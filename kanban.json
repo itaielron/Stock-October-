@@ -1,18 +1,11 @@
 {
-    "To Do": [
+    "To Do": [],
+    "In Progress": [
         {
             "id": "T2",
             "title": "Rebuild 4-Phase OS Architecture",
             "desc": "Rebuild original spec. Re-establish gating architecture.",
             "agent": "Dispatcher"
-        }
-    ],
-    "In Progress": [
-        {
-            "id": "M1",
-            "title": "Establish Agent Memory Banks",
-            "desc": "Creating local state files for all agents to prevent drift.",
-            "agent": "Top-Tier Manager"
         }
     ],
     "In Review": [],
@@ -76,6 +69,12 @@
             "title": "Phase 3: Walk-Forward Backtest",
             "desc": "Walk-forward historical simulation",
             "agent": "Evaluator Team"
+        },
+        {
+            "id": "M1",
+            "title": "Establish Agent Memory Banks",
+            "desc": "Creating local state files for all agents to prevent drift.",
+            "agent": "Top-Tier Manager"
         }
     ]
 }

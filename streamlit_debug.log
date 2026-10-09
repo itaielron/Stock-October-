@@ -1,0 +1,22 @@
+2026-10-10 01:21:14.799 Error removing credentials file.
+Traceback (most recent call last):
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/venv/lib/python3.13/site-packages/streamlit/runtime/credentials.py", line 151, in load
+    with open(self._conf_file, encoding="utf-8") as f:
+         ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 1] Operation not permitted: '/Users/itaielron/.streamlit/credentials.toml'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/venv/lib/python3.13/site-packages/streamlit/runtime/credentials.py", line 202, in reset
+    os.remove(c._conf_file)
+    ~~~~~~~~~^^^^^^^^^^^^^^
+PermissionError: [Errno 1] Operation not permitted: '/Users/itaielron/.streamlit/credentials.toml'
+
+      👋 Welcome to Streamlit!
+
+      If you'd like to receive helpful onboarding emails, news, offers, promotions,
+      and the occasional swag, please enter your email address below. Otherwise,
+      leave this field blank.
+
+      Email: 2026-10-10 01:21:14.800 
