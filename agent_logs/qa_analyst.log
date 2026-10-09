@@ -4688,3 +4688,230 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "index": int(i),
     }
 ```
+
+--- Sat Oct 10 02:31:54 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    Root-cause notes for prior trades=0 runs:
+      - EMA_50 / EMA_200 were referenced but never guaranteed to exist on the
+        passed frame, so the directional-bias gate silently failed every bar.
+      - GEX regime was treated as a hard boolean without a neutral fallback,
+        so any bar where GEX was missing/zero killed the signal.
+      - ATR window was compared against a fixed absolute threshold that was
+        never calibrated to the instrument, filtering out every bar.
+      - MTF confluence required *all* timeframes to agree, which almost never
+        happens on a 1m entry frame -> zero trades.
+
+    Fixes applied below:
+      - Defensive column resolution (EMA_50/EMA_200/ATR/Volume) with on-the-fly
+        computation if absent.
+      - GEX regime is a soft vote: negative -> trend-follow, positive ->
+        mean-revert, missing/zero -> allow both with reduced confidence.
+      - ATR gate is relative (percentile of recent ATR), not absolute.
+      - MTF confluence is a weighted score with a minimum threshold, not an
+        AND of every timeframe.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # ---- 0. Bounds & basic hygiene -------------------------------------
+    if df is None or len(df) < 210 or i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # ---- 1. Defensive column resolution --------------------------------
+    def _col(name, fallback=None):
+        if name in df.columns:
+            return df[name]
+        return fallback
+
+    close = _col("Close", _col("close"))
+    if close is None:
+        return None
+
+    ema50 = _col("EMA_50")
+    if ema50 is None:
+        ema50 = close.ewm(span=50, adjust=False).mean()
+
+    ema200 = _col("EMA_200")
+    if ema200 is None:
+        ema200 = close.ewm(span=200, adjust=False).mean()
+
+    atr_series = _col("ATR_14")
+    if atr_series is None:
+        high = _col("High", _col("high", close))
+        low = _col("Low", _col("low", close))
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [(high - low).abs(),
+             (high - prev_close).abs(),
+             (low - prev_close).abs()],
+            axis=1,
+        ).max(axis=1)
+        atr_series = tr.rolling(14).mean()
+
+    volume = _col("Volume", _col("volume"))
+
+    c = float(close.iloc[i])
+    e50 = float(ema50.iloc[i])
+    e200 = float(ema200.iloc[i])
+    atr_now = float(atr_series.iloc[i]) if atr is None else float(atr)
+
+    if not np.isfinite(c) or not np.isfinite(e50) or not np.isfinite(e200):
+        return None
+    if not np.isfinite(atr_now) or atr_now <= 0:
+        return None
+
+    # ---- 2. ATR regime gate (relative, not absolute) -------------------
+    atr_window = atr_series.iloc[max(0, i - 100):i + 1].dropna()
+    if len(atr_window) < 20:
+        return None
+    atr_pct = float((atr_window < atr_now).mean())
+    # Reject dead-volatility and blow-off volatility tails.
+    if atr_pct < 0.15 or atr_pct > 0.95:
+        return None
+
+    # ---- 3. GEX regime (soft vote) -------------------------------------
+    gex = None
+    for gcol in ("GEX", "gex", "GammaExposure", "gamma_exposure"):
+        if gcol in df.columns:
+            try:
+                gex = float(df[gcol].iloc[i])
+            except Exception:
+                gex = None
+            break
+
+    if gex is None or not np.isfinite(gex) or gex == 0.0:
+        regime = "neutral"
+        regime_conf = 0.5
+    elif gex < 0:
+        regime = "trend"
+        regime_conf = 1.0
+    else:
+        regime = "mean_revert"
+        regime_conf = 1.0
+
+    # ---- 4. Directional bias (EMA) -------------------------------------
+    bull_stack = c > e50 and e50 > e200
+    bear_stack = c < e50 and e50 < e200
+    # Allow a weaker but still directional read when the 200 is flat.
+    bull_soft = c > e50 and e50 >= e200
+    bear_soft = c < e50 and e50 <= e200
+
+    long_ok = bull_stack or bull_soft
+    short_ok = bear_stack or bear_soft
+
+    if not long_ok and not short_ok:
+        return None
+
+    # ---- 5. Multi-timeframe confluence score ---------------------------
+    # We approximate MTF agreement using EMA slopes on the same frame at
+    # multiple lookbacks (proxy for 1m/3m/5m/15m/1h/4h alignment).
+    def _slope(series, lookback):
+        if len(series) <= lookback:
+            return 0.0
+        a = float(series.iloc[i - lookback])
+        b = float(series.iloc[i])
+        if a == 0 or not np.isfinite(a) or not np.isfinite(b):
+            return 0.0
+        return (b - a) / abs(a)
+
+    mtf_lookbacks = [1, 3, 5, 15, 60, 240]
+    mtf_weights = [0.10, 0.15, 0.15, 0.20, 0.20, 0.20]
+
+    mtf_score_long = 0.0
+    mtf_score_short = 0.0
+    for lb, w in zip(mtf_lookbacks, mtf_weights):
+        s = _slope(close, lb)
+        if s > 0:
+            mtf_score_long += w
+        elif s < 0:
+            mtf_score_short += w
+
+    # ---- 6. Volume confirmation ----------------------------------------
+    vol_ok = True
+    if volume is not None:
+        try:
+            v_now = float(volume.iloc[i])
+            v_avg = float(volume.iloc[max(0, i - 20):i].mean())
+            if np.isfinite(v_now) and np.isfinite(v_avg) and v_avg > 0:
+                vol_ok = v_now >= 0.8 * v_avg
+        except Exception:
+            vol_ok = True
+
+    # ---- 7. Strategy selection -----------------------------------------
+    direction = None
+    strategy = None
+
+    if regime == "trend":
+        # Trend-following: require strong MTF alignment.
+        if long_ok and mtf_score_long >= 0.55:
+            direction, strategy = "long", "trend_follow"
+        elif short_ok and mtf_score_short >= 0.55:
+            direction, strategy = "short", "trend_follow"
+    elif regime == "mean_revert":
+        # Mean-reversion: fade extension against the short-term move but
+        # only in the direction of the higher-timeframe EMA bias.
+        if long_ok and mtf_score_short >= 0.45 and c < e50:
+            direction, strategy = "long", "mean_revert"
+        elif short_ok and mtf_score_long >= 0.45 and c > e50:
+            direction, strategy = "short", "mean_revert"
+    else:
+        # Neutral regime: accept whichever side has clear MTF dominance.
+        if long_ok and mtf_score_long >= 0.65:
+            direction, strategy = "long", "neutral_trend"
+        elif short_ok and mtf_score_short >= 0.65:
+            direction, strategy = "short", "neutral_trend"
+
+    if direction is None:
+        return None
+
+    if not vol_ok:
+        return None
+
+    # ---- 8. Risk sizing & levels ---------------------------------------
+    sl_distance = atr_now * 1.5
+    if direction == "long":
+        entry = c
+        stop = entry - sl_distance
+        tp1 = entry + sl_distance * 1.0
+        tp2 = entry + sl_distance * 2.0
+    else:
+        entry = c
+        stop = entry + sl_distance
+        tp1 = entry - sl_distance * 1.0
+        tp2 = entry - sl_distance * 2.0
+
+    # ---- 9. Confidence score -------------------------------------------
+    mtf_conf = mtf_score_long if direction == "long" else mtf_score_short
+    confidence = 0.5 * regime_conf + 0.5 * mtf_conf
+    if confidence < 0.55:
+        return None
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "regime": regime,
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr_now),
+        "atr_pct": float(atr_pct),
+        "mtf_score": float(mtf_conf),
+        "confidence": float(confidence),
+        "ema50": float(e50),
+        "ema200": float(e200),
+    }
+```
