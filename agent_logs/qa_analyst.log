@@ -7033,3 +7033,173 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{regime}|ema_align|atr_band_ok",
     }
 ```
+
+--- Sat Oct 10 02:38:08 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. This function is written so that
+    each gate is explicit and independently auditable:
+
+      1. Warmup / lookback: i must exceed the longest indicator window
+         (EMA_200 -> 200 bars). If the dataframe is shorter than ~210 bars,
+         every call returns None. This is the #1 cause of trades=0.
+      2. Regime gate (GEX): if the GEX column is missing, constant, or
+         sign-flipped relative to the strategy, no bar passes.
+      3. EMA trend gate: requires Close > EMA_50 > EMA_200 (long) or
+         Close < EMA_50 (short). In chop, EMA_50 and EMA_200 interleave and
+         the gate never fires.
+      4. ATR sanity band: ATR must be within [atr_floor, atr_ceiling] as a
+         fraction of price. A flat or synthetic series yields ATR ~ 0 and
+         fails the floor.
+      5. Macro / event pause: Trading_Enabled must be True.
+      6. Risk layer: drawdown and daily exposure must be within limits.
+
+    If trades=0, log which gate rejected the most bars (see _reject_log).
+    """
+    # ------------------------------------------------------------------
+    # 0. Warmup guard
+    # ------------------------------------------------------------------
+    MIN_BARS = 210  # EMA_200 + buffer
+    if i < MIN_BARS or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    # ------------------------------------------------------------------
+    # 1. Required columns
+    # ------------------------------------------------------------------
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "GEX")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = float(row["Close"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    atr14 = float(row["ATR_14"])
+    gex = float(row["GEX"])
+
+    if any(pd.isna(v) for v in (close, ema50, ema200, atr14, gex)):
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. ATR sanity band (volatility / risk sizing gate)
+    # ------------------------------------------------------------------
+    if close <= 0:
+        return None
+    atr_pct = atr14 / close
+    ATR_FLOOR = 0.0005   # 5 bps  -> below this the market is dead
+    ATR_CEIL = 0.05      # 5%    -> above this is a news spike, skip
+    if not (ATR_FLOOR <= atr_pct <= ATR_CEIL):
+        return None
+
+    # ------------------------------------------------------------------
+    # 3. Macro / event-driven pause
+    # ------------------------------------------------------------------
+    if "Trading_Enabled" in df.columns and not bool(row["Trading_Enabled"]):
+        return None
+    if "Macro_Score" in df.columns:
+        macro_score = float(row["Macro_Score"])
+    else:
+        macro_score = 0.0
+    BULLISH_THRESHOLD = 0.5
+    BEARISH_THRESHOLD = -0.5
+
+    # ------------------------------------------------------------------
+    # 4. Risk management layer
+    # ------------------------------------------------------------------
+    if "Current_Drawdown" in df.columns:
+        if float(row["Current_Drawdown"]) >= 0.10:  # 10% max DD
+            return None
+    if "Daily_Exposure" in df.columns:
+        if float(row["Daily_Exposure"]) >= 1.0:     # 100% of limit
+            return None
+
+    # ------------------------------------------------------------------
+    # 5. Regime + direction + confluence
+    # ------------------------------------------------------------------
+    # GEX regime: negative gamma -> trend-following, positive -> mean-reversion
+    trend_regime = gex < 0
+    mean_rev_regime = gex > 0
+
+    # EMA directional bias
+    long_bias = close > ema50 and ema50 > ema200
+    short_bias = close < ema50
+
+    # Macro veto
+    if macro_score >= BULLISH_THRESHOLD:
+        short_bias = False
+    if macro_score <= BEARISH_THRESHOLD:
+        long_bias = False
+
+    # Momentum confirmation (avoid buying into a falling knife)
+    body = close - float(prev["Close"])
+    long_momentum = body > 0
+    short_momentum = body < 0
+
+    # ------------------------------------------------------------------
+    # 6. Signal assembly
+    # ------------------------------------------------------------------
+    direction = None
+    strategy = None
+
+    if trend_regime:
+        # Trend-following: ride the EMA-aligned move
+        if long_bias and long_momentum:
+            direction, strategy = "long", "trend"
+        elif short_bias and short_momentum:
+            direction, strategy = "short", "trend"
+    elif mean_rev_regime:
+        # Mean-reversion: fade extension back toward EMA_50
+        dist = (close - ema50) / atr14 if atr14 > 0 else 0.0
+        if dist <= -1.5 and long_bias:
+            direction, strategy = "long", "mean_rev"
+        elif dist >= 1.5 and short_bias:
+            direction, strategy = "short", "mean_rev"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # 7. Risk sizing (ATR-based)
+    # ------------------------------------------------------------------
+    stop_dist = atr14 * 1.5
+    if direction == "long":
+        entry = close
+        stop = entry - stop_dist
+        tp1 = entry + stop_dist * 1.5   # 1.5R
+        tp2 = entry + stop_dist * 2.5   # 2.5R
+    else:
+        entry = close
+        stop = entry + stop_dist
+        tp1 = entry - stop_dist * 1.5
+        tp2 = entry - stop_dist * 2.5
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr14,
+        "gex": gex,
+        "ema50": ema50,
+        "ema200": ema200,
+        "macro_score": macro_score,
+        "bar_index": i,
+    }
+```
