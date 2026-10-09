@@ -8458,3 +8458,57 @@ Since no output was submitted, I cannot confirm trades executed. But per mandate
 **Directive:** Re-run and return raw output. If trades=0 persists, instrument the gate chain with per-condition counters and report which AND-clause is the bottleneck. Do not re-optimize blind — diagnose first.
 
 **Verdict: INCOMPLETE — resubmit with data.**
+
+--- Sat Oct 10 02:43:12 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate. If trades=0, explain why....
+RESPONSE:
+**QA EVALUATION — NO DATA RECEIVED**
+
+I cannot evaluate this cycle. The "Backtest Output" field is empty — no trade log, no metrics, no chart artifacts, no equity curve were provided.
+
+**Status: BLOCKED — INSUFFICIENT INPUT**
+
+---
+
+### Why I cannot proceed
+
+Per the Master Mandate, my evaluation requires:
+1. **Trade count** (to check the `trades=0` condition)
+2. **Win rate + sample size** (target >80%)
+3. **Entry/exit markers** on charts (visual clarity mandate)
+4. **MTFA breakdown** across 1m/3m/5m/15m/1h/4h
+5. **Loser/winner structural attribution** (genetic learning mandate #6)
+
+None of these were supplied. I will not fabricate a PASS/FAIL grade against missing data — that would violate **Mandate #3 (ZERO repeated mistakes)** and risk a false PASS triggering the **Smart Sleep Protocol (#9)** on an unverified system.
+
+---
+
+### If trades = 0 (conditional diagnosis)
+
+If the engine genuinely returned zero trades, the most probable causes — ranked by likelihood given our gating stack:
+
+| # | Cause | Check |
+|---|-------|-------|
+| 1 | **GEX regime never matched strategy** — negative-GEX trend sub-routine required but data feed returned GEX ≥ 0 (or NaN) for the entire window | Log `GEX` per bar |
+| 2 | **EMA stack never aligned** — `Close > EMA_50 > EMA_200` never simultaneously true on the tested TF | Plot EMA_50/200 |
+| 3 | **ATR filter too tight** — `ATR_14` outside `[min, max]` band every bar | Histogram ATR_14 |
+| 4 | **Macro gate locked** — `Macro_Score < Bullish_Threshold` disabled all shorts AND event-pause window covered the session | Dump macro score |
+| 5 | **Risk layer veto** — `Current_Drawdown ≥ Max_Allowed` or `Daily_Exposure ≥ Account_Limit` from bar 0 | Log drawdown state |
+| 6 | **Screener pre-filter empty** — `Volume > 1M AND Price > SMA_200` returned zero symbols | Count universe |
+
+Cause #1 or #2 is the usual culprit when the stack is this restrictive.
+
+---
+
+### Required to unblock
+
+Please resubmit with:
+- Raw trade log (CSV: timestamp, TF, side, entry, SL, TP1, outcome)
+- Per-bar indicator dump (GEX, EMA_50, EMA_200, ATR_14, Macro_Score)
+- Annotated chart PNGs with entry arrows + TP1/SL markers
+- MTFA confluence matrix
+
+**Grade: INCOMPLETE — awaiting data. No code rewrite authorized. No GitHub push (nothing changed).**
