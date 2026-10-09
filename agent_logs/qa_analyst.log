@@ -2228,3 +2228,166 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": "confluence_ok",
     }
 ```
+
+--- Sat Oct 10 02:25:16 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Evaluate confluence cluster at bar index i.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. Each gate below is instrumented so
+    that a zero-trade run can be diagnosed by inspecting the returned reason
+    codes (see `_confluence_cluster.last_reject`).
+
+    Common zero-trade causes (in order of frequency):
+      1. Warmup starvation: EMA_200 / ATR_14 need >= 200 bars. If the input
+         window (e.g. "past week" of 1m candles) is shorter than the longest
+         lookback, every bar is skipped. -> guard `i < _MIN_BARS`.
+      2. Regime mismatch: GEX sign never matches the required sub-routine
+         (e.g. GEX column all-NaN or all-positive while only trend-following
+         is enabled). -> require a finite GEX value.
+      3. EMA trend never aligns: in a flat/choppy week Close never clears
+         EMA_50 > EMA_200 (long) nor Close < EMA_50 (short).
+      4. ATR band filter too tight: ATR outside [min,max] on every bar.
+      5. Macro/event pause: Trading_Enabled False for the whole window.
+      6. Risk layer: drawdown/exposure caps already breached -> all dropped.
+
+    This function therefore returns None with a diagnostic reason rather than
+    silently failing, so the evaluator can log WHY trades=0.
+    """
+
+    # ---- diagnostics sink (read by evaluator after the run) ----
+    if not hasattr(_confluence_cluster, "reject_counts"):
+        _confluence_cluster.reject_counts = {}
+    _confluence_cluster.last_reject = None
+
+    def _reject(reason: str):
+        _confluence_cluster.reject_counts[reason] = (
+            _confluence_cluster.reject_counts.get(reason, 0) + 1
+        )
+        _confluence_cluster.last_reject = reason
+        return None
+
+    # ---- 0. Warmup / bounds guard (cause #1) ----
+    _MIN_BARS = 200  # EMA_200 is the longest lookback
+    if i < _MIN_BARS or i >= len(df):
+        return _reject("warmup_or_bounds")
+
+    row = df.iloc[i]
+
+    # ---- 1. Required columns present? ----
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "GEX")
+    for col in required:
+        if col not in df.columns:
+            return _reject(f"missing_column:{col}")
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+    gex = row["GEX"]
+
+    # NaN guard (cause #2/#3): any NaN kills the bar
+    if any(pd.isna(v) for v in (close, ema50, ema200, atr14, gex)):
+        return _reject("nan_indicator")
+
+    # ---- 2. Macro / event-driven pause (cause #5) ----
+    if "Trading_Enabled" in df.columns and not bool(row["Trading_Enabled"]):
+        return _reject("event_pause")
+
+    # ---- 3. Macro regime score: disable shorts in bull regime ----
+    macro_score = row.get("Macro_Score", 0.0)
+    BULLISH_THRESHOLD = 0.5
+    shorts_allowed = not (macro_score >= BULLISH_THRESHOLD)
+
+    # ---- 4. ATR band filter (cause #4) ----
+    # ATR must be finite and within sane limits relative to price.
+    if atr14 <= 0:
+        return _reject("atr_nonpositive")
+    atr_pct = atr14 / close if close else 0.0
+    ATR_MIN_PCT, ATR_MAX_PCT = 0.0005, 0.05  # 0.05% .. 5% of price
+    if not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
+        return _reject("atr_out_of_band")
+
+    # ---- 5. Regime filter (GEX) selects sub-routine (cause #2) ----
+    # GEX < 0 -> trend-following ; GEX > 0 -> mean-reversion
+    if gex < 0:
+        regime = "trend"
+    elif gex > 0:
+        regime = "mean_reversion"
+    else:
+        return _reject("gex_zero")
+
+    # ---- 6. Directional bias (EMA) ----
+    long_ok = (close > ema50) and (ema50 > ema200)
+    short_ok = (close < ema50) and shorts_allowed
+
+    direction = None
+    if long_ok:
+        direction = "long"
+    elif short_ok:
+        direction = "short"
+    else:
+        return _reject("ema_no_alignment")
+
+    # ---- 7. Regime <-> direction confluence ----
+    # Trend-following: trade WITH the EMA trend (already enforced above).
+    # Mean-reversion: only take counter-trend fades, i.e. require the bar to
+    # be stretched from EMA_50 by at least 1 ATR (otherwise no edge).
+    if regime == "mean_reversion":
+        stretch = abs(close - ema50)
+        if stretch < atr14:
+            return _reject("mr_not_stretched")
+        # In mean-reversion, fade the move: long only if price is BELOW ema50,
+        # short only if price is ABOVE ema50.
+        if direction == "long" and close >= ema50:
+            return _reject("mr_direction_conflict")
+        if direction == "short" and close <= ema50:
+            return _reject("mr_direction_conflict")
+
+    # ---- 8. Risk sizing (ATR-based) ----
+    stop_distance = atr14 * 1.5
+    if stop_distance <= 0:
+        return _reject("bad_stop_distance")
+
+    if direction == "long":
+        stop_loss = close - stop_distance
+        take_profit = close + stop_distance * 2.0  # 2R target
+    else:
+        stop_loss = close + stop_distance
+        take_profit = close - stop_distance * 2.0
+
+    # ---- 9. Strict risk-management layer (cause #6) ----
+    current_drawdown = row.get("Current_Drawdown", 0.0)
+    daily_exposure = row.get("Daily_Exposure", 0.0)
+    MAX_DRAWDOWN = 0.10
+    MAX_DAILY_EXPOSURE = 1.0
+    if current_drawdown >= MAX_DRAWDOWN:
+        return _reject("max_drawdown_breached")
+    if daily_exposure >= MAX_DAILY_EXPOSURE:
+        return _reject("daily_exposure_breached")
+
+    # ---- 10. Valid confluence cluster ----
+    return {
+        "index": i,
+        "direction": direction,
+        "regime": regime,
+        "entry": float(close),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "atr": float(atr14),
+        "stop_distance": float(stop_distance),
+        "r_multiple": 2.0,
+        "reason": "confluence_ok",
+    }
+```
