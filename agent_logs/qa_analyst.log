@@ -8389,3 +8389,34 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:42:20 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate. If trades=0, explain why....
+RESPONSE:
+**Evaluation: REJECT — Zero Trades (No Signal Generated)**
+
+**Root Cause Analysis (Why trades=0):**
+
+The backtest produced no trades, which means the signal generation layer never returned `True`. Based on the mandate's hierarchical confluence structure, the failure is almost certainly a **confluence deadlock** — one of the three mandatory gates never fired simultaneously with the others.
+
+**Most Likely Culprits (in order of probability):**
+
+1. **GEX Regime Mismatch (highest probability).** The regime filter is binary and mutually exclusive: `GEX < 0` → trend-following only; `GEX > 0` → mean-reversion only. If the GEX data feed returned `NaN`, `0`, or a constant sign across the test window, one entire subroutine was permanently disabled. A flat/zero GEX series is the #1 cause of zero-trade backtests.
+
+2. **EMA Stack Never Aligned.** Long requires `Close > EMA_50 AND EMA_50 > EMA_200`. On a 1m/3m window (past week only), EMA_200 is barely warmed up — it may be dominated by initialization bias, so the stack rarely flips. Short requires `Close < EMA_50`, which is looser, so if shorts are also zero, the block is upstream (GEX or ATR).
+
+3. **ATR Filter Too Tight.** If `ATR_14` bounds were set as an absolute range rather than a percentile, low-volatility 1m candles may sit permanently outside the "within limits" band.
+
+4. **Macro/Event Gate.** If `Macro_Score >= Bullish_Threshold` disabled shorts AND the window was bullish, only longs could fire — and if EMA stack failed, zero trades.
+
+5. **Screener Pre-Filter.** `Volume > 1M AND Price > SMA_200` may have emptied the universe before signals were even evaluated.
+
+**Diagnostic Required (do not re-optimize blindly):**
+Instrument the pipeline with per-gate pass counters:
+- `count(GEX_valid)`, `count(EMA_long_ok)`, `count(EMA_short_ok)`, `count(ATR_ok)`, `count(macro_ok)`, `count(screener_pass)`.
+The gate with the lowest count is the bottleneck. Fix that single gate — do not touch the others (anti-overfitting, Mandate #10).
+
+**Verdict:** No structural conclusion can be drawn from zero trades. This is a **plumbing failure, not a strategy failure**. Per Mandate #9, do NOT enter standby (no PASS earned) and do NOT rewrite the whole engine — patch the identified dead gate, re-run, and report gate-level counts.
