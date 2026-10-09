@@ -9821,3 +9821,39 @@ Replace the rigid AND-gate with a **weighted confluence score** (e.g., EMA=2, AT
 - ✅ Correctly did **not** crash on missing GEX.
 
 **Action:** Coder adds rejection telemetry + neutral GEX default, re-runs. Do **not** proceed to optimization until trades > 0. No `proven_strategies.md` entry warranted.
+
+--- Sat Oct 10 02:58:33 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:58:28Z -> 2026-10-09T23:58:28Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades means the entry gate never evaluated `True`. Given the mandate's hierarchical confluence stack, the failure is almost certainly a **stacked AND-gate**, not a data problem. Ranked causes:
+
+1. **GEX gate deadlock (most likely).** Per Mandate #11, GEX is unavailable on IEX. If the coder left a `GEX < 0` / `GEX > 0` branch without a neutral fallback, the regime filter returns `None`/`False` for every bar → no sub-routine ever fires. This is the #1 suspect and a **repeated mistake** (explicitly forbidden).
+2. **EMA warm-up starvation.** `EMA_200` needs ~200 bars. SPY had 297 bars, QQQ 372 — but if the engine computes EMA_200 on a rolling window *after* indicator warm-up, the first ~200 bars are nulled, leaving only ~97/172 tradeable bars. Combined with a strict `Close > EMA_50 > EMA_200` AND-chain, valid windows shrink to near-zero.
+3. **ATR "within limits" band too tight.** If `ATR_min`/`ATR_max` were hardcoded for a different volatility regime, the 1-week window (Oct 2–9) may sit entirely outside the band.
+4. **Macro/event pause.** If `Trading_Enabled=False` was set for an FOMC/NFP window and never reset, the whole week is muted.
+
+### Required fixes (do NOT re-run blind)
+- **GEX fallback:** `gex_regime = "neutral"` when data missing; neutral → allow BOTH trend and mean-reversion sub-routines. Never `raise`, never `False`.
+- **Instrument the gate:** log per-bar counts of `gex_pass`, `ema_pass`, `atr_pass`, `macro_pass`. We cannot diagnose a black-box zero.
+- **Warm-up:** fetch ≥400 bars per symbol so EMA_200 is valid for the full test window.
+- **ATR band:** derive from rolling percentile (e.g., 20th–90th of trailing ATR), not fixed constants.
+
+### Structural verdict
+A 0-trade week is **not** a "no-setup" market — it is a **logic bug**. Per Mandate #6, we cannot learn from losers if we never enter. Fix the gate, add telemetry, re-run. Do **not** proceed to multi-timeframe rotation until at least one timeframe produces trades.
+
+**Next action:** Coder patches GEX fallback + gate telemetry → re-run SPY/QQQ 5m → return for QA.
