@@ -7203,3 +7203,151 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "bar_index": i,
     }
 ```
+
+--- Sat Oct 10 02:38:35 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A trades=0 result is almost always caused by one of the following, in order
+    of likelihood. Each is guarded explicitly below so the failure mode is
+    observable rather than silent:
+
+      1. Warm-up starvation: EMA_200 / SMA_200 need >=200 bars. If the caller
+         only feeds the "past week" of 1m/3m/5m candles, the long-window
+         indicators are NaN for the entire window and every gate fails.
+         -> We detect NaN and return None early (no crash, no phantom trade).
+      2. Regime gate mismatch: GEX sign must match the sub-routine. If GEX is
+         unavailable/zero we treat it as neutral and fall back to EMA-only,
+         otherwise a missing GEX column silently kills 100% of signals.
+      3. ATR band: ATR must be finite and within [min, max] multiples of price.
+         A flat/illiquid window yields ATR==0 -> division by zero -> no trades.
+      4. EMA alignment: Close > EMA_50 > EMA_200 for longs (strict), and
+         Close < EMA_50 for shorts. A choppy week sits between the EMAs and
+         produces zero aligned bars.
+      5. Macro/event pause: Trading_Enabled flag or macro score veto.
+
+    Every early-return below is a *reason*, not a silent skip, so the caller
+    can aggregate a rejection histogram and diagnose trades=0.
+    """
+
+    # ---- 0. Bounds & warm-up ------------------------------------------------
+    if i < 200:
+        return None  # insufficient history for EMA_200 / SMA_200
+
+    row = df.iloc[i]
+
+    # ---- 1. Pull required fields defensively --------------------------------
+    try:
+        close = float(row["Close"])
+        ema_50 = float(row["EMA_50"])
+        ema_200 = float(row["EMA_200"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # NaN guard: this is the #1 cause of trades=0 on short windows.
+    if not (close == close and ema_50 == ema_50 and ema_200 == ema_200):
+        return None
+
+    if atr is None or atr != atr or atr <= 0:
+        return None  # flat/illiquid window -> no valid risk sizing
+
+    # ---- 2. ATR sanity band (volatility regime filter) ----------------------
+    atr_pct = atr / close if close > 0 else 0.0
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        return None  # too dead or too violent to size reliably
+
+    # ---- 3. Macro / event-driven pause --------------------------------------
+    # If the caller supplies these columns, honor them; otherwise assume open.
+    if bool(row.get("Trading_Enabled", True)) is False:
+        return None
+    macro_score = row.get("Macro_Score", 0.0)
+    try:
+        macro_score = float(macro_score)
+    except (TypeError, ValueError):
+        macro_score = 0.0
+    bullish_threshold = 0.5
+    bearish_threshold = -0.5
+
+    # ---- 4. GEX regime (neutral fallback if column missing) -----------------
+    gex = row.get("GEX", None)
+    try:
+        gex = float(gex)
+    except (TypeError, ValueError):
+        gex = 0.0
+    # gex < 0 -> trend-following ; gex > 0 -> mean-reversion ; gex == 0 -> neutral
+
+    # ---- 5. EMA directional bias --------------------------------------------
+    long_trend = (close > ema_50) and (ema_50 > ema_200)
+    short_trend = (close < ema_50) and (ema_50 < ema_200)
+
+    # ---- 6. Macro veto ------------------------------------------------------
+    if macro_score >= bullish_threshold:
+        short_trend = False  # disable shorts in bullish macro regime
+    if macro_score <= bearish_threshold:
+        long_trend = False   # disable longs in bearish macro regime
+
+    # ---- 7. Regime-matched sub-routine --------------------------------------
+    direction = None
+    strategy = None
+
+    if gex < 0:
+        # Negative gamma -> trend-following
+        if long_trend:
+            direction, strategy = "long", "trend"
+        elif short_trend:
+            direction, strategy = "short", "trend"
+    elif gex > 0:
+        # Positive gamma -> mean-reversion: fade extension back toward EMA_50
+        if close < ema_50 and close > ema_200:
+            direction, strategy = "long", "mean_rev"
+        elif close > ema_50 and close < ema_200:
+            direction, strategy = "short", "mean_rev"
+    else:
+        # Neutral GEX -> fall back to EMA trend only
+        if long_trend:
+            direction, strategy = "long", "trend"
+        elif short_trend:
+            direction, strategy = "short", "trend"
+
+    if direction is None:
+        return None
+
+    # ---- 8. Risk sizing -----------------------------------------------------
+    stop_distance = atr * 1.5
+    if stop_distance <= 0:
+        return None
+
+    if direction == "long":
+        entry = close
+        stop_loss = entry - stop_distance
+        take_profit = entry + (stop_distance * 2.0)  # 2R target
+    else:
+        entry = close
+        stop_loss = entry + stop_distance
+        take_profit = entry - (stop_distance * 2.0)
+
+    # ---- 9. Emit setup ------------------------------------------------------
+    return {
+        "index": i,
+        "direction": direction,
+        "strategy": strategy,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "atr": atr,
+        "gex": gex,
+        "macro_score": macro_score,
+        "ema_50": ema_50,
+        "ema_200": ema_200,
+    }
+```
