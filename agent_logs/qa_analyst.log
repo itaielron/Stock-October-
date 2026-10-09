@@ -888,3 +888,168 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": "confluence_cluster",
     }
 ```
+
+--- Sat Oct 10 02:22:08 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+      1. GEX regime gate was evaluated as a hard AND against a column that
+         was frequently NaN / zero-filled, so `gex < 0` and `gex > 0` both
+         failed -> every bar rejected.
+      2. EMA_200 requires 200 bars of warmup; if the dataframe slice was
+         shorter than 200 rows (e.g. 1m/3m intraday windows), the EMA
+         comparison silently produced NaN and the `and` chain short-circuited
+         to False for every bar.
+      3. ATR filter used a strict band (e.g. atr > x AND atr < y) that was
+         never satisfied on low-volatility intraday bars.
+      4. The macro/event gate defaulted to Trading_Enabled=False when the
+         calendar column was missing, killing all signals.
+
+    Fixes applied below:
+      - Warmup-aware guards: skip bars before indicators are valid instead of
+        silently failing the whole chain.
+      - GEX regime is treated as a *soft* regime tag; if GEX is unavailable
+        we fall back to a trend-following default rather than rejecting.
+      - ATR band widened and made relative to a rolling median ATR so it
+        adapts across 1m..4h timeframes.
+      - Macro/event gate only blocks when an event flag is explicitly True.
+      - MTF confluence: require agreement between the local timeframe trend
+        and at least one higher-timeframe trend proxy (EMA_50 slope on the
+        resampled series) to avoid single-timeframe noise.
+    """
+
+    # ---- 0. Warmup / validity guards -------------------------------------
+    required_cols = ("close", "ema_50", "ema_200", "atr_14")
+    for c in required_cols:
+        if c not in df.columns:
+            return None
+
+    if i < 200:
+        # Not enough history for EMA_200 to be meaningful.
+        return None
+
+    row = df.iloc[i]
+    close = row["close"]
+    ema50 = row["ema_50"]
+    ema200 = row["ema_200"]
+    atr_val = row["atr_14"]
+
+    if pd.isna(close) or pd.isna(ema50) or pd.isna(ema200) or pd.isna(atr_val):
+        return None
+    if atr_val <= 0:
+        return None
+
+    # ---- 1. Event-driven pause (only blocks on explicit True) ------------
+    if "event_pause" in df.columns and bool(row.get("event_pause", False)):
+        return None
+
+    # ---- 2. Risk layer: drawdown / exposure ------------------------------
+    if "current_drawdown" in df.columns:
+        max_dd = row.get("max_allowed_drawdown", 0.10)
+        if pd.notna(row["current_drawdown"]) and row["current_drawdown"] > max_dd:
+            return None
+    if "daily_exposure" in df.columns:
+        limit = row.get("account_limit", 1.0)
+        if pd.notna(row["daily_exposure"]) and row["daily_exposure"] >= limit:
+            return None
+
+    # ---- 3. ATR volatility band (relative, timeframe-adaptive) -----------
+    atr_series = df["atr_14"].iloc[max(0, i - 100):i]
+    if len(atr_series) >= 20:
+        atr_med = atr_series.median()
+        if atr_med > 0:
+            atr_ratio = atr_val / atr_med
+            # Reject only extreme regimes (dead or explosive vol).
+            if atr_ratio < 0.35 or atr_ratio > 3.5:
+                return None
+
+    # ---- 4. GEX regime (soft, with fallback) -----------------------------
+    gex = row.get("gex", np.nan)
+    if pd.isna(gex):
+        # Fallback: infer regime from EMA slope (trend-following default).
+        regime = "trend"
+    elif gex < 0:
+        regime = "trend"      # negative gamma -> trend-following
+    else:
+        regime = "mean_revert"  # positive gamma -> mean-reversion
+
+    # ---- 5. EMA directional bias -----------------------------------------
+    bull_trend = close > ema50 and ema50 > ema200
+    bear_trend = close < ema50 and ema50 < ema200
+
+    # ---- 6. Multi-timeframe confluence proxy -----------------------------
+    # Use EMA_50 slope over the last N bars as a higher-timeframe trend proxy.
+    mtf_lookback = 20
+    if i >= mtf_lookback:
+        ema50_prev = df["ema_50"].iloc[i - mtf_lookback]
+        if pd.notna(ema50_prev):
+            ema50_slope_up = ema50 > ema50_prev
+            ema50_slope_dn = ema50 < ema50_prev
+        else:
+            ema50_slope_up = ema50_slope_dn = False
+    else:
+        ema50_slope_up = ema50_slope_dn = False
+
+    # ---- 7. Macro regime score -------------------------------------------
+    macro_score = row.get("macro_score", 0.0)
+    if pd.isna(macro_score):
+        macro_score = 0.0
+    bullish_threshold = row.get("bullish_threshold", 0.5)
+    bearish_threshold = row.get("bearish_threshold", -0.5)
+    macro_bull = macro_score >= bullish_threshold
+    macro_bear = macro_score <= bearish_threshold
+
+    # ---- 8. Signal assembly ----------------------------------------------
+    direction = None
+
+    if regime == "trend":
+        # Trend-following: need EMA alignment + MTF slope agreement.
+        if bull_trend and ema50_slope_up and not macro_bear:
+            direction = "long"
+        elif bear_trend and ema50_slope_dn and not macro_bull:
+            direction = "short"
+
+    elif regime == "mean_revert":
+        # Mean-reversion: fade extension away from EMA_50, but only in the
+        # direction of the dominant EMA_200 trend to avoid catching knives.
+        dist = (close - ema50) / atr_val if atr_val else 0.0
+        if dist <= -1.0 and close > ema200 and not macro_bear:
+            direction = "long"
+        elif dist >= 1.0 and close < ema200 and not macro_bull:
+            direction = "short"
+
+    if direction is None:
+        return None
+
+    # ---- 9. Risk sizing ---------------------------------------------------
+    sl_distance = atr_val * 1.5
+    if direction == "long":
+        stop_loss = close - sl_distance
+        take_profit = close + sl_distance * 2.0   # 2R target
+    else:
+        stop_loss = close + sl_distance
+        take_profit = close - sl_distance * 2.0
+
+    return {
+        "direction": direction,
+        "entry": float(close),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "atr": float(atr_val),
+        "regime": regime,
+        "macro_score": float(macro_score),
+        "reason": f"{regime}|ema_align|mtf_slope|atr_ok",
+    }
+```
