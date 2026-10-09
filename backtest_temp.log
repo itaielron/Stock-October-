@@ -1,4 +1,0 @@
-  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 559
-    }def run_backtest(start: str | None = None,
-     ^^^
-SyntaxError: invalid syntax

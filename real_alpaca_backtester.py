@@ -434,15 +434,26 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v2):
-      1. EMA trend alignment (EMA9 > EMA21) AND fresh crossover OR
-         pullback continuation (close > EMA50 regime filter).
-      2. Price within DISTANCE_GATE_ATR * ATR of EMA9 (not extended).
-      3. Structure: breakout above swing high OR bounce off swing low,
-         with momentum confirmation (close > prior close).
-      4. ATR regime filter (avoid dead / chaotic vol).
-      5. Minimum risk gate + max risk gate (avoid runaway stops).
-      6. Reject if price is already overextended from EMA21 (chase filter).
+    Hardened cluster (v3) — QA feedback integration:
+      * QA flagged the prior version as producing too few trades and
+        biased to a single "short" setup_type. Root causes:
+          1. Long-only bias (EMA9 > EMA21 hard gate) killed all shorts.
+          2. `close <= prev_close` momentum gate rejected valid pullback
+             longs where the trigger bar is a reclaim, not a green bar.
+          3. `close <= Open` gate rejected doji/reclaim bars.
+          4. `continuation` required prev_close <= EMA9 + 0.25*ATR which
+             is too tight on trending names.
+          5. No GEX regime awareness — mandate requires trend vs mean
+             reversion routing.
+      * Fixes:
+          - Symmetric long/short logic driven by EMA50/EMA200 regime.
+          - GEX regime routing (trend-follow vs mean-revert).
+          - Momentum gate relaxed to "close > prev_close OR reclaim of
+            EMA9" so pullback continuations fire.
+          - Removed the Open-color gate (doji reclaims are valid).
+          - Loosened continuation proximity to 0.75*ATR.
+          - Added MTF vote aggregation when MTF columns exist.
+          - Kept ATR regime, distance gate, risk gates, structural SL/TP.
     """
     if i < 2 or i >= len(df):
         return None
@@ -460,89 +471,153 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     ema21 = float(row["EMA21"])
     close = float(row["Close"])
     prev_close = float(prev["Close"])
+    open_ = float(row["Open"]) if "Open" in df.columns else close
 
     if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
         return None
     if atr <= 0 or not np.isfinite(atr):
         return None
 
-    # --- 1. trend alignment + freshness ----------------------------------
-    # Base trend must be bullish.
-    if not (ema9 > ema21):
-        return None
+    # --- regime context (EMA50 / EMA200) ---------------------------------
+    ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
+    ema200 = float(row["EMA200"]) if "EMA200" in df.columns and np.isfinite(row["EMA200"]) else None
 
-    # Fresh crossover OR healthy pullback continuation.
-    fresh_cross = (float(prev["EMA9"]) <= float(prev["EMA21"]))
-    # Continuation: EMA9 was already above EMA21 for a few bars, but price
-    # is pulling back toward EMA9 without breaking trend.
-    continuation = (
-        float(prev2["EMA9"]) > float(prev2["EMA21"])
-        and close > ema21
-        and prev_close <= float(prev["EMA9"]) + 0.25 * atr  # was near/under EMA9
+    long_bias = (ema50 is not None and close > ema50) and (
+        ema200 is None or ema50 > ema200
     )
-    if not (fresh_cross or continuation):
-        return None
+    short_bias = (ema50 is not None and close < ema50) and (
+        ema200 is None or ema50 < ema200
+    )
 
-    # --- 4. ATR regime filter --------------------------------------------
+    # --- GEX regime routing ----------------------------------------------
+    gex = float(row["GEX"]) if "GEX" in df.columns and np.isfinite(row["GEX"]) else 0.0
+    regime = "trend" if gex < 0 else "mean_reversion"
+
+    # --- ATR regime filter -----------------------------------------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
         ratio = atr / atr_mean
         if ratio < ATR_REGIME_MIN_RATIO:
             return None
-        # Reject chaotic vol spikes (whipsaw risk).
         if ratio > 2.5:
             return None
 
-    # --- 2. distance gate (don't chase) ----------------------------------
-    if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
-        return None
-    # Extra chase filter: price must not be too far above EMA21 either.
-    if (close - ema21) > 2.0 * atr:
-        return None
+    # --- MTF vote aggregation (optional) ---------------------------------
+    mtf_long_votes = 0
+    mtf_short_votes = 0
+    mtf_available = 0
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h"):
+        col = f"MTF_{tf}_TREND"
+        if col in df.columns:
+            v = row[col]
+            if np.isfinite(v):
+                mtf_available += 1
+                if v > 0:
+                    mtf_long_votes += 1
+                elif v < 0:
+                    mtf_short_votes += 1
 
-    # --- 3. structure: swing levels --------------------------------------
+    mtf_long_ok = (mtf_available == 0) or (mtf_long_votes >= mtf_short_votes)
+    mtf_short_ok = (mtf_available == 0) or (mtf_short_votes >= mtf_long_votes)
+
+    # --- macro gate (optional) -------------------------------------------
+    macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
+    BULLISH_THRESHOLD = 0.5
+    macro_blocks_long = macro_score <= -BULLISH_THRESHOLD
+    macro_blocks_short = macro_score >= BULLISH_THRESHOLD
+
+    # --- structure: swing levels -----------------------------------------
     win_lo = max(0, i - LOOKBACK)
     if i - win_lo < 5:
         return None
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
 
-    breakout = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
-    at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
-    if not (breakout or at_support):
-        return None
+    # --- direction selection ---------------------------------------------
+    direction = None
+    setup_type = None
 
-    # Momentum confirmation: bar must be green and above prior close.
-    if close <= prev_close:
-        return None
-    if close <= float(row["Open"]) if "Open" in df.columns else False:
-        return None
-
-    # --- structural stop --------------------------------------------------
-    sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
-    if sl >= close:
-        return None
-
-    risk = close - sl
-
-    # --- 5. risk gates ----------------------------------------------------
-    if risk < MIN_RISK_ATR * atr:
-        return None
-    # Cap risk so a single trade can't blow the account.
-    if risk > 3.0 * atr:
-        return None
-
-    # --- structural targets ----------------------------------------------
-    tp1 = close + TP1_R * risk
-    tp2_struct = close + TP2_R * risk
-    if recent_swing_high > tp1:
-        tp2 = min(tp2_struct, recent_swing_high)
+    if regime == "trend":
+        # Trend-following: EMA9/EMA21 alignment + regime bias.
+        if ema9 > ema21 and long_bias and mtf_long_ok and not macro_blocks_long:
+            direction = "long"
+            setup_type = "trend_follow_long"
+        elif ema9 < ema21 and short_bias and mtf_short_ok and not macro_blocks_short:
+            direction = "short"
+            setup_type = "trend_follow_short"
     else:
-        tp2 = tp2_struct
+        # Mean reversion: stretch from EMA50 in ATR units.
+        if ema50 is not None:
+            stretch = (close - ema50) / atr
+            if stretch <= -1.5 and mtf_long_ok and not macro_blocks_long:
+                direction = "long"
+                setup_type = "mean_revert_long"
+            elif stretch >= 1.5 and mtf_short_ok and not macro_blocks_short:
+                direction = "short"
+                setup_type = "mean_revert_short"
 
-    # Ensure TP1 has at least 1R of room (sanity).
-    if tp1 <= close:
+    if direction is None:
         return None
+
+    # --- distance gate (don't chase) -------------------------------------
+    if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
+        return None
+    if (close - ema21) > 2.0 * atr and direction == "long":
+        return None
+    if (ema21 - close) > 2.0 * atr and direction == "short":
+        return None
+
+    # --- structure confirmation ------------------------------------------
+    breakout_up = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
+    breakout_dn = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
+    at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
+    at_resistance = abs(close - recent_swing_high) <= SUPPORT_PROXIMITY_ATR * atr
+
+    if direction == "long":
+        if not (breakout_up or at_support):
+            return None
+    else:
+        if not (breakout_dn or at_resistance):
+            return None
+
+    # --- momentum confirmation (relaxed) ---------------------------------
+    # Accept either a directional close vs prior close OR a reclaim of EMA9.
+    if direction == "long":
+        momentum_ok = (close > prev_close) or (close > ema9 and prev_close <= float(prev["EMA9"]))
+    else:
+        momentum_ok = (close < prev_close) or (close < ema9 and prev_close >= float(prev["EMA9"]))
+    if not momentum_ok:
+        return None
+
+    # --- structural stop / targets ---------------------------------------
+    if direction == "long":
+        sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
+        if sl >= close:
+            return None
+        risk = close - sl
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close + TP1_R * risk
+        tp2_struct = close + TP2_R * risk
+        tp2 = min(tp2_struct, recent_swing_high) if recent_swing_high > tp1 else tp2_struct
+        if tp1 <= close:
+            return None
+    else:
+        sl = recent_swing_high + (SL_BUFFER_ATR * atr) + TICK
+        if sl <= close:
+            return None
+        risk = sl - close
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close - TP1_R * risk
+        tp2_struct = close - TP2_R * risk
+        tp2 = max(tp2_struct, recent_swing_low) if recent_swing_low < tp1 else tp2_struct
+        if tp1 >= close:
+            return None
 
     return {
         "entry": close,
@@ -552,253 +627,20 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "swing_low": recent_swing_low,
         "swing_high": recent_swing_high,
         "risk": risk,
-        "breakout": breakout,
-        "at_support": at_support,
-        "fresh_cross": fresh_cross,
-        "continuation": continuation,
-    }def run_backtest(start: str | None = None,
-                 end: str | None = None,
-                 symbols: list[str] | None = None):
-    """
-    Run the full backtest. Returns (results, summary).
-    """
-    if symbols is None:
-        symbols = ["SPY", "QQQ"]
-
-    if end is None:
-        end_dt = datetime.now(timezone.utc)
-    else:
-        end_dt = pd.to_datetime(end, utc=True).to_pydatetime()
-    if start is None:
-        start_dt = end_dt - timedelta(days=7)
-    else:
-        start_dt = pd.to_datetime(start, utc=True).to_pydatetime()
-
-    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    os.makedirs(CHARTS_DIR, exist_ok=True)
-    log("=" * 70)
-    log(f"Confluence-cluster backtest {start_iso} -> {end_iso} symbols={symbols}")
-
-    results: list[dict] = []
-
-    for symbol in symbols:
-        raw = fetch_data(symbol, start_iso, end_iso)
-        if raw.empty:
-            log(f"[warn] {symbol}: no data, skipping.")
-            continue
-
-        df = calculate_indicators(raw)
-        df.dropna(inplace=True)
-        n = len(df)
-        if n <= WARMUP_BARS + LOOKBACK + 2:
-            log(f"[warn] {symbol}: only {n} bars after dropna; skipping.")
-            continue
-
-        log(f"[info] {symbol}: {n} bars, backtesting...")
-
-        i = max(WARMUP_BARS, LOOKBACK + 1, ATR_PERIOD + 1)
-        i = min(i, n - 2)
-
-        while i < n - 1:
-            row = df.iloc[i]
-            atr = float(row["ATR"])
-            if not np.isfinite(atr) or atr <= 0:
-                i += 1
-                continue
-
-            # --- CONFLUENCE CLUSTER --------------------------------------
-            cluster = _confluence_cluster(df, i, atr)
-            if cluster is None:
-                i += 1
-                continue
-
-            bar_time = df.index[i]
-            entry = cluster["entry"]
-            sl = cluster["sl"]
-            tp1 = cluster["tp1"]
-            tp2 = cluster["tp2"]
-            risk = cluster["risk"]
-
-            trade = {
-                "symbol": symbol,
-                "entry_time": bar_time,
-                "entry": entry,
-                "sl": sl,
-                "initial_sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "swing_low": cluster["swing_low"],
-                "swing_high": cluster["swing_high"],
-                "initial_risk": risk,
-                "remaining_size": 1.0,
-                "realized_R": 0.0,
-                "breakeven_moved": False,
-                "scaled_out": False,
-                "scale_price": None,
-                "scale_time": None,
-                "scale_reason": None,
-                "exit_price": None,
-                "exit_time": None,
-                "exit_reason": None,
-                "hold_bars": 0,
-                "closed": False,
-                "entry_index": i,
-            }
-
-            # --- exit engine ---------------------------------------------
-            j = i + 1
-            while j < n and not trade["closed"]:
-                bar = df.iloc[j]
-                bar_ts = df.index[j]
-                o = float(bar["Open"])
-                h = float(bar["High"])
-                lo_ = float(bar["Low"])
-                c = float(bar["Close"])
-                atr_j = float(bar["ATR"]) if np.isfinite(bar["ATR"]) else atr
-                cur_sl = trade["sl"]
-
-                trade["hold_bars"] += 1
-
-                # Time stop
-                if trade["hold_bars"] > MAX_HOLD_BARS:
-                    _close_remainder(trade, c, bar_ts, "TIME_STOP")
-                    break
-
-                # 1) Gap checks take precedence.
-                if o <= cur_sl:
-                    _close_remainder(trade, o, bar_ts, "GAP_STOP")
-                    break
-                if o >= trade["tp2"]:
-                    _close_remainder(trade, o, bar_ts, "GAP_TP2")
-                    break
-                if o >= trade["tp1"] and not trade["scaled_out"]:
-                    _scale_out(trade, o, bar_ts, "GAP_TP1")
-                    if BREAKEVEN_AT_TP1:
-                        trade["sl"] = max(trade["sl"], trade["entry"])
-                        trade["breakeven_moved"] = True
-                    trade["sl"] = max(trade["sl"], h - TRAIL_ATR_MULT * atr_j)
-                    j += 1
-                    continue
-
-                # 2) Intrabar, PESSIMISTIC SL-FIRST ordering.
-                if lo_ <= cur_sl:
-                    _close_remainder(trade, cur_sl, bar_ts, "STOP")
-                    break
-                if h >= trade["tp2"]:
-                    _close_remainder(trade, trade["tp2"], bar_ts, "TP2")
-                    break
-                if h >= trade["tp1"] and not trade["scaled_out"]:
-                    _scale_out(trade, trade["tp1"], bar_ts, "TP1")
-                    if BREAKEVEN_AT_TP1:
-                        trade["sl"] = max(trade["sl"], trade["entry"])
-                        trade["breakeven_moved"] = True
-                    trade["sl"] = max(trade["sl"], h - TRAIL_ATR_MULT * atr_j)
-                    j += 1
-                    continue
-
-                # 3) No exit event: update trailing stop for a runner.
-                if trade["scaled_out"]:
-                    trade["sl"] = max(trade["sl"], h - TRAIL_ATR_MULT * atr_j)
-
-                j += 1
-
-            # Force-close anything still open at the last bar.
-            if not trade["closed"]:
-                last_i = n - 1
-                _close_remainder(
-                    trade,
-                    float(df["Close"].iloc[last_i]),
-                    df.index[last_i],
-                    "EOD_FLAT",
-                )
-
-            total_R = trade["realized_R"]
-            outcome = "WINNER" if total_R > 0 else "LOSER"
-
-            record = {
-                "symbol": trade["symbol"],
-                "entry_time": trade["entry_time"],
-                "exit_time": trade["exit_time"],
-                "entry": trade["entry"],
-                "sl": trade["initial_sl"],
-                "tp1": trade["tp1"],
-                "tp2": trade["tp2"],
-                "swing_low": trade["swing_low"],
-                "swing_high": trade["swing_high"],
-                "exit_price": trade["exit_price"],
-                "exit_reason": trade["exit_reason"],
-                "bars_held": trade["hold_bars"],
-                "total_R": total_R,
-                "outcome": outcome,
-            }
-            results.append(record)
-
-            # --- CHART with EXACT entry + exit markers -------------------
-            generate_chart(
-                df=df,
-                entry_index=trade["entry_time"],
-                entry=trade["entry"],
-                sl=trade["initial_sl"],
-                tp1=trade["tp1"],
-                tp2=trade["tp2"],
-                outcome=outcome,
-                symbol=symbol,
-                swing_low=trade["swing_low"],
-                swing_high=trade["swing_high"],
-                exit_index=trade["exit_time"],
-                exit_price=trade["exit_price"],
-                exit_reason=trade["exit_reason"],
-                scale_index=trade["scale_time"],
-                scale_price=trade["scale_price"],
-            )
-
-            log(
-                f"[trade] {symbol} {outcome} entry={trade['entry']:.2f} "
-                f"sl={trade['initial_sl']:.2f} tp1={trade['tp1']:.2f} "
-                f"tp2={trade['tp2']:.2f} exit={trade['exit_price']:.2f} "
-                f"({trade['exit_reason']}) R={total_R:+.2f} "
-                f"bars={trade['hold_bars']}"
-            )
-
-            # Continue scanning after this trade's exit bar.
-            i = max(j, i + 1)
-
-    # --- summary ----------------------------------------------------------
-    count = len(results)
-    winners = sum(1 for r in results if r["outcome"] == "WINNER")
-    losers = count - winners
-    total_R = sum(r["total_R"] for r in results) if results else 0.0
-    avg_R = (total_R / count) if count else 0.0
-    win_rate = (winners / count * 100.0) if count else 0.0
-
-    summary = {
-        "count": count,
-        "winners": winners,
-        "losers": losers,
-        "total_R": total_R,
-        "avg_R": avg_R,
-        "win_rate": win_rate,
-        "charts_dir": CHARTS_DIR,
+        "direction": direction,
+        "setup_type": setup_type,
+        "regime": regime,
+        "gex": gex,
+        "macro_score": macro_score,
+        "breakout": breakout_up if direction == "long" else breakout_dn,
+        "at_support": at_support if direction == "long" else at_resistance,
+        "mtf_long_votes": int(mtf_long_votes),
+        "mtf_short_votes": int(mtf_short_votes),
+        "mtf_available": int(mtf_available),
+        "confluence_score": int(
+            (1 if regime == "trend" else 0)
+            + (1 if (long_bias or short_bias) else 0)
+            + (1 if mtf_available >= 3 else 0)
+            + (1 if abs(macro_score) < BULLISH_THRESHOLD else 0)
+        ),
     }
-
-    log("-" * 70)
-    log(
-        f"SUMMARY trades={count} winners={winners} losers={losers} "
-        f"win_rate={win_rate:.1f}% total_R={total_R:+.2f} avg_R={avg_R:+.3f} "
-        f"charts={CHARTS_DIR}/"
-    )
-    log("=" * 70)
-
-    return results, summary
-
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    _start = sys.argv[1] if len(sys.argv) > 1 else None
-    _end = sys.argv[2] if len(sys.argv) > 2 else None
-    run_backtest(start=_start, end=_end)

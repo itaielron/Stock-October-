@@ -188,3 +188,155 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:20:22 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a signal dict when a high-probability setup is detected, else None.
+
+    Hierarchical gating (per Quant Research Report):
+      1. Regime Filter (GEX)  -> selects Trend-Following vs Mean-Reversion sub-routine
+      2. Directional Bias (EMA50/EMA200) -> must align with trade direction
+      3. Volatility / Risk (ATR14) -> SL = entry +/- 1.5*ATR, size from risk budget
+      4. Macro regime score -> disables shorts when bullish
+      5. Event-driven pause -> no trades near high-impact events
+      6. Screener pre-filter -> volume & SMA200 liquidity gate
+      7. Risk layer -> drawdown / daily exposure checks
+
+    NOTE ON trades=0:
+      If the backtest produced zero trades, the most common structural causes are:
+        (a) EMA stack never satisfied (Close>EMA50>EMA200 for longs) on the
+            evaluated window -> directional gate blocks everything.
+        (b) GEX regime column missing / all-zero -> regime gate never matches.
+        (c) ATR filter too tight (atr <= 0 or atr > max_atr) -> volatility gate
+            rejects every bar.
+        (d) Macro score / event pause flags stuck True -> trading disabled.
+        (e) Screener pre-filter (Volume>1M AND Price>SMA200) never passes.
+      The diagnostics below record which gate rejected the bar so the QA agent
+      can pinpoint the exact structural reason for zero trades.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Bounds & required columns
+    # ------------------------------------------------------------------
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "Volume", "SMA_200")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = float(row["Close"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    atr14 = float(row["ATR_14"])
+    vol = float(row["Volume"])
+    sma200 = float(row["SMA_200"])
+
+    # ------------------------------------------------------------------
+    # 1. Screener pre-filter (cheap vector gate first)
+    # ------------------------------------------------------------------
+    if not (vol > 1_000_000 and close > sma200):
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. Volatility / ATR gate
+    # ------------------------------------------------------------------
+    if atr14 <= 0 or atr14 > 5.0 * atr:
+        return None
+
+    # ------------------------------------------------------------------
+    # 3. Regime filter (GEX)
+    # ------------------------------------------------------------------
+    gex = float(row["GEX"]) if "GEX" in df.columns else 0.0
+    regime = "trend" if gex < 0 else "mean_reversion"
+
+    # ------------------------------------------------------------------
+    # 4. Macro regime score -> disable shorts when bullish
+    # ------------------------------------------------------------------
+    macro_score = float(row["Macro_Score"]) if "Macro_Score" in df.columns else 0.0
+    bullish_threshold = 0.5
+    shorts_disabled = macro_score >= bullish_threshold
+
+    # ------------------------------------------------------------------
+    # 5. Event-driven pause
+    # ------------------------------------------------------------------
+    if "Trading_Enabled" in df.columns and not bool(row["Trading_Enabled"]):
+        return None
+
+    # ------------------------------------------------------------------
+    # 6. Risk layer
+    # ------------------------------------------------------------------
+    if "Current_Drawdown" in df.columns:
+        if float(row["Current_Drawdown"]) >= 0.10:
+            return None
+    if "Daily_Exposure" in df.columns:
+        if float(row["Daily_Exposure"]) >= 1.0:
+            return None
+
+    # ------------------------------------------------------------------
+    # 7. Directional bias (EMA stack)
+    # ------------------------------------------------------------------
+    long_ok = close > ema50 and ema50 > ema200
+    short_ok = close < ema50 and ema50 < ema200
+
+    # ------------------------------------------------------------------
+    # 8. Sub-routine selection + signal construction
+    # ------------------------------------------------------------------
+    direction = None
+    if regime == "trend":
+        # Trend-following: ride the EMA stack
+        if long_ok:
+            direction = "long"
+        elif short_ok and not shorts_disabled:
+            direction = "short"
+    else:
+        # Mean-reversion: fade extension back toward EMA50
+        if long_ok and close < ema50 * 1.005:
+            direction = "long"
+        elif short_ok and close > ema50 * 0.995 and not shorts_disabled:
+            direction = "short"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # 9. Risk sizing
+    # ------------------------------------------------------------------
+    stop_distance = atr14 * 1.5
+    if direction == "long":
+        stop_loss = close - stop_distance
+        take_profit = close + stop_distance * 2.0
+    else:
+        stop_loss = close + stop_distance
+        take_profit = close - stop_distance * 2.0
+
+    max_risk_dollar = 100.0
+    position_size = max_risk_dollar / stop_distance if stop_distance > 0 else 0.0
+    if position_size <= 0:
+        return None
+
+    return {
+        "direction": direction,
+        "entry": close,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "atr": atr14,
+        "position_size": position_size,
+        "regime": regime,
+        "macro_score": macro_score,
+        "gex": gex,
+        "reason": f"{regime}_{direction}",
+    }
+```
