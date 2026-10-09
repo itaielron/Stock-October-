@@ -9314,3 +9314,50 @@ Mandate #5 requires MTFA confluence across 1m/3m/5m/15m/1h/4h. A strict AND acro
 - Push diagnostics to GitHub per Mandate #8.
 
 **Next cycle target:** trades > 0 with rejection histogram populated. Win rate is meaningless until signals exist.
+
+--- Sat Oct 10 02:52:22 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:52:16Z -> 2026-10-09T23:52:16Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+# QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+## Why trades=0
+
+Zero trades across 669 bars (SPY 297, QQQ 372) means the gating stack never returned `True`. Given the mandate's hierarchical confluence, the failure is almost certainly a **stacked AND-gate**, not a data problem. Ranked causes:
+
+1. **EMA_200 warmup starvation.** SPY at 297 bars (~5 trading days of 1m) cannot produce a valid EMA_200 until bar ~200. QQQ at 372 bars barely clears it. If the engine requires `EMA_50 > EMA_200` on every bar, the first ~200 bars are structurally dead — and the remaining window is too short for a confluence cluster to form. **This is the #1 suspect.**
+2. **GEX gate mis-handling.** Per mandate #11, missing GEX must default to *neutral* (allow both regimes). If the Coder left a `if gex is None: return False` or a strict `GEX < 0` trend-only branch, every bar is rejected. Verify the neutral fallback is actually wired.
+3. **ATR "within limits" band too tight.** If `ATR_14` bounds were hardcoded for a higher-vol regime, current ATR may sit outside the band on every bar.
+4. **Macro/event pause stuck True.** If the economic-calendar parser failed silently and defaulted `Trading_Enabled=False`, all signals drop. Check logs for the pause flag.
+5. **Screener pre-filter.** `Volume > 1M AND Price > SMA_200` — SPY/QQQ pass trivially, so unlikely, but confirm the subset isn't empty.
+
+## Required diagnostics (next cycle)
+
+Instrument the engine to emit a **per-bar rejection histogram**: count bars failing each gate (EMA, GEX, ATR, macro, risk-layer). One run will pinpoint the culprit. Do not guess.
+
+## Structural fixes before re-run
+
+- **Warmup:** Either extend history to ≥500 bars per symbol, or seed EMA_200 with SMA_200 and mark bars <200 as `warmup=True` (skip, don't reject).
+- **GEX:** Confirm neutral default path executes both trend and mean-reversion sub-routines.
+- **ATR band:** Log min/max ATR_14 observed; widen band to observed range ±20%.
+- **Assertion:** Add `assert trades > 0 or rejection_counts['total'] == bars` so silent zero-trade runs fail loudly.
+
+## Mandate compliance
+
+- #11 (GEX fallback): **unverified — likely violated.**
+- #5 (MTFA): only 1m-equivalent bars present; 3m/5m/15m/1h/4h not evaluated. Flag.
+- #9 (Smart Sleep): not triggered (no PASS).
+- #8 (GitHub sync): confirm push occurred.
+
+**Verdict:** Do not rotate timeframes. Fix the warmup + GEX fallback, add rejection telemetry, re-run same window. Zero trades is a plumbing bug, not a market verdict.
