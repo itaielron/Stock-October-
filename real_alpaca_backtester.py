@@ -206,6 +206,11 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["EMA9"] = out["Close"].ewm(span=9, adjust=False).mean()
     out["EMA21"] = out["Close"].ewm(span=21, adjust=False).mean()
+    out["EMA_20"] = out["Close"].ewm(span=20, adjust=False).mean()
+    out["EMA_50"] = out["Close"].ewm(span=50, adjust=False).mean()
+    out["EMA_100"] = out["Close"].ewm(span=100, adjust=False).mean()
+    out["EMA_200"] = out["Close"].ewm(span=200, adjust=False).mean()
+    out["ATR_14"] = tr.rolling(14).mean()
 
     prev_close = out["Close"].shift(1)
     tr = pd.concat(
@@ -431,7 +436,7 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    Hierarchical confluence cluster — 15Min timeframe.
+    Hierarchical confluence cluster — 1Hour timeframe.
 
     Mandate §11: GEX/options data is NOT available from Alpaca IEX. We derive a
     *mock* GEX proxy strictly from price/volume so the engine NEVER halts.
@@ -452,29 +457,31 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         macro_ok | risk_ok booleans plus per-gate pass counts.
       - Rejection-reason telemetry retained (`_REJECT_STATS`).
 
-    15Min-specific structural tuning (win-rate oriented, not overfit):
-      - Warmup guard = 40 bars (15Min bars are 3x denser than 5Min; 40 bars
-        ≈ 10 hours of context — enough for EMA_50/20 + ATR_14 + swing seeding
-        on a 1-week window without eating the whole sample).
-      - Swing lookback = 16 bars (15Min swings span ~4 hours).
-      - Pullback tolerance = 0.6 ATR around EMA_50 (15Min noise is larger
-        than 5Min; too tight a tolerance starves the trend sub-routine).
-      - Momentum body >= 0.30 ATR (15Min bars carry more signal; require a
+    1Hour-specific structural tuning (win-rate oriented, not overfit):
+      - Warmup guard = 60 bars (1H bars are 12x denser than 5Min; 60 bars
+        ≈ 2.5 trading days of context — enough for EMA_50/20 + ATR_14 +
+        swing seeding on a 1-week window without eating the whole sample).
+      - Swing lookback = 24 bars (1H swings span ~1 trading day).
+      - Pullback tolerance = 0.8 ATR around EMA_50 (1H noise is larger
+        than 15Min; too tight a tolerance starves the trend sub-routine).
+      - Momentum body >= 0.35 ATR (1H bars carry more signal; require a
         decisive body to filter chop).
-      - R:R >= 2.0 on TP1, 3.5 on TP2 (15Min moves are larger than 5Min;
+      - R:R >= 2.2 on TP1, 4.0 on TP2 (1H moves are larger than 15Min;
         demand more edge per trade to lift win rate).
-      - Mean-reversion stretch cap = 1.2 ATR from swing extreme (15Min
-        mean-reversion needs a genuine stretch, but 15Min swings are wider).
-      - Trend continuation requires EMA_50 slope agreement over 4 bars
-        (15Min slope over 3 bars is too noisy).
+      - Mean-reversion stretch cap = 1.5 ATR from swing extreme (1H
+        mean-reversion needs a genuine stretch, but 1H swings are wider).
+      - Trend continuation requires EMA_50 slope agreement over 6 bars
+        (1H slope over 4 bars is too noisy).
       - ADX-style regime fallback: when GEX proxy is neutral, use realized
         vol expansion (recent vs prior) to route trend vs mean-revert.
-      - Volume confirmation: require current bar volume >= 1.1x rolling mean
-        (15Min bars are less noisy; demand above-average participation).
+      - Volume confirmation: require current bar volume >= 1.15x rolling mean
+        (1H bars are less noisy; demand above-average participation).
       - Higher-timeframe agreement: require EMA_50 vs EMA_200 alignment
-        when EMA_200 is available (15Min benefits from the slower anchor).
+        when EMA_200 is available (1H benefits from the slower anchor).
       - HTF trend anchor: when EMA_200 is unavailable, require EMA_50 vs
         EMA_20 alignment AND EMA_50 slope agreement (double confirmation).
+      - 1H-specific: require the prior bar to confirm direction (no
+        counter-trend entries against the immediately preceding bar).
 
     Confluence stack (all must agree):
         1) GEX regime  (proxy, neutral-permissive)
@@ -502,8 +509,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         _REJECT_STATS[reason] = _REJECT_STATS.get(reason, 0) + 1
         return None
 
-    # ---- Warmup guard: 40 bars for 15Min (≈10h context) ----
-    if i < 40:
+    # ---- Warmup guard: 60 bars for 1Hour (≈2.5 trading days context) ----
+    if i < 60:
         return _rej("warmup")
 
     # ---- Required columns (fail-soft: skip bar, never raise) ----
@@ -571,7 +578,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     #    Fallback: gex_regime = "neutral" when proxy is degenerate.
     #    Neutral routes via realized-vol expansion (ADX-style proxy).
     # ============================================================
-    lookback = 20  # 15Min: 20 bars ≈ 5h of context for the proxy
+    lookback = 24  # 1H: 24 bars ≈ 1 trading day of context for the proxy
     if i < lookback:
         return _rej("warmup")
     window = df.iloc[i - lookback:i]
@@ -593,12 +600,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         drift = (close - vwap) / vwap if vwap > 0 else 0.0
 
         rets = np.diff(w_close) / w_close[:-1]
-        if len(rets) >= 14:
-            recent_vol = float(np.std(rets[-6:])) + 1e-9
-            prior_vol = float(np.std(rets[:-6])) + 1e-9
+        if len(rets) >= 16:
+            recent_vol = float(np.std(rets[-8:])) + 1e-9
+            prior_vol = float(np.std(rets[:-8])) + 1e-9
             vol_slope = (recent_vol - prior_vol) / prior_vol
             # ADX-style: expanding realized vol => trending regime.
-            vol_expansion = vol_slope > 0.18
+            vol_expansion = vol_slope > 0.15
         else:
             vol_slope = 0.0
 
@@ -655,35 +662,43 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     _GATE_TRACE["atr_ok"] += 1
 
     # ============================================================
-    # 4) STRUCTURAL PULLBACK + MOMENTUM + VOLUME (15Min tuned)
+    # 4) STRUCTURAL PULLBACK + MOMENTUM + VOLUME (1Hour tuned)
     # ============================================================
-    swing_low = float(df["Low"].iloc[max(0, i - 16):i].min())
-    swing_high = float(df["High"].iloc[max(0, i - 16):i].max())
+    swing_low = float(df["Low"].iloc[max(0, i - 24):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 24):i].max())
 
     body = close - open_
-    # 15Min: require a decisive body (>= 0.30 ATR) to filter chop.
-    min_body = atr14 * 0.30
+    # 1H: require a decisive body (>= 0.35 ATR) to filter chop.
+    min_body = atr14 * 0.35
     bullish_bar = body > min_body and close > float(prev["Close"])
     bearish_bar = body < -min_body and close < float(prev["Close"])
 
-    # Volume confirmation: current bar volume >= 1.1x rolling mean (20 bars).
+    # 1H-specific: prior bar must confirm direction (no counter-trend entries
+    # against the immediately preceding bar).
+    prev_close = float(prev["Close"])
+    prev_open = float(prev["Open"])
+    prev_body = prev_close - prev_open
+    prev_bullish = prev_body > 0
+    prev_bearish = prev_body < 0
+
+    # Volume confirmation: current bar volume >= 1.15x rolling mean (24 bars).
     vol_ok = True
     try:
-        vol_mean = float(df["Volume"].iloc[max(0, i - 20):i].astype(float).mean())
+        vol_mean = float(df["Volume"].iloc[max(0, i - 24):i].astype(float).mean())
         if vol_mean > 0:
-            vol_ok = vol >= (vol_mean * 1.1)
+            vol_ok = vol >= (vol_mean * 1.15)
     except (TypeError, ValueError):
         vol_ok = True
 
-    # EMA_50 slope over 4 bars — 15Min trend continuation confirmation.
+    # EMA_50 slope over 6 bars — 1H trend continuation confirmation.
     ema50_slope_up = False
     ema50_slope_dn = False
-    if i >= 4:
+    if i >= 6:
         try:
-            ema50_prev4 = float(df["EMA_50"].iloc[i - 4])
-            if ema50_prev4 == ema50_prev4 and ema50_prev4 > 0:
-                ema50_slope_up = ema50 > ema50_prev4
-                ema50_slope_dn = ema50 < ema50_prev4
+            ema50_prev6 = float(df["EMA_50"].iloc[i - 6])
+            if ema50_prev6 == ema50_prev6 and ema50_prev6 > 0:
+                ema50_slope_up = ema50 > ema50_prev6
+                ema50_slope_dn = ema50 < ema50_prev6
         except (TypeError, ValueError):
             pass
 
@@ -698,13 +713,16 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     def _trend_long():
         if not vol_ok:
             return _rej("volume")
-        recent_low = float(df["Low"].iloc[i - 6:i].min())
-        # 15Min: allow pullback within 0.6 ATR of EMA_50.
-        pulled_back = recent_low <= ema50 + (atr14 * 0.6)
+        recent_low = float(df["Low"].iloc[i - 8:i].min())
+        # 1H: allow pullback within 0.8 ATR of EMA_50.
+        pulled_back = recent_low <= ema50 + (atr14 * 0.8)
         if not pulled_back:
             return _rej("structure")
-        # 15Min continuation: EMA_50 must be rising (or flat-but-not-falling).
+        # 1H continuation: EMA_50 must be rising (or flat-but-not-falling).
         if not ema50_slope_up and ema50_slope_dn:
+            return _rej("structure")
+        # 1H-specific: prior bar must not be a strong counter-trend bar.
+        if prev_bearish and abs(prev_body) > atr14 * 0.5:
             return _rej("structure")
         entry = close
         sl = min(swing_low, recent_low) - (atr14 * 1.5)
@@ -713,7 +731,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry + (risk * 2.0), "tp2": entry + (risk * 3.5),
+            "tp1": entry + (risk * 2.2), "tp2": entry + (risk * 4.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "trend_long", "gex_proxy": gex_proxy,
         }
@@ -721,11 +739,14 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     def _trend_short():
         if not vol_ok:
             return _rej("volume")
-        recent_high = float(df["High"].iloc[i - 6:i].max())
-        pulled_back = recent_high >= ema50 - (atr14 * 0.6)
+        recent_high = float(df["High"].iloc[i - 8:i].max())
+        pulled_back = recent_high >= ema50 - (atr14 * 0.8)
         if not pulled_back:
             return _rej("structure")
         if not ema50_slope_dn and ema50_slope_up:
+            return _rej("structure")
+        # 1H-specific: prior bar must not be a strong counter-trend bar.
+        if prev_bullish and abs(prev_body) > atr14 * 0.5:
             return _rej("structure")
         entry = close
         sl = max(swing_high, recent_high) + (atr14 * 1.5)
@@ -734,7 +755,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry - (risk * 2.0), "tp2": entry - (risk * 3.5),
+            "tp1": entry - (risk * 2.2), "tp2": entry - (risk * 4.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "trend_short", "gex_proxy": gex_proxy,
         }
@@ -742,13 +763,13 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     def _mr_long():
         if not vol_ok:
             return _rej("volume")
-        # 15Min mean-reversion: require close below EMA_50 (stretched down).
+        # 1H mean-reversion: require close below EMA_50 (stretched down).
         if close >= ema50:
             return _rej("structure")
         if not bullish_bar:
             return _rej("structure")
         dist_to_low = (close - swing_low) / atr14
-        if dist_to_low > 1.2:
+        if dist_to_low > 1.5:
             return _rej("structure")
         entry = close
         sl = swing_low - (atr14 * 1.5)
@@ -757,7 +778,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry + (risk * 2.0), "tp2": entry + (risk * 3.5),
+            "tp1": entry + (risk * 2.2), "tp2": entry + (risk * 4.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "mr_long", "gex_proxy": gex_proxy,
         }
@@ -770,7 +791,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not bearish_bar:
             return _rej("structure")
         dist_to_high = (swing_high - close) / atr14
-        if dist_to_high > 1.2:
+        if dist_to_high > 1.5:
             return _rej("structure")
         entry = close
         sl = swing_high + (atr14 * 1.5)
@@ -779,7 +800,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry - (risk * 2.0), "tp2": entry - (risk * 3.5),
+            "tp1": entry - (risk * 2.2), "tp2": entry - (risk * 4.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "mr_short", "gex_proxy": gex_proxy,
         }
