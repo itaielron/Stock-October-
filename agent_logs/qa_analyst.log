@@ -8206,3 +8206,186 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": "ok",
     }
 ```
+
+--- Sat Oct 10 02:41:13 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. Each gate below is annotated with
+    the reason it can zero out the entire run so the QA/Evaluator agent can
+    pinpoint the culprit without re-running:
+
+      1. Warmup / index guard  -> i < 200 kills the first 200 bars.
+      2. NaN guard             -> any NaN in EMA_50/EMA_200/ATR_14 kills the bar.
+      3. ATR band              -> atr <= 0 or atr > 3*median_atr kills the bar.
+      4. EMA trend gate        -> Close vs EMA_50 vs EMA_200 mismatch.
+      5. GEX regime gate       -> regime must match strategy family.
+      6. Macro score gate      -> macro_score must clear threshold.
+      7. Event pause           -> trading_enabled must be True.
+      8. Risk layer            -> drawdown / daily exposure must be within limits.
+
+    If trades == 0, the evaluator should log which gate rejected the most bars.
+    """
+    import numpy as np
+
+    # ------------------------------------------------------------------
+    # 0. Warmup / index guard
+    # ------------------------------------------------------------------
+    if i < 200:
+        return None
+
+    row = df.iloc[i]
+
+    # ------------------------------------------------------------------
+    # 1. Required columns present?
+    # ------------------------------------------------------------------
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+
+    # ------------------------------------------------------------------
+    # 2. NaN guard
+    # ------------------------------------------------------------------
+    if any(v is None or (isinstance(v, float) and np.isnan(v))
+           for v in (close, ema50, ema200, atr14)):
+        return None
+
+    # ------------------------------------------------------------------
+    # 3. ATR sanity band (volatility filter)
+    #    Reject dead / exploded volatility regimes.
+    # ------------------------------------------------------------------
+    if atr14 <= 0:
+        return None
+    if "ATR_14" in df.columns:
+        med_atr = df["ATR_14"].iloc[max(0, i - 200):i].median()
+        if med_atr and med_atr > 0:
+            if atr14 > 3.0 * med_atr or atr14 < 0.25 * med_atr:
+                return None
+
+    # ------------------------------------------------------------------
+    # 4. Macro / event / risk gates (fail-closed)
+    # ------------------------------------------------------------------
+    if not bool(row.get("trading_enabled", True)):
+        return None
+
+    macro_score = row.get("macro_score", 0.0)
+    bullish_threshold = row.get("bullish_threshold", 0.5)
+    bearish_threshold = row.get("bearish_threshold", -0.5)
+
+    max_dd = row.get("max_allowed_drawdown", 1.0)
+    cur_dd = row.get("current_drawdown", 0.0)
+    if cur_dd >= max_dd:
+        return None
+
+    daily_exposure = row.get("daily_exposure", 0.0)
+    account_limit = row.get("account_limit", 1.0)
+    if daily_exposure >= account_limit:
+        return None
+
+    # ------------------------------------------------------------------
+    # 5. GEX regime -> strategy family
+    # ------------------------------------------------------------------
+    gex = row.get("GEX", 0.0)
+    if gex < 0:
+        regime = "trend"
+    else:
+        regime = "mean_reversion"
+
+    # ------------------------------------------------------------------
+    # 6. EMA directional bias
+    # ------------------------------------------------------------------
+    long_ok = (close > ema50) and (ema50 > ema200)
+    short_ok = (close < ema50) and (ema50 < ema200)
+
+    # Macro override: bullish macro disables shorts, bearish disables longs.
+    if macro_score >= bullish_threshold:
+        short_ok = False
+    if macro_score <= bearish_threshold:
+        long_ok = False
+
+    # ------------------------------------------------------------------
+    # 7. Build candidate signal
+    # ------------------------------------------------------------------
+    direction = None
+    if long_ok:
+        direction = "long"
+    elif short_ok:
+        direction = "short"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # 8. Regime / direction compatibility
+    #    Trend regime -> trade WITH the EMA trend (already enforced).
+    #    Mean-reversion regime -> only take counter-trend fades that are
+    #    still inside the broader EMA structure.
+    # ------------------------------------------------------------------
+    if regime == "mean_reversion":
+        # In positive-gamma, fade extremes but require price to be
+        # stretched from EMA_50 by at least 1 ATR.
+        stretch = abs(close - ema50)
+        if stretch < 1.0 * atr14:
+            return None
+
+    # ------------------------------------------------------------------
+    # 9. Risk sizing (ATR-based)
+    # ------------------------------------------------------------------
+    stop_distance = atr14 * 1.5
+    if stop_distance <= 0:
+        return None
+
+    if direction == "long":
+        entry = close
+        stop = entry - stop_distance
+        tp1 = entry + stop_distance * 1.5
+        tp2 = entry + stop_distance * 3.0
+    else:
+        entry = close
+        stop = entry + stop_distance
+        tp1 = entry - stop_distance * 1.5
+        tp2 = entry - stop_distance * 3.0
+
+    max_risk_dollar = row.get("max_risk_dollar", 100.0)
+    position_size = max_risk_dollar / stop_distance if stop_distance else 0.0
+    if position_size <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 10. Emit setup
+    # ------------------------------------------------------------------
+    return {
+        "direction": direction,
+        "regime": regime,
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr14),
+        "stop_distance": float(stop_distance),
+        "position_size": float(position_size),
+        "macro_score": float(macro_score),
+        "gex": float(gex),
+        "reason": (
+            f"{regime}|{direction}|close={close:.4f}|ema50={ema50:.4f}|"
+            f"ema200={ema200:.4f}|atr={atr14:.4f}"
+        ),
+    }
+```
