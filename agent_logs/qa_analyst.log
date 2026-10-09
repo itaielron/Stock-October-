@@ -8068,3 +8068,141 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:40:47 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade signal, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    The previous backtest produced trades=0. Root causes (in order of likelihood):
+
+      1. GEX regime column missing / all-NaN -> regime filter never matches,
+         so every candidate is rejected before EMA/ATR checks.
+      2. EMA_200 warm-up: with only ~1 week of 1m/3m data, EMA_200 is NaN for
+         the entire window, so `Close > EMA_50 > EMA_200` is never True.
+      3. ATR gate too tight (e.g. requiring ATR within a narrow band) filters
+         out every bar in low-vol regimes.
+      4. Strict AND-chaining of [GEX AND EMA AND ATR AND macro AND event-pause]
+         means a single missing/False component kills 100% of signals.
+
+    This rewrite:
+      - Degrades gracefully when GEX is unavailable (treats as neutral, not
+        as a hard reject) so we can still gather EMA/ATR confluence stats.
+      - Uses a shorter EMA warm-up fallback (EMA_50 vs EMA_200, but if
+        EMA_200 is NaN we fall back to EMA_50 slope as trend proxy).
+      - Keeps ATR as a *sizing* input, not a hard gate, unless ATR is
+        degenerate (<=0 or > 5x median).
+      - Emits a diagnostic reason string on rejection so the QA agent can
+        aggregate WHY losers/no-trades occurred.
+    """
+
+    # ---- 0. Bounds & basic hygiene -------------------------------------
+    if i < 2 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = float(row.get("Close", float("nan")))
+    if not (close == close):  # NaN guard
+        return None
+
+    if atr is None or atr != atr or atr <= 0:
+        return None
+
+    # ---- 1. Regime filter (GEX) ----------------------------------------
+    # GEX < 0 -> trend-following ; GEX > 0 -> mean-reversion.
+    # If GEX column is absent or NaN, we DO NOT hard-reject; we mark regime
+    # as "unknown" and allow EMA trend to drive direction. This prevents the
+    # all-NaN-GEX -> trades=0 failure mode.
+    gex = row.get("GEX", None)
+    if gex is None or gex != gex:
+        regime = "unknown"
+    elif gex < 0:
+        regime = "trend"
+    else:
+        regime = "meanrev"
+
+    # ---- 2. EMA trend alignment ----------------------------------------
+    ema50 = row.get("EMA_50", None)
+    ema200 = row.get("EMA_200", None)
+    ema50_prev = prev.get("EMA_50", None)
+
+    if ema50 is None or ema50 != ema50:
+        return {"signal": None, "reason": "ema50_nan"}
+
+    # EMA_200 warm-up fallback: if EMA_200 is NaN (short history), use the
+    # slope of EMA_50 as a trend proxy instead of hard-rejecting.
+    if ema200 is None or ema200 != ema200:
+        if ema50_prev is None or ema50_prev != ema50_prev:
+            return {"signal": None, "reason": "ema200_nan_no_slope"}
+        trend_up = (close > ema50) and (ema50 > ema50_prev)
+        trend_dn = (close < ema50) and (ema50 < ema50_prev)
+        trend_src = "ema50_slope"
+    else:
+        trend_up = (close > ema50) and (ema50 > ema200)
+        trend_dn = (close < ema50)
+        trend_src = "ema50_200"
+
+    # ---- 3. ATR sanity (sizing input, not a hard gate) ------------------
+    # Reject only degenerate ATR (non-positive already handled). We do NOT
+    # reject on "ATR too small/large" because that was a silent killer of
+    # every signal in low-vol windows.
+    atr_ok = atr > 0
+
+    # ---- 4. Direction resolution ---------------------------------------
+    direction = None
+    if regime == "trend":
+        if trend_up:
+            direction = "long"
+        elif trend_dn:
+            direction = "short"
+    elif regime == "meanrev":
+        # Mean-reversion: fade extension. Long if price stretched below
+        # EMA_50, short if stretched above.
+        if close < ema50 and trend_dn:
+            direction = "long"
+        elif close > ema50 and trend_up:
+            direction = "short"
+    else:  # unknown regime -> default to trend-following on EMA
+        if trend_up:
+            direction = "long"
+        elif trend_dn:
+            direction = "short"
+
+    if direction is None:
+        return {"signal": None, "reason": f"no_direction_{regime}_{trend_src}"}
+
+    if not atr_ok:
+        return {"signal": None, "reason": "atr_degenerate"}
+
+    # ---- 5. Risk sizing (ATR-based) ------------------------------------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        stop_loss = close - sl_dist
+        take_profit = close + (sl_dist * 2.0)  # 2R target
+    else:
+        stop_loss = close + sl_dist
+        take_profit = close - (sl_dist * 2.0)
+
+    return {
+        "signal": direction,
+        "entry": close,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "atr": atr,
+        "regime": regime,
+        "trend_src": trend_src,
+        "reason": "ok",
+    }
+```
