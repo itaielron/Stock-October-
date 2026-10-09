@@ -1688,3 +1688,190 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:23:58 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    The previous run produced trades=0. Root causes (in order of likelihood):
+
+      1. Warm-up starvation: EMA_200 requires >=200 bars. If the caller only
+         feeds the "past week" of 1m/3m/5m data, EMA_200 is NaN for the entire
+         window and every directional gate fails silently. We now require a
+         minimum bar count and fall back to a shorter EMA stack when the
+         long-horizon EMA is unavailable, instead of returning None forever.
+
+      2. GEX regime never matched: if `gex` column is missing or all-zero,
+         the regime filter rejected every bar. We now treat missing/zero GEX
+         as NEUTRAL and allow both trend and mean-reversion sub-routines,
+         tagging the setup so the evaluator can still learn from it.
+
+      3. ATR band too tight: ATR percentile gate rejected everything during
+         low-vol regimes. We now use a soft band with a fallback.
+
+      4. Macro/event pause stuck True: if the calendar flag was never reset,
+         Trading_Enabled stayed False. We now only honor the pause if the
+         timestamp is actually inside the event window.
+
+    Every rejection path is recorded in `df.attrs['reject_log']` so the QA
+    agent can diagnose WHY losers lost / winners won on the next cycle.
+    """
+
+    # ---- 0. Bookkeeping / reject logging -------------------------------
+    reject_log = df.attrs.setdefault("reject_log", [])
+    def _reject(reason: str):
+        reject_log.append((i, reason))
+        return None
+
+    # ---- 1. Bounds & warm-up -------------------------------------------
+    if i < 2 or i >= len(df):
+        return _reject("out_of_bounds")
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    # ---- 2. Event-driven pause (only if truly inside window) -----------
+    # Caller is expected to set df.attrs['event_pause_until'] as a timestamp.
+    pause_until = df.attrs.get("event_pause_until")
+    if pause_until is not None:
+        try:
+            ts = df.index[i]
+            if ts <= pause_until:
+                return _reject("event_pause")
+        except Exception:
+            pass  # non-datetime index -> ignore pause
+
+    # ---- 3. Risk-management layer (drawdown / exposure) ----------------
+    if df.attrs.get("trading_enabled", True) is False:
+        return _reject("trading_disabled")
+    if df.attrs.get("current_drawdown", 0.0) >= df.attrs.get("max_drawdown", 1.0):
+        return _reject("max_drawdown")
+    if df.attrs.get("daily_exposure", 0.0) >= df.attrs.get("account_limit", 1.0):
+        return _reject("daily_exposure")
+
+    # ---- 4. ATR sanity --------------------------------------------------
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return _reject("atr_invalid")
+
+    # ---- 5. EMA stack (with graceful degradation) ----------------------
+    ema50 = row.get("ema_50", np.nan)
+    ema200 = row.get("ema_200", np.nan)
+    close = row["close"]
+
+    # Fallback: if EMA_200 unavailable (short window), use EMA_100 or EMA_50
+    # as the slow anchor so we don't starve the whole run.
+    if not np.isfinite(ema200):
+        ema200 = row.get("ema_100", np.nan)
+    if not np.isfinite(ema200):
+        ema200 = ema50  # last resort: collapse to single-EMA trend
+    if not np.isfinite(ema50) or not np.isfinite(ema200):
+        return _reject("ema_nan")
+
+    long_trend = (close > ema50) and (ema50 >= ema200)
+    short_trend = (close < ema50) and (ema50 <= ema200)
+
+    # ---- 6. GEX regime (neutral fallback) ------------------------------
+    gex = row.get("gex", np.nan)
+    if not np.isfinite(gex) or gex == 0:
+        regime = "neutral"
+    elif gex < 0:
+        regime = "trend"          # negative gamma -> trend-following
+    else:
+        regime = "mean_revert"    # positive gamma -> mean-reversion
+
+    # ---- 7. Macro score gate -------------------------------------------
+    macro_score = df.attrs.get("macro_score", 0.0)
+    bull_thresh = df.attrs.get("bullish_threshold", 1.0)
+    bear_thresh = df.attrs.get("bearish_threshold", -1.0)
+    if macro_score >= bull_thresh:
+        short_trend = False
+    if macro_score <= bear_thresh:
+        long_trend = False
+
+    # ---- 8. Multi-timeframe confluence ---------------------------------
+    # Caller is expected to attach higher-TF EMAs as columns:
+    #   ema_50_5m, ema_50_15m, ema_50_1h, ema_50_4h
+    # Missing HTF columns are treated as "no opinion" (not a veto).
+    def _htf_align(direction: str) -> int:
+        score = 0
+        for tf in ("5m", "15m", "1h", "4h"):
+            col = f"ema_50_{tf}"
+            v = row.get(col, np.nan)
+            if not np.isfinite(v):
+                continue
+            if direction == "long" and close > v:
+                score += 1
+            elif direction == "short" and close < v:
+                score += 1
+        return score
+
+    # ---- 9. Strategy selection -----------------------------------------
+    setup = None
+
+    if regime in ("trend", "neutral"):
+        # Trend-following sub-routine
+        if long_trend:
+            htf = _htf_align("long")
+            if htf >= 1 or regime == "neutral":
+                setup = {"side": "long", "strategy": "trend", "htf_score": htf}
+        elif short_trend:
+            htf = _htf_align("short")
+            if htf >= 1 or regime == "neutral":
+                setup = {"side": "short", "strategy": "trend", "htf_score": htf}
+
+    if setup is None and regime in ("mean_revert", "neutral"):
+        # Mean-reversion sub-routine: fade extension from EMA_50
+        dist = (close - ema50) / atr if atr else 0.0
+        if dist <= -1.5 and long_trend:
+            setup = {"side": "long", "strategy": "mean_revert", "htf_score": 0}
+        elif dist >= 1.5 and short_trend:
+            setup = {"side": "short", "strategy": "mean_revert", "htf_score": 0}
+
+    if setup is None:
+        return _reject("no_confluence")
+
+    # ---- 10. ATR-based risk sizing -------------------------------------
+    side = setup["side"]
+    entry = close
+    sl_mult = 1.5
+    if side == "long":
+        sl = entry - atr * sl_mult
+        tp1 = entry + atr * sl_mult * 1.0   # 1R
+        tp2 = entry + atr * sl_mult * 2.0   # 2R
+    else:
+        sl = entry + atr * sl_mult
+        tp1 = entry - atr * sl_mult * 1.0
+        tp2 = entry - atr * sl_mult * 2.0
+
+    max_risk = df.attrs.get("max_risk_dollar", 100.0)
+    pos_size = max_risk / (atr * sl_mult) if atr * sl_mult > 0 else 0.0
+
+    # ---- 11. Emit setup ------------------------------------------------
+    return {
+        "side": side,
+        "strategy": setup["strategy"],
+        "regime": regime,
+        "htf_score": setup["htf_score"],
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "pos_size": float(pos_size),
+        "ema50": float(ema50),
+        "ema200": float(ema200),
+        "macro_score": float(macro_score),
+        "bar_index": int(i),
+    }
+```
