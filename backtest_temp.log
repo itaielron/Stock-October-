@@ -1,14 +1,7 @@
 ======================================================================
-Confluence-cluster backtest 2026-10-02T23:48:57Z -> 2026-10-09T23:48:57Z symbols=['SPY', 'QQQ']
+Confluence-cluster backtest 2026-10-02T23:49:21Z -> 2026-10-09T23:49:21Z symbols=['SPY', 'QQQ']
 [info] SPY: 297 bars, backtesting...
-Traceback (most recent call last):
-  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 996, in <module>
-    run_backtest(start=_start, end=_end)
-    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 804, in run_backtest
-    cluster = _confluence_cluster(df, i, atr)
-  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 526, in _confluence_cluster
-    raise RuntimeError(
-    ...<4 lines>...
-    )
-RuntimeError: [FAIL_CLOSED] GEX column missing — mandate §1 requires GEX regime filter. Fix the data puller (or synthesize GEX_PROXY from dealer OI / VIX-term-structure + put-call OI skew) before re-running. Do NOT default GEX to 0.
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================

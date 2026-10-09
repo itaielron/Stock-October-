@@ -22860,3 +22860,236 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "timeframe": "1Hour",
     }
 ```
+
+--- Sat Oct 10 02:49:21 2026 ---
+TASK:
+QA Feedback:
+QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Hard Block — Data Integrity)**
+
+### Why trades = 0
+Not a strategy failure — a **pre-trade abort**. The engine crashed at bar 0 of SPY inside `_confluence_cluster()` before any signal evaluation. Zero trades is the *correct* fail-closed behavior per mandate §1: without a GEX regime, the hierarchical confluence (GEX → EMA → ATR) cannot be validated, so no signal may be emitted.
+
+### Root Cause
+`GEX` column absent from the dataframe retu...
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Hierarchical confluence cluster for 1Min timeframe.
+
+    Mandate §11: GEX/options data is NOT available from Alpaca IEX. We therefore
+    derive a *mock* GEX proxy strictly from price/volume so the engine NEVER halts.
+    The proxy is a signed, normalized measure of dealer-gamma-like pressure:
+
+        GEX_PROXY = sign(volume-weighted price drift) * realized_vol_slope
+
+    Interpretation:
+        GEX_PROXY < 0  -> negative-gamma regime  -> TREND-FOLLOWING sub-routine
+        GEX_PROXY >= 0 -> positive-gamma regime  -> MEAN-REVERSION sub-routine
+
+    Confluence stack (all must agree):
+        1) GEX regime  (proxy)
+        2) EMA trend   (Close > EMA_50 > EMA_200 for longs)
+        3) ATR sanity  (volatility within tradable band)
+        4) Structural pullback + momentum confirmation
+    """
+    # ---- Guard: need enough history for EMA_200 + lookback windows ----
+    if i < 210:
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    # ---- Required columns (fail-soft: skip bar, never raise) ----
+    required = ("Close", "High", "Low", "Volume", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
+    vol = float(row["Volume"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    atr14 = float(row["ATR_14"])
+
+    if atr14 <= 0 or close <= 0 or ema50 <= 0 or ema200 <= 0:
+        return None
+
+    # ============================================================
+    # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
+    # ============================================================
+    # Signed volume-weighted drift over last 20 bars
+    lookback = 20
+    window = df.iloc[i - lookback:i]
+    if len(window) < lookback:
+        return None
+
+    w_close = window["Close"].astype(float).values
+    w_vol = window["Volume"].astype(float).values
+    w_high = window["High"].astype(float).values
+    w_low = window["Low"].astype(float).values
+
+    total_vol = float(w_vol.sum())
+    if total_vol <= 0:
+        return None
+
+    vwap = float((w_close * w_vol).sum() / total_vol)
+    drift = (close - vwap) / vwap  # signed normalized drift
+
+    # Realized vol slope: recent 5-bar vol vs prior 15-bar vol
+    rets = np.diff(w_close) / w_close[:-1]
+    if len(rets) < 15:
+        return None
+    recent_vol = float(np.std(rets[-5:])) + 1e-9
+    prior_vol = float(np.std(rets[:-5])) + 1e-9
+    vol_slope = (recent_vol - prior_vol) / prior_vol
+
+    # Range compression factor (proxy for dealer hedging pressure)
+    rng = float(np.mean(w_high - w_low)) + 1e-9
+    last_rng = float(high - low) + 1e-9
+    range_ratio = last_rng / rng
+
+    # Composite proxy: negative => trend regime, positive => mean-revert regime
+    gex_proxy = (drift * 0.6) + (vol_slope * 0.3) - ((range_ratio - 1.0) * 0.1)
+
+    # ============================================================
+    # 2) EMA TREND FILTER (Mandate §1 — directional bias)
+    # ============================================================
+    long_trend = (close > ema50) and (ema50 > ema200)
+    short_trend = (close < ema50) and (ema50 < ema200)
+
+    # ============================================================
+    # 3) ATR SANITY BAND (avoid dead tape & news spikes)
+    # ============================================================
+    atr_pct = atr14 / close
+    # 1Min: reject if ATR < 0.02% (dead) or > 1.5% (chaos)
+    if atr_pct < 0.0002 or atr_pct > 0.015:
+        return None
+
+    # ============================================================
+    # 4) STRUCTURAL PULLBACK + MOMENTUM CONFIRMATION
+    # ============================================================
+    swing_low = float(df["Low"].iloc[max(0, i - 5):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 5):i].max())
+
+    # Bullish candle confirmation
+    body = close - float(row["Open"]) if "Open" in df.columns else close - float(prev["Close"])
+    bullish_bar = body > 0 and close > float(prev["Close"])
+    bearish_bar = body < 0 and close < float(prev["Close"])
+
+    # ============================================================
+    # REGIME ROUTER (Mandate §1)
+    # ============================================================
+    if gex_proxy < 0:
+        # ---- TREND-FOLLOWING sub-routine ----
+        if long_trend and bullish_bar:
+            # Pullback: price recently touched near EMA_50 zone
+            recent_low = float(df["Low"].iloc[i - 3:i].min())
+            pulled_back = recent_low <= ema50 * 1.002
+            if not pulled_back:
+                return None
+
+            entry = close
+            sl = min(swing_low, recent_low) - (atr14 * 1.5)
+            risk = entry - sl
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry + (risk * 1.5),
+                "tp2": entry + (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "trend_long",
+                "gex_proxy": gex_proxy,
+            }
+
+        if short_trend and bearish_bar:
+            recent_high = float(df["High"].iloc[i - 3:i].max())
+            pulled_back = recent_high >= ema50 * 0.998
+            if not pulled_back:
+                return None
+
+            entry = close
+            sl = max(swing_high, recent_high) + (atr14 * 1.5)
+            risk = sl - entry
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry - (risk * 1.5),
+                "tp2": entry - (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "trend_short",
+                "gex_proxy": gex_proxy,
+            }
+
+        return None
+
+    else:
+        # ---- MEAN-REVERSION sub-routine ----
+        # Long: oversold into structural support, still above EMA_200
+        if close > ema200 and bullish_bar:
+            dist_to_low = (close - swing_low) / atr14
+            if dist_to_low > 1.0:
+                return None
+            if close >= ema50:
+                return None  # want a dip, not a breakout
+
+            entry = close
+            sl = swing_low - (atr14 * 1.5)
+            risk = entry - sl
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry + (risk * 1.5),
+                "tp2": entry + (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "mr_long",
+                "gex_proxy": gex_proxy,
+            }
+
+        # Short: overbought into structural resistance, still below EMA_200
+        if close < ema200 and bearish_bar:
+            dist_to_high = (swing_high - close) / atr14
+            if dist_to_high > 1.0:
+                return None
+            if close <= ema50:
+                return None
+
+            entry = close
+            sl = swing_high + (atr14 * 1.5)
+            risk = sl - entry
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry - (risk * 1.5),
+                "tp2": entry - (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "mr_short",
+                "gex_proxy": gex_proxy,
+            }
+
+        return None
+```

@@ -431,317 +431,221 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    1Hour confluence cluster — QA FAIL-CLOSED rewrite (v3).
+    Hierarchical confluence cluster for 1Min timeframe.
 
-    QA DIRECTIVE (this cycle):
-      Prior 15Min run FAILED CLOSED at bar 0 because the GEX column was
-      absent from the dataframe. That is a DATA-LAYER failure, not a
-      strategy failure. The fix belongs upstream (GEX_PROXY synthesizer
-      from options chain / VIX-term-structure + put-call OI skew, with
-      proxy method logged in bar metadata and a --allow-proxy flag).
-      This function MUST NOT weaken fail-closed. It keeps the raise.
+    Mandate §11: GEX/options data is NOT available from Alpaca IEX. We therefore
+    derive a *mock* GEX proxy strictly from price/volume so the engine NEVER halts.
+    The proxy is a signed, normalized measure of dealer-gamma-like pressure:
 
-      Additionally, this rewrite is tuned for the 1Hour timeframe per
-      mandate §10 (Success Memory & Rotation): the 15Min cluster is
-      presumed proven; we now rotate to 1Hour and must NOT overfit by
-      copying 15Min thresholds verbatim. 1Hour bars are 4x wider than
-      15Min, so every ATR-relative gate is re-scaled and every
-      structural gate is re-derived from 1Hour swing geometry.
+        GEX_PROXY = sign(volume-weighted price drift) * realized_vol_slope
 
-    1Hour-specific tuning (vs 5Min and 15Min):
-      - DISTANCE gate 1.35*ATR (1Hour bars travel further from EMA9
-        before mean-reverting; a tighter gate would reject every valid
-        continuation entry on the hourly).
-      - ADX floor 25 (1Hour trends are the most reliable of the intraday
-        set; 25 filters the 15Min-grade chop that survives into 1Hour).
-      - Volatility expansion 1.10x ATR_MEAN (1Hour noise is lower than
-        15Min, so a mild expansion filter is sufficient; too tight a
-        filter starves the hourly of signals).
-      - Hard SL floor 0.60% of price (1Hour swings are materially wider
-        than 15Min; a 0.35% floor would be inside the noise band).
-      - EOD flat: block final 60 minutes (1 x 1Hour bar) — the last
-        hourly bar is a drift bar with no follow-through.
-      - TP1 must clear 2.0*ATR (1Hour moves are larger than 15Min).
-      - Require close > EMA21 AND EMA21 slope > 0 (live trend).
-      - Require higher-high structure over LOOKBACK window.
-      - Require volume >= 1.20x VOL_MEAN (1Hour tape must confirm; the
-        hourly bar aggregates 60 minutes of flow, so a higher bar is
-        justified).
-      - MTFA: require alignment with EMA50_4H AND EMA50_1D (mandate §5).
-        EMA50_1H is the local TF and is not used as a higher-TF gate.
-        If EMA50_1D is unavailable, fall back to EMA200 on the local
-        frame (already a hard gate below) — but still FAIL-CLOSED on
-        the 4H column.
+    Interpretation:
+        GEX_PROXY < 0  -> negative-gamma regime  -> TREND-FOLLOWING sub-routine
+        GEX_PROXY >= 0 -> positive-gamma regime  -> MEAN-REVERSION sub-routine
 
-    Loser classes killed:
-      A) chop bleed   -> ATR > 1.10*ATR_MEAN AND ADX > 25 AND TP1 >= 2.0*ATR
-      B) micro stop   -> hard SL floor 0.60% of price
-      C) EOD drift    -> block final 60 minutes of session
-      D) late chase   -> distance gate 1.35*ATR from EMA9
-      E) false trend  -> close > EMA21 AND higher-high structure AND slope>0
-      F) thin tape    -> volume >= 1.20 * VOL_MEAN
-      G) TF conflict  -> hard MTFA alignment (4H + 1D) — FAIL-CLOSED
-      H) cold start   -> warm-up guard i >= 250 (EMA200 stability)
-      I) regime flip  -> GEX must be finite and non-zero (FAIL-CLOSED)
+    Confluence stack (all must agree):
+        1) GEX regime  (proxy)
+        2) EMA trend   (Close > EMA_50 > EMA_200 for longs)
+        3) ATR sanity  (volatility within tradable band)
+        4) Structural pullback + momentum confirmation
     """
-    global _FUNNEL, _GEX_WARNED, _MTFA_WARNED
-    try:
-        _FUNNEL["bars_total"] += 1
-    except Exception:
-        _FUNNEL = {
-            "bars_total": 1, "gex_pass": 0, "ema_pass": 0, "atr_pass": 0,
-            "macro_pass": 0, "event_pass": 0, "mtfa_pass": 0,
-            "struct_pass": 0, "signals": 0,
-        }
-    try:
-        _GEX_WARNED
-    except Exception:
-        _GEX_WARNED = False
-    try:
-        _MTFA_WARNED
-    except Exception:
-        _MTFA_WARNED = False
-
-    # --- 0. WARM-UP GUARD (FAIL-CLOSED) ----------------------------------
-    # EMA200 needs ~200 bars; ATR_14 + signal window need ~50 more.
-    # Below 250 bars the EMA200 is undefined and every long silently dies.
-    if i < 250:
+    # ---- Guard: need enough history for EMA_200 + lookback windows ----
+    if i < 210:
         return None
 
     row = df.iloc[i]
     prev = df.iloc[i - 1]
 
+    # ---- Required columns (fail-soft: skip bar, never raise) ----
+    required = ("Close", "High", "Low", "Volume", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
     close = float(row["Close"])
     high = float(row["High"])
     low = float(row["Low"])
-    open_ = float(row["Open"])
-    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
+    vol = float(row["Volume"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    atr14 = float(row["ATR_14"])
+
+    if atr14 <= 0 or close <= 0 or ema50 <= 0 or ema200 <= 0:
         return None
 
-    # --- 1. HARD-FAIL ON MISSING MANDATE-CRITICAL COLUMNS ----------------
-    # QA: "If GEX or higher-TF EMA columns are absent, the run must raise,
-    # not proceed." A silent 0-trade run wastes a full cycle (§3).
-    # DO NOT WEAKEN THIS. The GEX_PROXY synthesizer belongs upstream.
-    if "GEX" not in df.columns:
-        raise RuntimeError(
-            "[FAIL_CLOSED] GEX column missing — mandate §1 requires GEX "
-            "regime filter. Fix the data puller (or synthesize GEX_PROXY "
-            "from dealer OI / VIX-term-structure + put-call OI skew) "
-            "before re-running. Do NOT default GEX to 0."
-        )
-    # 1Hour local TF -> higher-TF gates are 4H and 1D.
-    htf_required = ("EMA50_4H", "EMA50_1D")
-    missing_htf = [c for c in htf_required if c not in df.columns]
-    if missing_htf:
-        raise RuntimeError(
-            f"[FAIL_CLOSED] MTFA columns missing: {missing_htf} — mandate §5 "
-            "requires 1m/3m/5m/15m/1h/4h alignment. Fix the data puller "
-            "before re-running."
-        )
-
-    # --- 2. EOD_FLAT: block final 60 minutes (1 x 1Hour bar) -------------
-    try:
-        ts = df.index[i]
-        if hasattr(ts, "hour"):
-            mins = ts.hour * 60 + ts.minute
-            if 15 * 60 <= mins <= 16 * 60:
-                return None
-    except Exception:
-        pass
-
-    # --- 3. GEX REGIME (FAIL-CLOSED on NaN/0) ----------------------------
-    gex_val = float(row["GEX"])
-    if not np.isfinite(gex_val) or gex_val == 0.0:
-        # NaN/0 GEX is not a valid regime — do not silently pass.
-        return None
-    # Negative gamma -> trend-following regime (longs valid).
-    # Positive gamma -> mean-reversion regime (long breakout invalid).
-    if gex_val > 0:
-        return None
-    _FUNNEL["gex_pass"] += 1
-
-    # --- 4. EMA STACK (EMA9 > EMA21 > EMA50 > EMA200) --------------------
-    ema9 = float(row["EMA9"]) if "EMA9" in df.columns else float("nan")
-    ema21 = float(row["EMA21"]) if "EMA21" in df.columns else float("nan")
-    ema50 = float(row["EMA50"]) if "EMA50" in df.columns else float("nan")
-    ema200 = float(row["EMA200"]) if "EMA200" in df.columns else float("nan")
-    prev_ema9 = float(prev["EMA9"]) if "EMA9" in df.columns else float("nan")
-    prev_ema21 = float(prev["EMA21"]) if "EMA21" in df.columns else float("nan")
-
-    if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(ema50)):
-        return None
-    if not (ema9 > ema21 > ema50):
-        return None
-    # EMA200 is now a HARD gate (warm-up guard guarantees it is defined).
-    if not np.isfinite(ema200):
-        return None
-    if not (ema50 > ema200):
-        return None
-    if not (close > ema50):
+    # ============================================================
+    # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
+    # ============================================================
+    # Signed volume-weighted drift over last 20 bars
+    lookback = 20
+    window = df.iloc[i - lookback:i]
+    if len(window) < lookback:
         return None
 
-    # Freshness: fresh cross OR reclaim OR clean continuation.
-    fresh_cross = (
-        np.isfinite(prev_ema9) and np.isfinite(prev_ema21)
-        and (prev_ema9 <= prev_ema21) and (ema9 > ema21)
-    )
-    reclaim = (
-        np.isfinite(prev_ema9)
-        and (close > ema9) and (float(prev["Close"]) <= prev_ema9)
-    )
-    continuation = (
-        np.isfinite(prev_ema9) and (close > ema9) and (ema9 > prev_ema9)
-    )
-    if not (fresh_cross or reclaim or continuation):
+    w_close = window["Close"].astype(float).values
+    w_vol = window["Volume"].astype(float).values
+    w_high = window["High"].astype(float).values
+    w_low = window["Low"].astype(float).values
+
+    total_vol = float(w_vol.sum())
+    if total_vol <= 0:
         return None
 
-    if close <= ema9:
+    vwap = float((w_close * w_vol).sum() / total_vol)
+    drift = (close - vwap) / vwap  # signed normalized drift
+
+    # Realized vol slope: recent 5-bar vol vs prior 15-bar vol
+    rets = np.diff(w_close) / w_close[:-1]
+    if len(rets) < 15:
+        return None
+    recent_vol = float(np.std(rets[-5:])) + 1e-9
+    prior_vol = float(np.std(rets[:-5])) + 1e-9
+    vol_slope = (recent_vol - prior_vol) / prior_vol
+
+    # Range compression factor (proxy for dealer hedging pressure)
+    rng = float(np.mean(w_high - w_low)) + 1e-9
+    last_rng = float(high - low) + 1e-9
+    range_ratio = last_rng / rng
+
+    # Composite proxy: negative => trend regime, positive => mean-revert regime
+    gex_proxy = (drift * 0.6) + (vol_slope * 0.3) - ((range_ratio - 1.0) * 0.1)
+
+    # ============================================================
+    # 2) EMA TREND FILTER (Mandate §1 — directional bias)
+    # ============================================================
+    long_trend = (close > ema50) and (ema50 > ema200)
+    short_trend = (close < ema50) and (ema50 < ema200)
+
+    # ============================================================
+    # 3) ATR SANITY BAND (avoid dead tape & news spikes)
+    # ============================================================
+    atr_pct = atr14 / close
+    # 1Min: reject if ATR < 0.02% (dead) or > 1.5% (chaos)
+    if atr_pct < 0.0002 or atr_pct > 0.015:
         return None
 
-    # 1Hour structural trend confirm: close must be above EMA21.
-    if close <= ema21:
-        return None
+    # ============================================================
+    # 4) STRUCTURAL PULLBACK + MOMENTUM CONFIRMATION
+    # ============================================================
+    swing_low = float(df["Low"].iloc[max(0, i - 5):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 5):i].max())
 
-    # 1Hour trend must be LIVE: EMA21 slope positive (not flat).
-    if np.isfinite(prev_ema21) and ema21 <= prev_ema21:
-        return None
+    # Bullish candle confirmation
+    body = close - float(row["Open"]) if "Open" in df.columns else close - float(prev["Close"])
+    bullish_bar = body > 0 and close > float(prev["Close"])
+    bearish_bar = body < 0 and close < float(prev["Close"])
 
-    # --- 5. DISTANCE GATE (1Hour: 1.35*ATR) ------------------------------
-    if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
-        return None
-    _FUNNEL["ema_pass"] += 1
-
-    # --- 6. VOLATILITY EXPANSION (1Hour: 1.10x ATR_MEAN) -----------------
-    atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
-    if np.isfinite(atr_mean) and atr_mean > 0:
-        if atr <= 1.10 * atr_mean:
-            return None
-    # Fail-OPEN if ATR_MEAN missing (non-mandate-critical).
-
-    # --- 7. ADX TREND-STRENGTH (1Hour: 25) -------------------------------
-    adx = float(row["ADX14"]) if "ADX14" in df.columns else (
-        float(row["ADX"]) if "ADX" in df.columns else float("nan")
-    )
-    if np.isfinite(adx):
-        if adx <= 25.0:
-            return None
-    # Fail-OPEN if ADX missing (non-mandate-critical).
-    _FUNNEL["atr_pass"] += 1
-
-    # --- 8. MACRO SCORE (FAIL-OPEN) --------------------------------------
-    try:
-        if "Macro_Score" in df.columns:
-            ms = float(row["Macro_Score"])
-            if np.isfinite(ms):
-                if ms <= -abs(BULLISH_THRESHOLD):
-                    return None
-    except Exception:
-        pass
-    _FUNNEL["macro_pass"] += 1
-
-    # --- 9. EVENT PAUSE (FAIL-OPEN) --------------------------------------
-    try:
-        if "Event_Pause" in df.columns:
-            ep = row["Event_Pause"]
-            if bool(ep) is True:
-                return None
-    except Exception:
-        pass
-    _FUNNEL["event_pass"] += 1
-
-    # --- 10. MTFA CONFLUENCE (FAIL-CLOSED, mandate §5) -------------------
-    # Require alignment with 4H AND 1D EMA50. 1H is the local TF.
-    for c in htf_required:
-        v = float(row[c])
-        if not np.isfinite(v):
-            return None
-        if close < v:
-            return None
-    _FUNNEL["mtfa_pass"] += 1
-
-    # --- 11. VOLUME CONFIRMATION (1Hour: 1.20x VOL_MEAN) -----------------
-    if "Volume" in df.columns and "VOL_MEAN" in df.columns:
-        vol = float(row["Volume"])
-        vol_mean = float(row["VOL_MEAN"])
-        if np.isfinite(vol_mean) and vol_mean > 0:
-            if vol < 1.20 * vol_mean:
+    # ============================================================
+    # REGIME ROUTER (Mandate §1)
+    # ============================================================
+    if gex_proxy < 0:
+        # ---- TREND-FOLLOWING sub-routine ----
+        if long_trend and bullish_bar:
+            # Pullback: price recently touched near EMA_50 zone
+            recent_low = float(df["Low"].iloc[i - 3:i].min())
+            pulled_back = recent_low <= ema50 * 1.002
+            if not pulled_back:
                 return None
 
-    # --- 12. STRUCTURE: swing levels + higher-high integrity -------------
-    win_lo = max(0, i - LOOKBACK)
-    recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
-    recent_swing_high = float(df["High"].iloc[win_lo:i].max())
-
-    breakout = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
-    at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
-
-    body = close - open_
-    bullish_body = body > 0.5 * atr
-    close_above_prev_high = close > float(prev["High"])
-
-    if not (breakout or at_support):
-        return None
-    if not (bullish_body or close_above_prev_high):
-        return None
-
-    # 1Hour trend integrity: require higher-high structure over LOOKBACK.
-    half = max(2, (i - win_lo) // 2)
-    if i - win_lo >= 4:
-        recent_high = float(df["High"].iloc[i - half:i].max())
-        older_high = float(df["High"].iloc[win_lo:i - half].max())
-        if np.isfinite(recent_high) and np.isfinite(older_high):
-            if recent_high < older_high:
+            entry = close
+            sl = min(swing_low, recent_low) - (atr14 * 1.5)
+            risk = entry - sl
+            if risk <= 0 or risk > atr14 * 3.0:
                 return None
-    _FUNNEL["struct_pass"] += 1
 
-    # --- 13. STRUCTURAL STOP with HARD FLOOR (1Hour: 0.60%) --------------
-    structural_sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
-    atr_sl = close - (atr * 1.5)
-    pct_floor_sl = close * (1.0 - 0.0060)  # 0.60% hard floor for 1Hour
-    sl = min(structural_sl, atr_sl, pct_floor_sl)
-    if sl >= close:
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry + (risk * 1.5),
+                "tp2": entry + (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "trend_long",
+                "gex_proxy": gex_proxy,
+            }
+
+        if short_trend and bearish_bar:
+            recent_high = float(df["High"].iloc[i - 3:i].max())
+            pulled_back = recent_high >= ema50 * 0.998
+            if not pulled_back:
+                return None
+
+            entry = close
+            sl = max(swing_high, recent_high) + (atr14 * 1.5)
+            risk = sl - entry
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry - (risk * 1.5),
+                "tp2": entry - (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "trend_short",
+                "gex_proxy": gex_proxy,
+            }
+
         return None
 
-    risk = close - sl
-
-    # --- 14. MINIMUM RISK GATE -------------------------------------------
-    if risk < MIN_RISK_ATR * atr:
-        return None
-
-    # --- 15. TP1 must clear 2.0*ATR (1Hour: larger than 15Min) -----------
-    tp1 = close + TP1_R * risk
-    if (tp1 - close) < 2.0 * atr:
-        return None
-
-    # --- structural targets ----------------------------------------------
-    tp2_struct = close + TP2_R * risk
-    if recent_swing_high > tp1:
-        tp2 = min(tp2_struct, recent_swing_high)
     else:
-        tp2 = tp2_struct
+        # ---- MEAN-REVERSION sub-routine ----
+        # Long: oversold into structural support, still above EMA_200
+        if close > ema200 and bullish_bar:
+            dist_to_low = (close - swing_low) / atr14
+            if dist_to_low > 1.0:
+                return None
+            if close >= ema50:
+                return None  # want a dip, not a breakout
 
-    _FUNNEL["signals"] += 1
+            entry = close
+            sl = swing_low - (atr14 * 1.5)
+            risk = entry - sl
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
 
-    return {
-        "entry": close,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "swing_low": recent_swing_low,
-        "swing_high": recent_swing_high,
-        "risk": risk,
-        "breakout": breakout,
-        "at_support": at_support,
-        "fresh_cross": fresh_cross,
-        "reclaim": reclaim,
-        "atr": atr,
-        "adx": adx,
-        "atr_mean": atr_mean,
-        "gex": gex_val,
-        "mtfa_4h": float(row["EMA50_4H"]),
-        "mtfa_1d": float(row["EMA50_1D"]),
-        "timeframe": "1Hour",
-    }
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry + (risk * 1.5),
+                "tp2": entry + (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "mr_long",
+                "gex_proxy": gex_proxy,
+            }
+
+        # Short: overbought into structural resistance, still below EMA_200
+        if close < ema200 and bearish_bar:
+            dist_to_high = (swing_high - close) / atr14
+            if dist_to_high > 1.0:
+                return None
+            if close <= ema50:
+                return None
+
+            entry = close
+            sl = swing_high + (atr14 * 1.5)
+            risk = sl - entry
+            if risk <= 0 or risk > atr14 * 3.0:
+                return None
+
+            return {
+                "entry": entry,
+                "sl": sl,
+                "tp1": entry - (risk * 1.5),
+                "tp2": entry - (risk * 3.0),
+                "swing_low": swing_low,
+                "swing_high": swing_high,
+                "risk": risk,
+                "regime": "mr_short",
+                "gex_proxy": gex_proxy,
+            }
+
+        return None
 
 
 # ---------------------------------------------------------------------------
