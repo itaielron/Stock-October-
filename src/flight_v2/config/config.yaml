@@ -1,0 +1,26 @@
+origin: TLV
+destinations:
+  europe: [LHR, CDG, AMS, FRA, MUC, MAD, BCN, FCO, MXP, ATH, IST, VIE, ZRH, BER, LIS, PRG, WAW, BUD, OTP, KEF]
+  us_east: [JFK, EWR, BOS, IAD, PHL, MIA, ATL]
+
+amadeus:
+  monthly_call_budget: 1800
+  daily_call_budget: 60
+  destinations_per_day: 10
+  days_per_destination: 3
+
+fli:
+  days_ahead: 45
+  max_routes_per_day: 300
+  throttle_seconds: 2
+
+detection:
+  window_days: 30
+  min_samples: 5
+  z_threshold: -1.5
+  pct_threshold: -20
+
+notify:
+  telegram_channel: 402367764
+  alert_unconfirmed: false
+  max_alerts_per_day: 20

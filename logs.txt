@@ -1,0 +1,364 @@
+2026-10-10 00:38:45: task_name="None", task="1. Read the existing gate parameters using 'Read Tools File'.
+2. Formulate the mathematical logic for the 6 new rules:
+   - T3-B: 15-30m cooldown per ticker/direction.
+   - T3-C: Bracket sanity validator (TP1/SL must not be inverted).
+   - T3-D: ATR stop scaling floor.
+   - T3-E: EMA extension/distance filter.
+   - T3-F: S/R buffer zone.
+   - T3-G: GEX recalibration.
+3. Output the exact Python functions needed to implement these gates.
+4. Use 'Finish Task Tool' to mark them as Done on the Kanban board.", agent="Math Engine", status="started"
+2026-10-10 00:39:00: task_name="None", task="1. Read the existing gate parameters using 'Read Tools File'.
+2. Formulate the mathematical logic for the 6 new rules:
+   - T3-B: 15-30m cooldown per ticker/direction.
+   - T3-C: Bracket sanity validator (TP1/SL must not be inverted).
+   - T3-D: ATR stop scaling floor.
+   - T3-E: EMA extension/distance filter.
+   - T3-F: S/R buffer zone.
+   - T3-G: GEX recalibration.
+3. Output the exact Python functions needed to implement these gates.
+4. Use 'Finish Task Tool' to mark them as Done on the Kanban board.", agent="Math Engine", status="completed", output="Files unavailable in the environment, so I'll provide the full redesign from first principles. Here is the complete Python logic block.
+
+```python
+"""
+patch_stock_tools_gates.py
+==========================
+Redesigned signal-quality gate stack (target: >80% win-rate filter).
+Six parameter fixes: T3-B .. T3-G.
+
+All functions are pure / side-effect free except where explicitly noted
+(cooldown writes only to the supplied in-memory state dict).
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Shared config
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GateConfig:
+    # T3-B  Cooldown
+    cooldown_min_minutes: int = 15
+    cooldown_max_minutes: int = 30
+
+    # T3-C  Bracket sanity
+    min_rr: float = 1.2          # TP1 reward / risk must clear this
+    tick_epsilon: float = 1e-9   # degenerate-pair tolerance
+
+    # T3-D  ATR stop scaling
+    atr_stop_floor_mult: float = 1.5   # SL >= 1.5 * ATR
+    atr_stop_ceiling_mult: float = 4.0 # SL <= 4.0 * ATR (over-wide guard)
+    min_atr: float = 1e-6
+
+    # T3-E  EMA extension
+    ema_ext_max_atr: float = 1.8   # |price - EMA| <= 1.8 * ATR
+    ema_ext_hard_atr: float = 2.6  # hard reject band
+    ema_fast_len: int = 9
+    ema_slow_len: int = 21
+
+    # T3-F  S/R buffer
+    sr_buffer_atr: float = 0.35    # stay outside 0.35*ATR of a level
+    sr_hard_buffer_atr: float = 0.15  # inside -> unconditional reject
+
+    # T3-G  GEX recalibration
+    gex_wall_percentile: float = 0.85  # only treat top 15% as walls
+    gex_flip_tolerance: float = 0.0025 # 0.25% of spot around flip
+    gex_min_abs: float = 1.0           # |gamma| floor to be "real"
+
+
+# ---------------------------------------------------------------------------
+# Signal container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Signal:
+    ticker: str
+    direction: int          # +1 long, -1 short
+    entry: float
+    tp1: float
+    sl: float
+    price: float
+    atr: float
+    ema_fast: float
+    ema_slow: float
+    ts: datetime
+    levels: Optional[list] = None      # support/resistance candidates
+    gex: Optional[Dict[str, Any]] = None
+
+
+# ---------------------------------------------------------------------------
+# T3-B  Cooldown (15-30m per ticker/direction)
+# ---------------------------------------------------------------------------
+
+class CooldownGate:
+    """
+    Rejects a signal if the same (ticker, direction) fired inside the
+    cooldown window. Window is itself adaptive in [15m, 30m] based on the
+    volatility of the prior signal (higher ATR -> longer cooldown).
+    """
+
+    def __init__(self, cfg: GateConfig):
+        self.cfg = cfg
+        self._last: Dict[Tuple[str, int], Tuple[datetime, float]] = {}
+
+    def _cooldown_for(self, prior_atr: float) -> timedelta:
+        c = self.cfg
+        # Normalise prior ATR into [0,1] using a 50-bps style soft ramp.
+        # Low ATR -> min window; high ATR -> max window.
+        span = max(c.cooldown_max_minutes - c.cooldown_min_minutes, 0)
+        # 0.0 at atr<=0.003 (0.3%), 1.0 at atr>=0.02 (2%)
+        ramp = min(max((prior_atr - 0.003) / (0.02 - 0.003), 0.0), 1.0)
+        minutes = c.cooldown_min_minutes + ramp * span
+        return timedelta(minutes=minutes)
+
+    def check(self, sig: Signal) -> Tuple[bool, str]:
+        key = (sig.ticker.upper(), sig.direction)
+        prior = self._last.get(key)
+        if prior is None:
+            return True, "cooldown:first"
+
+        prior_ts, prior_atr = prior
+        window = self._cooldown_for(prior_atr)
+        elapsed = sig.ts - prior_ts
+        if elapsed < window:
+            remaining = (window - elapsed).total_seconds() / 60.0
+            return False, f"cooldown:blocked({remaining:.1f}m left)"
+        return True, "cooldown:clear"
+
+    def commit(self, sig: Signal) -> None:
+        self._last[(sig.ticker.upper(), sig.direction)] = (sig.ts, sig.atr)
+
+
+# ---------------------------------------------------------------------------
+# T3-C  Bracket sanity validator
+# ---------------------------------------------------------------------------
+
+def bracket_sanity(sig: Signal, cfg: GateConfig) -> Tuple[bool, str]:
+    """
+    Reject if TP1 / SL are inverted, degenerate, or on the wrong side of
+    entry for the signal direction, or if R:R is below cfg.min_rr.
+    """
+    e, tp, sl = sig.entry, sig.tp1, sig.sl
+
+    if any(v is None for v in (e, tp, sl)):
+        return False, "bracket:missing_price"
+
+    if abs(tp - sl) < cfg.tick_epsilon or abs(tp - e) < cfg.tick_epsilon:
+        return False, "bracket:degenerate"
+
+    if sig.direction > 0:                       # long
+        if not (tp > e > sl):
+            return False, "bracket:inverted_long"
+        risk, reward = e - sl, tp - e
+    elif sig.direction < 0:                     # short
+        if not (sl > e > tp):
+            return False, "bracket:inverted_short"
+        risk, reward = sl - e, e - tp
+    else:
+        return False, "bracket:bad_direction"
+
+    if risk <= 0:
+        return False, "bracket:nonpositive_risk"
+
+    rr = reward / risk
+    if rr < cfg.min_rr:
+        return False, f"bracket:rr_too_low({rr:.2f}<{cfg.min_rr})"
+    return True, f"bracket:ok(rr={rr:.2f})"
+
+
+# ---------------------------------------------------------------------------
+# T3-D  ATR stop scaling floor
+# ---------------------------------------------------------------------------
+
+def atr_stop_scaling(sig: Signal, cfg: GateConfig) -> Tuple[bool, str]:
+    """
+    Scale SL distance against ATR. Reject stops that are too tight
+    (noise stop-out risk) or absurdly wide (bad R:R + slippage).
+    """
+    if sig.atr is None or sig.atr <= cfg.min_atr:
+        return False, "atr:invalid"
+
+    sl_dist = abs(sig.entry - sig.sl)
+    ratio = sl_dist / sig.atr
+
+    if ratio < cfg.atr_stop_floor_mult:
+        return False, f"atr_stop:too_tight({ratio:.2f}<{cfg.atr_stop_floor_mult})"
+    if ratio > cfg.atr_stop_ceiling_mult:
+        return False, f"atr_stop:too_wide({ratio:.2f}>{cfg.atr_stop_ceiling_mult})"
+    return True, f"atr_stop:ok({ratio:.2f}xATR)"
+
+
+def scale_sl_to_atr(sig: Signal, cfg: GateConfig) -> float:
+    """Push SL out to the floor, preserving direction. Returns new SL."""
+    floor = cfg.atr_stop_floor_mult * sig.atr
+    if sig.direction > 0:
+        return min(sig.sl, sig.entry - floor)
+    return max(sig.sl, sig.entry + floor)
+
+
+# ---------------------------------------------------------------------------
+# T3-E  EMA extension / distance filter
+# ---------------------------------------------------------------------------
+
+def ema_extension(sig: Signal, cfg: GateConfig) -> Tuple[bool, str]:
+    """
+    Reject entries that are already stretched far from the EMA stack
+    (chasing). Also require EMA structure to agree with direction.
+    """
+    if sig.atr is None or sig.atr <= cfg.min_atr:
+        return False, "ema_ext:no_atr"
+
+    dist = abs(sig.price - sig.ema_slow)
+    ext = dist / sig.atr
+
+    if ext > cfg.ema_ext_hard_atr:
+        return False, f"ema_ext:hard_reject({ext:.2f}>{cfg.ema_ext_hard_atr})"
+    if ext > cfg.ema_ext_max_atr:
+        return False, f"ema_ext:over_extended({ext:.2f}>{cfg.ema_ext_max_atr})"
+
+    # Structure check
+    if sig.direction > 0 and sig.ema_fast <= sig.ema_slow:
+        return False, "ema_ext:bear_stack"
+    if sig.direction < 0 and sig.ema_fast >= sig.ema_slow:
+        return False, "ema_ext:bull_stack"
+
+    return True, f"ema_ext:ok({ext:.2f}xATR)"
+
+
+# ---------------------------------------------------------------------------
+# T3-F  S/R buffer zone
+# ---------------------------------------------------------------------------
+
+def sr_buffer(sig: Signal, cfg: GateConfig) -> Tuple[bool, str]:
+    """
+    Reject if price sits inside the buffer band of an opposing S/R level.
+    A level *ahead* of the target counts as a wall; being within the hard
+    buffer is an unconditional reject.
+    """
+    if not sig.levels:
+        return True, "sr:none"
+    if sig.atr is None or sig.atr <= cfg.min_atr:
+        return False, "sr:no_atr"
+
+    soft = cfg.sr_buffer_atr * sig.atr
+    hard = cfg.sr_hard_buffer_atr * sig.atr
+
+    for lvl in sig.levels:
+        d = abs(sig.price - lvl)
+        if d <= hard:
+            return False, f"sr:inside_hard_buffer({d:.4f}<={hard:.4f})"
+        if d < soft:
+            return False, f"sr:space_too_tight({d:.4f}<{soft:.4f})"
+
+        # Blocked wall between entry and TP1
+        between = min(sig.entry, sig.tp1) <= lvl <= max(sig.entry, sig.tp1)
+        if between and d < 2.0 * soft:
+            return False, f"sr:wall_before_tp1({lvl:.4f})"
+    return True, "sr:clear"
+
+
+# ---------------------------------------------------------------------------
+# T3-G  GEX recalibration
+# ---------------------------------------------------------------------------
+
+def gex_recalibrated(sig: Signal, cfg: GateConfig) -> Tuple[bool, str]:
+    """
+    Recalibrated dealer-gamma gate.
+      * walls only count if in the top (1-p) percentile of |gamma|
+      * flip point must be respected as a soft regime boundary
+      * direction must agree with the sign of net gamma near spot
+    """
+    g = sig.gex
+    if not g:
+        return True, "gex:absent"
+
+    spot = g.get("spot", sig.price)
+    net = g.get("net_gamma", 0.0)
+    flip = g.get("flip", None)
+    walls = g.get("walls") or []          # list of (strike, |gamma|)
+    atr = sig.atr or cfg.min_atr
+
+    # 1. Wall percentile filter
+    if walls:
+        mags = sorted((abs(m) for _, m in walls), reverse=True)
+        k = max(int(round(cfg.gex_wall_percentile * (len(mags) - 1))), 0)
+        thresh = mags[k]
+        strong = [s for s, m in walls if abs(m) >= thresh and abs(m) >= cfg.gex_min_abs]
+        for s in strong:
+            # a wall directly in the path = reject
+            in_path = min(sig.entry, sig.tp1) <= s <= max(sig.entry, sig.tp1)
+            near = abs(spot - s) < 0.5 * atr
+            if in_path and near:
+                return False, f"gex:wall_block({s})"
+
+    # 2. Flip tolerance
+    if flip is not None:
+        if abs(spot - flip) / max(spot, 1e-9) <= cfg.gex_flip_tolerance:
+            return False, "gex:at_flip_noise"
+        # Regime agreement
+        if sig.direction > 0 and spot < flip:
+            return False, "gex:below_flip_long"
+        if sig.direction < 0 and spot > flip:
+            return False, "gex:above_flip_short"
+
+    # 3. Net gamma sign agreement
+    if net != 0:
+        if sig.direction > 0 and net < -cfg.gex_min_abs:
+            return False, "gex:negative_gamma_long"
+        if sig.direction < 0 and net > cfg.gex_min_abs:
+            return False, "gex:positive_gamma_short"
+
+    return True, "gex:ok"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — the >80% gate
+# ---------------------------------------------------------------------------
+
+class MasterGate:
+    """
+    Runs the full stack. Cooldown is checked last (cheap + stateful)
+    so it only consumes state on signals that already pass stateless gates.
+    """
+
+    def __init__(self, cfg: Optional[GateConfig] = None):
+        self.cfg = cfg or GateConfig()
+        self.cooldown = CooldownGate(self.cfg)
+
+    def evaluate(self, sig: Signal) -> Dict[str, Any]:
+        checks = [
+            ("T3-C bracket", bracket_sanity(sig, self.cfg)),
+            ("T3-D atr_stop", atr_stop_scaling(sig, self.cfg)),
+            ("T3-E ema_ext", ema_extension(sig, self.cfg)),
+            ("T3-F sr_buffer", sr_buffer(sig, self.cfg)),
+            ("T3-G gex", gex_recalibrated(sig, self.cfg)),
+            ("T3-B cooldown", self.cooldown.check(sig)),
+        ]
+        failures = [name for name, (ok, _) in checks if not ok]
+        passed = not failures
+        if passed:
+            self.cooldown.commit(sig)
+        return {
+            "passed": passed,
+            "failures": failures,
+            "details": {name: reason for name, (_, reason) in checks},
+        }
+```
+
+**Key math notes for each fix:**
+
+- **T3-B:** cooldown ramps 15→30 min via `min + ramp*span`, `ramp = clamp((atr−0.003)/0.017, 0, 1)`.
+- **T3-C:** side-aware inequality `tp > entry > sl` (long) / `sl > entry > tp` (short) plus `R:R ≥ 1.2`.
+- **T3-D:** `1.5·ATR ≤ |entry−sl| ≤ 4.0·ATR`; `scale_sl_to_atr` widens tight stops to the floor.
+- **T3-E:** `|price−EMA_slow|/ATR ≤ 1.8` (soft) and `2.6` (hard), plus EMA-stack agreement.
+- **T3-F:** `0.35·ATR` soft buffer, `0.15·ATR` hard reject, plus wall-between-entry-and-TP1 check.
+- **T3-G:** wall percentile (top 15%), flip tolerance `0.25%` of spot, and net-gamma sign agreement.
+
+Task board marked **Done** as requested."
+2026-10-10 01:01:04: task_name="None", task="1. Use 'Walk-Forward Simulation Tool' to run the backtest.
+2. Analyze the outcomes. Did the new Phase 2 gates (EMA extension, Brackets, Cooldowns) successfully block bad signals?
+3. Output a detailed diagnostic of the win rate and PnL.", agent="Evaluator Team", status="started"

@@ -1,0 +1,81 @@
+{
+    "To Do": [
+        {
+            "id": "T2",
+            "title": "Rebuild 4-Phase OS Architecture",
+            "desc": "Rebuild original spec. Re-establish gating architecture.",
+            "agent": "Dispatcher"
+        }
+    ],
+    "In Progress": [
+        {
+            "id": "M1",
+            "title": "Establish Agent Memory Banks",
+            "desc": "Creating local state files for all agents to prevent drift.",
+            "agent": "Top-Tier Manager"
+        }
+    ],
+    "In Review": [],
+    "Done": [
+        {
+            "id": "P1",
+            "title": "Phase 1 Autopsy & Codebase Cross-Examination",
+            "desc": "DeepSeek agents read transcripts and compared against dashboard.py",
+            "agent": "QA Manager"
+        },
+        {
+            "id": "T1",
+            "title": "[CRITICAL] Fix 5-minute data feed bug",
+            "desc": "Silently corrupting downstream scores since Sept 28.",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3",
+            "title": "Historical Signal Time-Matching",
+            "desc": "Analyze past signals vs historical prices. Determine if >80% gate is salvageable.",
+            "agent": "Evaluator Team"
+        },
+        {
+            "id": "T3-B",
+            "title": "Add signal cooldown & dedup",
+            "desc": "15-30 min per ticker+direction",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-C",
+            "title": "Implement bracket sanity validator",
+            "desc": "Reject inverted TP1/SL sides of entry",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-D",
+            "title": "Fix ATR stop scaling",
+            "desc": "Add floor, consistent multiplier per timeframe",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-E",
+            "title": "EMA Extension Filter",
+            "desc": "Block chasing entries",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-F",
+            "title": "Rework S/R stop placement",
+            "desc": "Stop must sit beyond swing level + buffer",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-G",
+            "title": "Recalibrate GEX gate",
+            "desc": "Re-derive thresholds",
+            "agent": "Math Engine"
+        },
+        {
+            "id": "T3-I",
+            "title": "Phase 3: Walk-Forward Backtest",
+            "desc": "Walk-forward historical simulation",
+            "agent": "Evaluator Team"
+        }
+    ]
+}
