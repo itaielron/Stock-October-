@@ -431,21 +431,23 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    Evaluate the confluence cluster at bar `i` for 1Min timeframe.
+    Evaluate the confluence cluster at bar `i` for 5Min timeframe.
 
-    QA-driven rewrite (1Min hardening):
-      - Fail-OPEN on missing GEX/ATR_MEAN (was silently zeroing the pipeline).
-      - EMA stack: require EMA9 > EMA21 AND EMA21 > EMA50 (trend alignment),
-        but allow a "pullback reclaim" path when EMA50 is flat/rising.
-      - Distance gate widened slightly for 1m noise; require close ABOVE EMA9
-        (not just near it) to avoid catching falling knives.
-      - Structure: require breakout OR (support bounce AND bullish reclaim bar).
-      - Momentum confirmation: current bar close > prev bar high OR strong body.
-      - ATR regime: only reject if ATR is EXTREMELY low (dead tape), not merely
-        below mean — 1m ATR_MEAN is dominated by session-open spikes.
-      - Volume confirmation: current volume >= VOL_MULT * rolling mean volume.
-      - Structural SL below swing low with buffer; TP1 = 1.5R, TP2 = 3R capped
-        by swing high if it sits between TP1 and TP2.
+    QA-driven rewrite (5Min hardening — kills the two loser classes):
+      - LOSER CLASS A (chop bleed): require volatility EXPANSION
+        (ATR > ATR_MEAN) AND ADX_14 > 20 AND TP1_distance >= 1.0*ATR.
+      - LOSER CLASS B (gap-stop): enforce hard SL floor of 0.35% of price
+        so a tiny-ATR stop can't sit inside normal noise / overnight gap.
+      - EOD_FLAT: block entries in the final 30 min of session (no overnight
+        holds on fresh positions).
+      - Fail-OPEN on missing GEX/ATR_MEAN/ADX so the pipeline never silently
+        zeroes out.
+      - EMA stack: EMA9 > EMA21 > EMA50 (strict trend alignment).
+      - Structure: breakout OR (support bounce AND bullish reclaim bar).
+      - Momentum: close > prev high OR strong bullish body.
+      - Volume: vol >= VOL_MULT * VOL_MEAN.
+      - SL = min(swing_low - buffer, close - max(ATR*1.5, 0.35%*close)).
+      - TP1 = 1.5R, TP2 = 3R capped by swing high.
     """
     row = df.iloc[i]
     prev = df.iloc[i - 1]
@@ -461,7 +463,20 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
         return None
 
-    # --- 1. EMA stack (trend alignment) ----------------------------------
+    # --- 0. EOD_FLAT: no fresh entries in final 30 min of session --------
+    # 5Min bars -> 6 bars = 30 min. If a session-close marker exists, use it;
+    # otherwise fall back to a time-of-day check on the index.
+    try:
+        ts = df.index[i]
+        # Assume US equity session close ~16:00 ET. Block 15:30-16:00.
+        if hasattr(ts, "hour"):
+            mins = ts.hour * 60 + ts.minute
+            if 15 * 60 + 30 <= mins <= 16 * 60:
+                return None
+    except Exception:
+        pass
+
+    # --- 1. EMA stack (strict trend alignment) ---------------------------
     ema9 = float(row["EMA9"])
     ema21 = float(row["EMA21"])
     ema50 = float(row["EMA50"]) if "EMA50" in df.columns else float("nan")
@@ -471,42 +486,49 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not (np.isfinite(ema9) and np.isfinite(ema21)):
         return None
 
-    # Core stack: EMA9 > EMA21
     if not (ema9 > ema21):
         return None
 
-    # Prefer EMA21 > EMA50 when available; if EMA50 missing, fall back to
-    # requiring EMA9 rising (slope positive) to avoid flat-chop entries.
     if np.isfinite(ema50):
         if not (ema21 > ema50):
             return None
     else:
+        # Fallback: require EMA9 rising to avoid flat-chop entries.
         if not (ema9 > prev_ema9):
             return None
 
-    # Freshness: crossover happened recently OR price reclaiming EMA9
+    # Freshness: recent cross OR reclaim of EMA9 OR clean continuation.
     fresh_cross = (prev_ema9 <= prev_ema21) and (ema9 > ema21)
     reclaim = (close > ema9) and (float(prev["Close"]) <= prev_ema9)
-    if not (fresh_cross or reclaim or (close > ema9 and ema9 > prev_ema9)):
+    continuation = (close > ema9) and (ema9 > prev_ema9)
+    if not (fresh_cross or reclaim or continuation):
         return None
 
-    # --- 2. distance gate (widened for 1m noise) -------------------------
+    # --- 2. distance gate -------------------------------------------------
     if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
         return None
 
-    # Must be above EMA9 (long-only bias on 1m)
     if close <= ema9:
         return None
 
-    # --- 3. ATR regime: only reject DEAD tape ----------------------------
+    # --- 3. VOLATILITY EXPANSION gate (kills chop-bleed loser) -----------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
-        # Reject only if ATR is catastrophically low (< 40% of mean).
-        # Fail-OPEN if ATR_MEAN is NaN (QA issue #3).
-        if atr < 0.40 * atr_mean:
+        # Require EXPANDING volatility, not merely non-dead tape.
+        if atr <= atr_mean:
             return None
+    # Fail-OPEN if ATR_MEAN missing.
 
-    # --- 4. volume confirmation ------------------------------------------
+    # --- 4. ADX trend-strength gate (kills range-bound false signals) ----
+    adx = float(row["ADX14"]) if "ADX14" in df.columns else (
+        float(row["ADX"]) if "ADX" in df.columns else float("nan")
+    )
+    if np.isfinite(adx):
+        if adx <= 20.0:
+            return None
+    # Fail-OPEN if ADX missing.
+
+    # --- 5. volume confirmation ------------------------------------------
     if "Volume" in df.columns and "VOL_MEAN" in df.columns:
         vol = float(row["Volume"])
         vol_mean = float(row["VOL_MEAN"])
@@ -514,7 +536,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             if vol < VOL_MULT * vol_mean:
                 return None
 
-    # --- 5. structure: swing levels --------------------------------------
+    # --- 6. structure: swing levels --------------------------------------
     win_lo = max(0, i - LOOKBACK)
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
@@ -522,7 +544,6 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     breakout = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
 
-    # Momentum confirmation: bullish body OR close > prev high
     body = close - open_
     bullish_body = body > 0.5 * atr
     close_above_prev_high = close > float(prev["High"])
@@ -532,19 +553,27 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not (bullish_body or close_above_prev_high):
         return None
 
-    # --- structural stop --------------------------------------------------
-    sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
+    # --- 7. structural stop with HARD FLOOR (kills gap-stop loser) -------
+    structural_sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
+    atr_sl = close - (atr * 1.5)
+    pct_floor_sl = close * (1.0 - 0.0035)  # 0.35% hard floor
+    # Take the LOWEST (widest) of the three so the stop is never too tight.
+    sl = min(structural_sl, atr_sl, pct_floor_sl)
     if sl >= close:
         return None
 
     risk = close - sl
 
-    # --- 6. minimum risk gate --------------------------------------------
+    # --- 8. minimum risk gate --------------------------------------------
     if risk < MIN_RISK_ATR * atr:
         return None
 
-    # --- structural targets ----------------------------------------------
+    # --- 9. TP1 distance must clear 1.0*ATR (kills low-vol false signals) -
     tp1 = close + TP1_R * risk
+    if (tp1 - close) < 1.0 * atr:
+        return None
+
+    # --- structural targets ----------------------------------------------
     tp2_struct = close + TP2_R * risk
     if recent_swing_high > tp1:
         tp2 = min(tp2_struct, recent_swing_high)
@@ -564,6 +593,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "fresh_cross": fresh_cross,
         "reclaim": reclaim,
         "atr": atr,
+        "adx": adx,
+        "atr_mean": atr_mean,
     }
 
 

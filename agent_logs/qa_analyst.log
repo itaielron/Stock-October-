@@ -8633,3 +8633,49 @@ RESPONSE:
 Do **not** halt — 60% is below target. One rewrite cycle authorized. If next run ≥80% with sound charts, enter standby and append to `proven_strategies.md`.
 
 **Push to GitHub: required.**
+
+--- Sat Oct 10 02:46:21 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:46:15Z -> 2026-10-09T23:46:15Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Signal Deadlock)**
+
+### Why trades = 0
+Zero trades is not a "safe" result — it's a **logic deadlock**. The confluence gate is over-constrained. Based on the mandate's hierarchical rules, the most likely culprits:
+
+1. **GEX Regime Mismatch (primary suspect).** The regime filter requires `GEX < 0` for trend-following and `GEX > 0` for mean-reversion. If the GEX feed returned `NaN`, `0`, or a stale constant across the 7-day window, *every* signal is dropped before EMA/ATR are even evaluated. This is the #1 cause of silent zero-trade runs.
+2. **EMA Stack Never Aligned.** `Close > EMA_50 AND EMA_50 > EMA_200` on a 297-bar SPY / 372-bar QQQ window means EMA_200 is barely seeded (~200 bars). Early bars produce `NaN` EMA_200 → comparison returns False → no longs. Shorts require `Close < EMA_50`, which may have been true but then blocked by GEX or macro.
+3. **Macro_Score Gate.** If `Macro_Score >= Bullish_Threshold` disables shorts AND the tape was bearish, longs are also invalid → total lockout.
+4. **Event Pause Overlap.** 30-min blackout windows around FOMC/NFP can consume a disproportionate share of a 7-day intraday sample if the calendar parser defaulted to "always paused" on missing data.
+
+### Diagnostic Required (do NOT re-optimize yet)
+Before any parameter tuning, the Coder must emit a **funnel counter** per bar:
+```
+bars_total → gex_pass → ema_pass → atr_pass → macro_pass → event_pass → signals
+```
+This isolates which gate is zeroing the pipeline. Without it, any "fix" is guesswork and violates Mandate #6 (deduce *why*).
+
+### Mandate Compliance Check
+- **#5 MTFA:** Only 1 timeframe appears to have run (no 1m/3m/5m/15m/1h/4h breakdown in output). **Violation.**
+- **#4 Visual clarity:** `charts=charts/` with 0 trades → no entry arrows, no TP1/SL markers. **Violation.**
+- **#9 Smart Sleep:** Correctly NOT triggered — no PASS grade earned.
+- **#10 Rotation:** Cannot rotate; no proven strategy to log.
+
+### Directive
+1. Add funnel instrumentation (one cycle only).
+2. Verify GEX feed is live and non-null; if synthetic, document the generator.
+3. Confirm EMA_200 warmup — either extend lookback or use `min_periods` fallback.
+4. Re-run **once**. If funnel shows a single gate at 0, patch that gate only.
+
+**Do not tune thresholds blindly. Do not rotate timeframes. Do not push to GitHub until the funnel report is attached.**
