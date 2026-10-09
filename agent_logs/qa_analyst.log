@@ -9406,3 +9406,45 @@ A backtester returning 0 trades is **worse than a losing one** — it teaches no
 4. **Do NOT** proceed to optimization until trades > 0.
 
 **Re-run required. No PASS. No standby.**
+
+--- Sat Oct 10 02:53:16 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:53:11Z -> 2026-10-09T23:53:11Z symbols=['SPY', 'QQQ']
+Traceback (most recent call last):
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 1148, in <module>
+    run_backtest(start=_start, end=_end)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester...
+RESPONSE:
+## QA Evaluation — FAIL (Crash, 0 Trades)
+
+**Root Cause:** `UnboundLocalError: 'tr'` at line 213. The True Range variable is referenced before assignment. This is a **code defect, not a strategy failure** — no trades were evaluated because the pipeline died during indicator computation.
+
+**Likely mechanism:** `tr` is defined inside a conditional branch (e.g., `if len(df) > 1:` or a try/except, or a GEX-proxy block) that did not execute for this data slice. Given the 7-day window (2026-10-02 → 2026-10-09) and the mandate's GEX-proxy note, the most probable culprit is a **GEX/options-proxy branch that short-circuits before `tr` is computed**, or an early-return path when a symbol's raw frame is empty/short.
+
+**Diagnostic checklist (in order):**
+1. Print `len(raw)` per symbol before `calculate_indicators`. If SPY or QQQ returned <15 bars (IEX feed gaps, holiday, or pagination failure), the rolling(14) path may be skipped.
+2. Inspect lines ~200–215: confirm `tr` is assigned unconditionally *before* any branch. Move `tr = pd.concat([...]).max(axis=1)` to the top of the function, outside all `if`/`try` blocks.
+3. Verify the GEX-proxy block does not `return` early or raise on missing options data (Mandate #11 — must default to neutral, never halt).
+4. Confirm `high`/`low`/`close` columns exist post-`raw` fetch; a silent column rename would also orphan `tr`.
+
+**Mandate compliance flags:**
+- **#11 VIOLATED (spirit):** The crash halts execution on a data-availability edge case. Even if not a literal `raise`, an unbound variable is functionally equivalent to a halt. Harden with explicit fallbacks.
+- **#3 (Zero repeated mistakes):** This is a repeat-class bug (indicator init fragility). Log to `agent_logs/proven_strategies.md` as an anti-pattern.
+- **#8:** No chart output produced → nothing to sync. Push the fix + this log.
+
+**Required fix before re-run:**
+```python
+prev_close = close.shift(1)
+tr = pd.concat([
+    high - low,
+    (high - prev_close).abs(),
+    (low - prev_close).abs()
+], axis=1).max(axis=1)
+out["ATR_14"] = tr.rolling(14).mean()
+```
+Place this **unconditionally**, after column validation, before any GEX/regime branching.
+
+**Verdict:** Do **not** proceed to optimization or timeframe rotation. Fix, re-run, then re-evaluate. Trades=0 is explained entirely by the crash — no signal logic was ever reached.
