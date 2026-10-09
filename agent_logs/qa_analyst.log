@@ -8868,3 +8868,39 @@ The most likely root causes, in order of probability:
 We cannot deduce *why losers lost* when there are no trades. This cycle produced **no learning signal** — it is pure waste. Per Mandate #9, do not re-run heuristics until the gate instrumentation is in place.
 
 **Action:** Coder must add gate-level telemetry and fix the GEX/MTFA data path. Re-run only after a dry-run confirms non-zero `final_signal` counts on at least one symbol.
+
+--- Sat Oct 10 02:48:14 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:48:09Z -> 2026-10-09T23:48:09Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[GEX_UNAVAILABLE] column missing — failing open (regime filter disabled for this run).
+[MTFA_UNAVAILABLE] no higher-TF EMA columns — failing open (MTFA confluence disabled).
+[info] QQQ: 372 bars, backtesting...
+--------------------------------------------------------------------...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-02 → 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Two independent gates failed open, and the third (EMA) likely never aligned. Zero trades is a **data-plumbing failure, not a strategy failure** — the engine never actually tested the thesis.
+
+1. **GEX column missing** → regime filter disabled. Per mandate §1, GEX is the *primary* regime switch (trend vs. mean-reversion). With it off, the engine has no regime context, so any downstream directional logic is unanchored.
+2. **MTFA columns missing** → higher-TF EMA confluence disabled. Mandate §5 requires 1m/3m/5m/15m/1h/4h alignment. Without these, the multi-timeframe gate cannot fire.
+3. **EMA trend gate** (`Close > EMA_50 > EMA_200`) — with only 297 SPY / 372 QQQ bars, EMA_200 is barely warmed up (needs ~200 bars minimum, ideally 3× for stability). Early bars produce NaN/undefined EMA_200, silently killing every long condition. This is the most probable *proximate* cause of 0 trades.
+
+### Root Cause (structural, not statistical)
+The pipeline is **failing open on missing data instead of failing closed**. "Fail open" here means: missing GEX → skip filter → but then EMA_200 is also NaN → no signal → 0 trades. The system reports "0 trades" as if it were a valid backtest result. It is not. It is an **uninitialized run**.
+
+### Required Fixes Before Next Cycle
+1. **Hard-fail on missing columns.** If `GEX` or higher-TF EMA columns are absent, the run must `raise`, not proceed. A silent 0-trade run wastes a full cycle and violates §3 (zero repeated mistakes).
+2. **Warm-up guard.** Require `len(bars) >= 250` per symbol *after* dropping the EMA_200 warm-up window. 297 bars is insufficient for a 200-EMA + ATR_14 + signal window.
+3. **Verify data ingestion.** GEX and MTFA columns are mandate-critical. Confirm the data puller actually requests them; if the vendor lacks GEX, synthesize a proxy (e.g., dealer gamma from OI) or explicitly log `GEX_PROXY` — do not silently drop.
+4. **Add a diagnostic counter.** Log `signals_evaluated`, `gated_by_GEX`, `gated_by_EMA`, `gated_by_ATR` so a 0-trade run is self-explaining.
+
+### Verdict
+**Do not rotate timeframes. Do not append to `proven_strategies.md`.** This run produced no evidence. Fix the data layer, re-run the *same* window, and only then evaluate win rate. Per §9, no optimization is warranted until a valid trade sample exists.
+
+**Next action:** Coder patches fail-closed guards + warm-up check; re-run 2026-10-02→09; QA re-evaluates.
