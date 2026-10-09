@@ -8776,3 +8776,54 @@ We cannot deduce *why winners won* or *losers lost* with zero samples. This cycl
 3. **Do not** enter standby (Mandate #9) — PASS not achieved.
 
 **Verdict: FAIL — fix instrumentation, re-run.**
+
+--- Sat Oct 10 02:47:27 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:47:22Z -> 2026-10-09T23:47:22Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Signal Deadlock)**
+
+### Why trades = 0
+Zero trades is not a "no setup" outcome — it's a **logic deadlock**. With 297 SPY bars and 372 QQQ bars across a full week, statistically impossible to have zero valid signals unless a gate is permanently closed. Root causes, in order of likelihood:
+
+1. **GEX regime gate is hard-blocking.** If GEX is computed as a static scalar (or defaults to `0`/`None`), the `GEX < 0` / `GEX > 0` branch never resolves to a valid regime. Both trend-following AND mean-reversion sub-routines get skipped. **This is the #1 suspect.**
+2. **EMA warm-up starvation.** `EMA_200` on 297 SPY bars leaves only ~97 evaluable bars; on 1m/3m MTFA pulls, EMA_200 may never fully seed, forcing `NaN` comparisons that silently return `False`.
+3. **ATR "within limits" band is empty.** If `ATR_min > ATR_max` (unit mismatch, e.g., % vs. points), the volatility filter rejects 100% of bars.
+4. **Macro/Event pause stuck True.** If the economic calendar parser failed to load, `Trading_Enabled` may default to `False` for the entire window.
+5. **MTFA confluence AND-chain too strict.** Requiring 1m AND 3m AND 5m AND 15m AND 1h AND 4h to *simultaneously* align on a 1-week window is near-impossible — 4h only has ~42 bars, so its EMA_200 is undefined → whole chain fails.
+
+### Required Diagnostics (before any re-optimization)
+Instrument the engine to emit per-bar gate telemetry:
+```
+[gate] bars=297 gex_pass=? ema_pass=? atr_pass=? macro_pass=? mtfa_pass=? final=?
+```
+Without this, we are blind. **Do not tune parameters until we see which gate is zero.**
+
+### Structural Fixes (Coder)
+- **GEX**: replace scalar with rolling 5-day dealer-gamma proxy; log regime per bar.
+- **EMA**: require `min_bars >= 250` before enabling EMA_200 gate; else fall back to EMA_50/EMA_100 pair.
+- **ATR band**: assert `ATR_min < ATR_max` at init; fail loud.
+- **MTFA**: downgrade from AND to **weighted score** (e.g., ≥4 of 6 TFs aligned). Hard AND across 6 TFs is anti-confluence, not confluence.
+- **Event pause**: default `Trading_Enabled=True` if calendar fetch fails; log warning.
+
+### Anti-Overfitting Note
+Zero trades ≠ proven strategy. **Do not append to `proven_strategies.md`.** No rotation warranted — this cycle produced no learnable signal.
+
+### Next Action
+1. Coder adds gate telemetry + fixes above.
+2. Re-run same window.
+3. If trades > 0, QA evaluates winner/loser structure.
+4. Push to GitHub per Mandate #8.
+
+**Standby NOT authorized** — system is broken, not optimized.
