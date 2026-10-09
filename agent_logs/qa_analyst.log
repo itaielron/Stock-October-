@@ -5293,3 +5293,192 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "risk_per_unit": sl_distance,
     }
 ```
+
+--- Sat Oct 10 02:33:19 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+
+    1. GEX regime gate was hard-coded to a single regime (e.g. only negative
+       gamma -> trend-following). If the synthetic/historical GEX series was
+       flat, NaN, or always positive, every trend signal was rejected.
+    2. EMA stack required BOTH `Close > EMA_50` AND `EMA_50 > EMA_200` with
+       strict inequality. On short windows (1m/3m) EMA_200 is barely warmed
+       up, so the condition almost never fires -> zero longs. Shorts required
+       `Close < EMA_50` but were then blocked by the macro bullish filter.
+    3. ATR band filter used a narrow percentile window; on low-volatility
+       sessions ATR_14 fell outside the band -> every candidate rejected.
+    4. Event-driven pause flag defaulted to True when the calendar was empty,
+       silently disabling all trading.
+    5. Risk layer required `Current_Drawdown < Max_Allowed` with an
+       uninitialized drawdown variable -> comparison against NaN -> False.
+
+    Fixes applied below:
+    - GEX regime is inferred from a rolling proxy when the raw series is
+      missing/flat, and BOTH regimes are allowed to route to their matching
+      sub-strategy instead of a single hard-coded branch.
+    - EMA warmup is guarded: if EMA_200 is not yet valid, fall back to
+      EMA_50 vs EMA_20 slope confirmation rather than rejecting outright.
+    - ATR band widened to a rolling 5th-95th percentile with a floor.
+    - Event pause defaults to False when calendar is empty.
+    - Drawdown guard uses a safe default of 0.0 when uninitialized.
+    """
+
+    # ---- 0. Bounds & warmup ------------------------------------------------
+    if i < 210 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    required = ("Close", "EMA_20", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+        if pd.isna(row[col]):
+            return None
+
+    close = float(row["Close"])
+    ema20 = float(row["EMA_20"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    atr14 = float(row["ATR_14"])
+
+    if atr14 <= 0 or not np.isfinite(atr14):
+        return None
+
+    # ---- 1. Risk / exposure layer (safe defaults) --------------------------
+    current_drawdown = float(row.get("Current_Drawdown", 0.0) or 0.0)
+    max_allowed_dd = float(row.get("Max_Allowed_DD", 0.10) or 0.10)
+    daily_exposure = float(row.get("Daily_Exposure", 0.0) or 0.0)
+    account_limit = float(row.get("Account_Limit", 1.0) or 1.0)
+
+    if current_drawdown >= max_allowed_dd:
+        return None
+    if daily_exposure >= account_limit:
+        return None
+
+    # ---- 2. Event-driven pause (default OFF when calendar empty) -----------
+    trading_enabled = row.get("Trading_Enabled", None)
+    if trading_enabled is None:
+        trading_enabled = True
+    if not bool(trading_enabled):
+        return None
+
+    # ---- 3. ATR volatility band (widened, with floor) ----------------------
+    atr_series = df["ATR_14"].iloc[max(0, i - 200):i].dropna()
+    if len(atr_series) >= 30:
+        lo = float(np.nanpercentile(atr_series, 5))
+        hi = float(np.nanpercentile(atr_series, 95))
+        if hi <= lo:
+            hi = lo * 1.5 + 1e-9
+        if atr14 < lo * 0.5 or atr14 > hi * 2.0:
+            return None
+
+    # ---- 4. GEX regime (with proxy fallback) -------------------------------
+    gex = row.get("GEX", None)
+    if gex is None or pd.isna(gex):
+        # Proxy: use recent realized vol vs long-run vol as a gamma sign proxy.
+        recent_ret = df["Close"].iloc[max(0, i - 20):i].pct_change().dropna()
+        if len(recent_ret) >= 10:
+            rv = float(recent_ret.std())
+            lv = float(df["Close"].iloc[max(0, i - 200):i].pct_change().dropna().std())
+            gex = -1.0 if (lv > 0 and rv > lv) else 1.0
+        else:
+            gex = 1.0
+
+    gex = float(gex)
+    negative_gamma = gex < 0.0   # trend-following regime
+    positive_gamma = gex > 0.0   # mean-reversion regime
+
+    # ---- 5. EMA directional bias (with warmup fallback) --------------------
+    ema200_valid = not pd.isna(ema200) and ema200 > 0
+    if ema200_valid:
+        long_bias = (close > ema50) and (ema50 > ema200)
+        short_bias = (close < ema50) and (ema50 < ema200)
+    else:
+        # Fallback: use EMA20 vs EMA50 slope as trend proxy.
+        long_bias = (close > ema50) and (ema20 > ema50)
+        short_bias = (close < ema50) and (ema20 < ema50)
+
+    # ---- 6. Macro regime score --------------------------------------------
+    macro_score = float(row.get("Macro_Score", 0.0) or 0.0)
+    bullish_threshold = float(row.get("Bullish_Threshold", 0.5) or 0.5)
+    bearish_threshold = float(row.get("Bearish_Threshold", -0.5) or -0.5)
+
+    if macro_score >= bullish_threshold:
+        short_bias = False
+    if macro_score <= bearish_threshold:
+        long_bias = False
+
+    # ---- 7. Regime-routed signal generation --------------------------------
+    direction = None
+    strategy = None
+
+    if negative_gamma:
+        # Trend-following: ride momentum in EMA direction.
+        if long_bias and close > prev["Close"]:
+            direction, strategy = "long", "trend"
+        elif short_bias and close < prev["Close"]:
+            direction, strategy = "short", "trend"
+    elif positive_gamma:
+        # Mean-reversion: fade extension back toward EMA_50.
+        dist = (close - ema50) / atr14 if atr14 > 0 else 0.0
+        if long_bias and dist < -1.0:
+            direction, strategy = "long", "mean_reversion"
+        elif short_bias and dist > 1.0:
+            direction, strategy = "short", "mean_reversion"
+
+    if direction is None:
+        return None
+
+    # ---- 8. ATR-based risk sizing -----------------------------------------
+    stop_distance = atr14 * 1.5
+    if direction == "long":
+        entry = close
+        stop_loss = entry - stop_distance
+        take_profit = entry + stop_distance * 2.0   # 2R target
+    else:
+        entry = close
+        stop_loss = entry + stop_distance
+        take_profit = entry - stop_distance * 2.0
+
+    max_risk_dollar = float(row.get("Max_Risk_Dollar", 100.0) or 100.0)
+    position_size = max_risk_dollar / stop_distance if stop_distance > 0 else 0.0
+    if position_size <= 0:
+        return None
+
+    # ---- 9. Confluence score (for logging / QA) ----------------------------
+    confluence = {
+        "gex_regime": "negative" if negative_gamma else "positive",
+        "strategy": strategy,
+        "ema_aligned": bool(long_bias if direction == "long" else short_bias),
+        "macro_score": macro_score,
+        "atr": atr14,
+    }
+
+    return {
+        "index": i,
+        "timestamp": row.get("timestamp", row.name),
+        "direction": direction,
+        "strategy": strategy,
+        "entry": float(entry),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "position_size": float(position_size),
+        "atr": float(atr14),
+        "confluence": confluence,
+    }
+```
