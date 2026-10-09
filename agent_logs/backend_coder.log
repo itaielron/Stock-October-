@@ -383,3 +383,283 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:20:39 2026 ---
+TASK:
+
+Here is the QA Analyst's recent feedback:
+df.columns:
+        if float(row["Daily_Exposure"]) >= 1.0:
+            return None
+
+    # ------------------------------------------------------------------
+    # 7. Directional bias (EMA stack)
+    # ------------------------------------------------------------------
+    long_ok = close > ema50 and ema50 > ema200
+    short_ok = close < ema50 and ema50 < ema200
+
+    # ------------------------------------------------------------------
+    # 8. Sub-routin...
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Evaluate the confluence cluster at bar `i`. Returns a dict of the
+    structural levels if ALL conditions pass, else None.
+
+    Hardened cluster (v4) — QA feedback integration:
+      * QA flagged v3 for: (a) still too few trades, (b) structural SL
+        placed at the *lookback* swing extreme which is often far away,
+        producing risk > 3*ATR rejections and killing valid setups,
+        (c) mean-reversion branch required |stretch| >= 1.5 ATR which is
+        rare on liquid names, (d) momentum gate still rejected reclaim
+        bars where prev_close == EMA9, (e) no explicit "why losers lost"
+        filter — losers clustered on: chasing extended bars, entering
+        against the higher-TF vote, and entering into a fresh opposite
+        swing.
+      * Fixes:
+          - Structural SL now uses the *nearest* protective swing within
+            a bounded window (NEAR_SWING_LOOKBACK) so risk stays inside
+            the 3*ATR cap and TP1 is reachable.
+          - Mean-reversion stretch threshold lowered to 1.0 ATR and
+            requires a reclaim candle (close back toward EMA50) so we
+            fade exhaustion, not free-fall.
+          - Momentum gate accepts reclaim when prev_close == EMA9 (<=
+            with tolerance) and accepts inside-bar continuations.
+          - Added "anti-chase" gate: reject if the last 3 bars already
+            moved > 2.5*ATR in trade direction (losers were late entries).
+          - Added "opposite swing" veto: reject long if a fresh lower
+            high formed in last 3 bars, reject short if fresh higher low.
+          - MTF vote now requires strict majority when >= 3 TFs present
+            (losers had split votes).
+          - Kept ATR regime, distance gate, risk gates, structural SL/TP.
+    """
+    if i < 3 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+    prev2 = df.iloc[i - 2]
+    prev3 = df.iloc[i - 3]
+
+    # --- required columns -------------------------------------------------
+    for col in ("EMA9", "EMA21", "Close", "High", "Low"):
+        if col not in df.columns:
+            return None
+
+    ema9 = float(row["EMA9"])
+    ema21 = float(row["EMA21"])
+    close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
+    prev_close = float(prev["Close"])
+    prev_ema9 = float(prev["EMA9"]) if np.isfinite(prev["EMA9"]) else ema9
+
+    if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
+        return None
+    if atr <= 0 or not np.isfinite(atr):
+        return None
+
+    # --- regime context (EMA50 / EMA200) ---------------------------------
+    ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
+    ema200 = float(row["EMA200"]) if "EMA200" in df.columns and np.isfinite(row["EMA200"]) else None
+
+    long_bias = (ema50 is not None and close > ema50) and (
+        ema200 is None or ema50 > ema200
+    )
+    short_bias = (ema50 is not None and close < ema50) and (
+        ema200 is None or ema50 < ema200
+    )
+
+    # --- GEX regime routing ----------------------------------------------
+    gex = float(row["GEX"]) if "GEX" in df.columns and np.isfinite(row["GEX"]) else 0.0
+    regime = "trend" if gex < 0 else "mean_reversion"
+
+    # --- ATR regime filter -----------------------------------------------
+    atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
+    if np.isfinite(atr_mean) and atr_mean > 0:
+        ratio = atr / atr_mean
+        if ratio < ATR_REGIME_MIN_RATIO:
+            return None
+        if ratio > 2.5:
+            return None
+
+    # --- MTF vote aggregation (optional) ---------------------------------
+    mtf_long_votes = 0
+    mtf_short_votes = 0
+    mtf_available = 0
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h"):
+        col = f"MTF_{tf}_TREND"
+        if col in df.columns:
+            v = row[col]
+            if np.isfinite(v):
+                mtf_available += 1
+                if v > 0:
+                    mtf_long_votes += 1
+                elif v < 0:
+                    mtf_short_votes += 1
+
+    # Strict majority when we have enough TFs (losers had split votes).
+    if mtf_available >= 3:
+        mtf_long_ok = mtf_long_votes > mtf_short_votes
+        mtf_short_ok = mtf_short_votes > mtf_long_votes
+    else:
+        mtf_long_ok = True
+        mtf_short_ok = True
+
+    # --- macro gate (optional) -------------------------------------------
+    macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
+    BULLISH_THRESHOLD = 0.5
+    macro_blocks_long = macro_score <= -BULLISH_THRESHOLD
+    macro_blocks_short = macro_score >= BULLISH_THRESHOLD
+
+    # --- structure: swing levels -----------------------------------------
+    win_lo = max(0, i - LOOKBACK)
+    if i - win_lo < 5:
+        return None
+    recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
+    recent_swing_high = float(df["High"].iloc[win_lo:i].max())
+
+    # Nearest protective swing (bounded) — keeps risk inside 3*ATR cap.
+    near_lo = max(0, i - NEAR_SWING_LOOKBACK)
+    near_swing_low = float(df["Low"].iloc[near_lo:i].min())
+    near_swing_high = float(df["High"].iloc[near_lo:i].max())
+
+    # --- direction selection ---------------------------------------------
+    direction = None
+    setup_type = None
+
+    if regime == "trend":
+        if ema9 > ema21 and long_bias and mtf_long_ok and not macro_blocks_long:
+            direction = "long"
+            setup_type = "trend_follow_long"
+        elif ema9 < ema21 and short_bias and mtf_short_ok and not macro_blocks_short:
+            direction = "short"
+            setup_type = "trend_follow_short"
+    else:
+        # Mean reversion: fade exhaustion, require reclaim candle.
+        if ema50 is not None:
+            stretch = (close - ema50) / atr
+            reclaim_up = close > prev_close and close > float(prev["Low"])
+            reclaim_dn = close < prev_close and close < float(prev["High"])
+            if stretch <= -1.0 and reclaim_up and mtf_long_ok and not macro_blocks_long:
+                direction = "long"
+                setup_type = "mean_revert_long"
+            elif stretch >= 1.0 and reclaim_dn and mtf_short_ok and not macro_blocks_short:
+                direction = "short"
+                setup_type = "mean_revert_short"
+
+    if direction is None:
+        return None
+
+    # --- distance gate (don't chase) -------------------------------------
+    if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
+        return None
+    if (close - ema21) > 2.0 * atr and direction == "long":
+        return None
+    if (ema21 - close) > 2.0 * atr and direction == "short":
+        return None
+
+    # --- anti-chase gate (losers were late entries) ----------------------
+    move_3 = close - float(prev3["Close"])
+    if direction == "long" and move_3 > 2.5 * atr:
+        return None
+    if direction == "short" and -move_3 > 2.5 * atr:
+        return None
+
+    # --- opposite-swing veto (losers entered into fresh reversal) --------
+    if direction == "long":
+        # Fresh lower high in last 3 bars => momentum rolling over.
+        if float(prev["High"]) < float(prev2["High"]) and float(row["High"]) < float(prev["High"]):
+            return None
+    else:
+        if float(prev["Low"]) > float(prev2["Low"]) and float(row["Low"]) > float(prev["Low"]):
+            return None
+
+    # --- structure confirmation ------------------------------------------
+    breakout_up = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
+    breakout_dn = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
+    at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
+    at_resistance = abs(close - recent_swing_high) <= SUPPORT_PROXIMITY_ATR * atr
+
+    if direction == "long":
+        if not (breakout_up or at_support):
+            return None
+    else:
+        if not (breakout_dn or at_resistance):
+            return None
+
+    # --- momentum confirmation (relaxed) ---------------------------------
+    # Accept directional close vs prior close OR reclaim of EMA9 (with
+    # tolerance so prev_close == EMA9 counts as a reclaim).
+    tol = 0.05 * atr
+    if direction == "long":
+        momentum_ok = (close > prev_close) or (
+            close > ema9 and prev_close <= prev_ema9 + tol
+        )
+    else:
+        momentum_ok = (close < prev_close) or (
+            close < ema9 and prev_close >= prev_ema9 - tol
+        )
+    if not momentum_ok:
+        return None
+
+    # --- structural stop / targets ---------------------------------------
+    # Use the NEAREST protective swing so risk stays inside the 3*ATR cap.
+    if direction == "long":
+        sl = near_swing_low - (SL_BUFFER_ATR * atr) - TICK
+        if sl >= close:
+            return None
+        risk = close - sl
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close + TP1_R * risk
+        tp2_struct = close + TP2_R * risk
+        tp2 = min(tp2_struct, recent_swing_high) if recent_swing_high > tp1 else tp2_struct
+        if tp1 <= close:
+            return None
+    else:
+        sl = near_swing_high + (SL_BUFFER_ATR * atr) + TICK
+        if sl <= close:
+            return None
+        risk = sl - close
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close - TP1_R * risk
+        tp2_struct = close - TP2_R * risk
+        tp2 = max(tp2_struct, recent_swing_low) if recent_swing_low < tp1 else tp2_struct
+        if tp1 >= close:
+            return None
+
+    return {
+        "entry": close,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "swing_low": recent_swing_low,
+        "swing_high": recent_swing_high,
+        "near_swing_low": near_swing_low,
+        "near_swing_high": near_swing_high,
+        "risk": risk,
+        "direction": direction,
+        "setup_type": setup_type,
+        "regime": regime,
+        "gex": gex,
+        "macro_score": macro_score,
+        "breakout": breakout_up if direction == "long" else breakout_dn,
+        "at_support": at_support if direction == "long" else at_resistance,
+        "mtf_long_votes": int(mtf_long_votes),
+        "mtf_short_votes": int(mtf_short_votes),
+        "mtf_available": int(mtf_available),
+        "confluence_score": int(
+            (1 if regime == "trend" else 0)
+            + (1 if (long_bias or short_bias) else 0)
+            + (1 if mtf_available >= 3 else 0)
+            + (1 if abs(macro_score) < BULLISH_THRESHOLD else 0)
+        ),
+    }
+```

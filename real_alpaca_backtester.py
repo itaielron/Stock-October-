@@ -434,33 +434,40 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v3) — QA feedback integration:
-      * QA flagged the prior version as producing too few trades and
-        biased to a single "short" setup_type. Root causes:
-          1. Long-only bias (EMA9 > EMA21 hard gate) killed all shorts.
-          2. `close <= prev_close` momentum gate rejected valid pullback
-             longs where the trigger bar is a reclaim, not a green bar.
-          3. `close <= Open` gate rejected doji/reclaim bars.
-          4. `continuation` required prev_close <= EMA9 + 0.25*ATR which
-             is too tight on trending names.
-          5. No GEX regime awareness — mandate requires trend vs mean
-             reversion routing.
+    Hardened cluster (v4) — QA feedback integration:
+      * QA flagged v3 for: (a) still too few trades, (b) structural SL
+        placed at the *lookback* swing extreme which is often far away,
+        producing risk > 3*ATR rejections and killing valid setups,
+        (c) mean-reversion branch required |stretch| >= 1.5 ATR which is
+        rare on liquid names, (d) momentum gate still rejected reclaim
+        bars where prev_close == EMA9, (e) no explicit "why losers lost"
+        filter — losers clustered on: chasing extended bars, entering
+        against the higher-TF vote, and entering into a fresh opposite
+        swing.
       * Fixes:
-          - Symmetric long/short logic driven by EMA50/EMA200 regime.
-          - GEX regime routing (trend-follow vs mean-revert).
-          - Momentum gate relaxed to "close > prev_close OR reclaim of
-            EMA9" so pullback continuations fire.
-          - Removed the Open-color gate (doji reclaims are valid).
-          - Loosened continuation proximity to 0.75*ATR.
-          - Added MTF vote aggregation when MTF columns exist.
+          - Structural SL now uses the *nearest* protective swing within
+            a bounded window (NEAR_SWING_LOOKBACK) so risk stays inside
+            the 3*ATR cap and TP1 is reachable.
+          - Mean-reversion stretch threshold lowered to 1.0 ATR and
+            requires a reclaim candle (close back toward EMA50) so we
+            fade exhaustion, not free-fall.
+          - Momentum gate accepts reclaim when prev_close == EMA9 (<=
+            with tolerance) and accepts inside-bar continuations.
+          - Added "anti-chase" gate: reject if the last 3 bars already
+            moved > 2.5*ATR in trade direction (losers were late entries).
+          - Added "opposite swing" veto: reject long if a fresh lower
+            high formed in last 3 bars, reject short if fresh higher low.
+          - MTF vote now requires strict majority when >= 3 TFs present
+            (losers had split votes).
           - Kept ATR regime, distance gate, risk gates, structural SL/TP.
     """
-    if i < 2 or i >= len(df):
+    if i < 3 or i >= len(df):
         return None
 
     row = df.iloc[i]
     prev = df.iloc[i - 1]
     prev2 = df.iloc[i - 2]
+    prev3 = df.iloc[i - 3]
 
     # --- required columns -------------------------------------------------
     for col in ("EMA9", "EMA21", "Close", "High", "Low"):
@@ -470,8 +477,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     ema9 = float(row["EMA9"])
     ema21 = float(row["EMA21"])
     close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
     prev_close = float(prev["Close"])
-    open_ = float(row["Open"]) if "Open" in df.columns else close
+    prev_ema9 = float(prev["EMA9"]) if np.isfinite(prev["EMA9"]) else ema9
 
     if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
         return None
@@ -517,8 +526,13 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 elif v < 0:
                     mtf_short_votes += 1
 
-    mtf_long_ok = (mtf_available == 0) or (mtf_long_votes >= mtf_short_votes)
-    mtf_short_ok = (mtf_available == 0) or (mtf_short_votes >= mtf_long_votes)
+    # Strict majority when we have enough TFs (losers had split votes).
+    if mtf_available >= 3:
+        mtf_long_ok = mtf_long_votes > mtf_short_votes
+        mtf_short_ok = mtf_short_votes > mtf_long_votes
+    else:
+        mtf_long_ok = True
+        mtf_short_ok = True
 
     # --- macro gate (optional) -------------------------------------------
     macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
@@ -533,12 +547,16 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
 
+    # Nearest protective swing (bounded) — keeps risk inside 3*ATR cap.
+    near_lo = max(0, i - NEAR_SWING_LOOKBACK)
+    near_swing_low = float(df["Low"].iloc[near_lo:i].min())
+    near_swing_high = float(df["High"].iloc[near_lo:i].max())
+
     # --- direction selection ---------------------------------------------
     direction = None
     setup_type = None
 
     if regime == "trend":
-        # Trend-following: EMA9/EMA21 alignment + regime bias.
         if ema9 > ema21 and long_bias and mtf_long_ok and not macro_blocks_long:
             direction = "long"
             setup_type = "trend_follow_long"
@@ -546,13 +564,15 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             direction = "short"
             setup_type = "trend_follow_short"
     else:
-        # Mean reversion: stretch from EMA50 in ATR units.
+        # Mean reversion: fade exhaustion, require reclaim candle.
         if ema50 is not None:
             stretch = (close - ema50) / atr
-            if stretch <= -1.5 and mtf_long_ok and not macro_blocks_long:
+            reclaim_up = close > prev_close and close > float(prev["Low"])
+            reclaim_dn = close < prev_close and close < float(prev["High"])
+            if stretch <= -1.0 and reclaim_up and mtf_long_ok and not macro_blocks_long:
                 direction = "long"
                 setup_type = "mean_revert_long"
-            elif stretch >= 1.5 and mtf_short_ok and not macro_blocks_short:
+            elif stretch >= 1.0 and reclaim_dn and mtf_short_ok and not macro_blocks_short:
                 direction = "short"
                 setup_type = "mean_revert_short"
 
@@ -566,6 +586,22 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         return None
     if (ema21 - close) > 2.0 * atr and direction == "short":
         return None
+
+    # --- anti-chase gate (losers were late entries) ----------------------
+    move_3 = close - float(prev3["Close"])
+    if direction == "long" and move_3 > 2.5 * atr:
+        return None
+    if direction == "short" and -move_3 > 2.5 * atr:
+        return None
+
+    # --- opposite-swing veto (losers entered into fresh reversal) --------
+    if direction == "long":
+        # Fresh lower high in last 3 bars => momentum rolling over.
+        if float(prev["High"]) < float(prev2["High"]) and float(row["High"]) < float(prev["High"]):
+            return None
+    else:
+        if float(prev["Low"]) > float(prev2["Low"]) and float(row["Low"]) > float(prev["Low"]):
+            return None
 
     # --- structure confirmation ------------------------------------------
     breakout_up = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
@@ -581,17 +617,24 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return None
 
     # --- momentum confirmation (relaxed) ---------------------------------
-    # Accept either a directional close vs prior close OR a reclaim of EMA9.
+    # Accept directional close vs prior close OR reclaim of EMA9 (with
+    # tolerance so prev_close == EMA9 counts as a reclaim).
+    tol = 0.05 * atr
     if direction == "long":
-        momentum_ok = (close > prev_close) or (close > ema9 and prev_close <= float(prev["EMA9"]))
+        momentum_ok = (close > prev_close) or (
+            close > ema9 and prev_close <= prev_ema9 + tol
+        )
     else:
-        momentum_ok = (close < prev_close) or (close < ema9 and prev_close >= float(prev["EMA9"]))
+        momentum_ok = (close < prev_close) or (
+            close < ema9 and prev_close >= prev_ema9 - tol
+        )
     if not momentum_ok:
         return None
 
     # --- structural stop / targets ---------------------------------------
+    # Use the NEAREST protective swing so risk stays inside the 3*ATR cap.
     if direction == "long":
-        sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
+        sl = near_swing_low - (SL_BUFFER_ATR * atr) - TICK
         if sl >= close:
             return None
         risk = close - sl
@@ -605,7 +648,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if tp1 <= close:
             return None
     else:
-        sl = recent_swing_high + (SL_BUFFER_ATR * atr) + TICK
+        sl = near_swing_high + (SL_BUFFER_ATR * atr) + TICK
         if sl <= close:
             return None
         risk = sl - close
@@ -626,6 +669,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "tp2": tp2,
         "swing_low": recent_swing_low,
         "swing_high": recent_swing_high,
+        "near_swing_low": near_swing_low,
+        "near_swing_high": near_swing_high,
         "risk": risk,
         "direction": direction,
         "setup_type": setup_type,
