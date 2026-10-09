@@ -3090,3 +3090,151 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{regime}|{direction}|mtf={agree}/3",
     }
 ```
+
+--- Sat Oct 10 02:27:26 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    Root-cause notes for prior trades=0 runs:
+      - EMA_200 requires >=200 bars; if the caller only feeds a short window
+        (e.g. 1 week of 1m = ~2000 bars is fine, but 1h/4h windows are not),
+        the EMA columns are NaN and every gate fails silently.
+      - ATR gate was too tight (atr <= 0 or atr/price ratio bounds) and killed
+        every bar on low-vol instruments.
+      - GEX regime column was missing/NaN -> regime check always False.
+      - Strict AND-chaining of 4 independent gates with no fallback produced
+        zero signals. We now (a) guard for missing columns, (b) use a
+        scored confluence with a minimum threshold, and (c) keep the hard
+        risk gates (EMA trend + ATR) mandatory while allowing GEX to be
+        soft when unavailable.
+    """
+    import numpy as np
+
+    # ---- 0. Bounds & required-column guards -------------------------------
+    if i < 1 or i >= len(df):
+        return None
+
+    required = ("Close", "High", "Low", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+
+    # NaN guards (warm-up period, gaps, bad feeds)
+    if not np.isfinite(close) or not np.isfinite(ema50) or not np.isfinite(ema200):
+        return None
+    if not np.isfinite(atr14) or atr14 <= 0:
+        return None
+
+    # ---- 1. Volatility sanity (ATR within limits) -------------------------
+    atr_pct = atr14 / close
+    if atr_pct < 0.0005 or atr_pct > 0.05:   # 0.05% .. 5% of price
+        return None
+
+    # ---- 2. Directional bias (EMA) — HARD GATE ----------------------------
+    long_bias = (close > ema50) and (ema50 > ema200)
+    short_bias = (close < ema50) and (ema50 < ema200)
+    if not (long_bias or short_bias):
+        return None
+
+    direction = "long" if long_bias else "short"
+
+    # ---- 3. GEX regime — SOFT GATE (may be absent) ------------------------
+    gex = row.get("GEX", np.nan) if hasattr(row, "get") else np.nan
+    if "GEX" in df.columns:
+        gex = row["GEX"]
+
+    regime = None
+    if np.isfinite(gex):
+        regime = "trend" if gex < 0 else "mean_revert"
+
+    # ---- 4. Confluence scoring -------------------------------------------
+    score = 0
+    reasons = []
+
+    # 4a. EMA stack strength
+    ema_gap = abs(ema50 - ema200) / close
+    if ema_gap > 0.002:
+        score += 2
+        reasons.append("ema_stack")
+    elif ema_gap > 0.0005:
+        score += 1
+        reasons.append("ema_stack_weak")
+
+    # 4b. Momentum / candle body in trade direction
+    body = close - row.get("Open", prev["Close"]) if hasattr(row, "get") else close - prev["Close"]
+    if direction == "long" and body > 0:
+        score += 1
+        reasons.append("bull_body")
+    elif direction == "short" and body < 0:
+        score += 1
+        reasons.append("bear_body")
+
+    # 4c. Regime alignment
+    if regime == "trend" and direction in ("long", "short"):
+        score += 1
+        reasons.append("gex_trend")
+    elif regime == "mean_revert":
+        # mean-revert: fade extension from EMA50
+        ext = (close - ema50) / atr14
+        if direction == "long" and ext < -0.5:
+            score += 1
+            reasons.append("gex_mr_long")
+        elif direction == "short" and ext > 0.5:
+            score += 1
+            reasons.append("gex_mr_short")
+
+    # 4d. Volume confirmation (if available)
+    if "Volume" in df.columns:
+        vol = row["Volume"]
+        vol_ma = df["Volume"].iloc[max(0, i - 20):i].mean()
+        if np.isfinite(vol) and np.isfinite(vol_ma) and vol_ma > 0 and vol > vol_ma:
+            score += 1
+            reasons.append("volume")
+
+    # ---- 5. Minimum confluence threshold ---------------------------------
+    if score < 3:
+        return None
+
+    # ---- 6. Risk sizing (ATR-based) --------------------------------------
+    stop_dist = atr14 * 1.5
+    if direction == "long":
+        entry = close
+        sl = entry - stop_dist
+        tp1 = entry + stop_dist * 1.5
+        tp2 = entry + stop_dist * 2.5
+    else:
+        entry = close
+        sl = entry + stop_dist
+        tp1 = entry - stop_dist * 1.5
+        tp2 = entry - stop_dist * 2.5
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr14),
+        "score": int(score),
+        "regime": regime,
+        "reasons": reasons,
+        "index": int(i),
+    }
+```
