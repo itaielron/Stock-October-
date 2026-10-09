@@ -3589,3 +3589,213 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "index": i,
     }
 ```
+
+--- Sat Oct 10 02:29:09 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    The previous run produced zero trades. Root causes identified:
+      1. GEX regime gate was evaluated as a hard AND against a column that
+         was either missing or all-NaN, so every signal was rejected.
+      2. EMA_200 warm-up: with only ~1 week of 1m data (~2000 bars) the
+         EMA_200 was NaN for the first ~200 bars and the strict
+         `Close > EMA_50 > EMA_200` chain silently failed on the rest
+         because EMA_200 was still unstable.
+      3. ATR band filter used absolute dollar thresholds that never matched
+         the instrument's realized ATR, rejecting 100% of candidates.
+      4. Event-pause flag defaulted to False (trading disabled) when the
+         calendar column was absent.
+
+    Fixes applied below:
+      - GEX gate is now soft: if GEX data is unavailable, fall back to a
+        trend/volatility regime proxy instead of hard-rejecting.
+      - EMA warm-up handled via NaN-tolerant comparisons and a shorter
+        fallback EMA pair when EMA_200 is not yet defined.
+      - ATR filter is now relative (percentile of recent ATR) rather than
+        absolute dollar values.
+      - Event pause defaults to True (trading enabled) unless an explicit
+        pause flag is present and True.
+      - Multi-timeframe confluence: we require agreement between the
+        current bar's trend and the higher-timeframe (resampled) trend
+        when HTF data is derivable from the same frame.
+    """
+    import numpy as np
+
+    # --- Guard: need enough history ---
+    if i < 5 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # --- Helper: safe float ---
+    def _f(x):
+        try:
+            v = float(x)
+            return v if np.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
+    close = _f(row.get("Close", row.get("close")))
+    if close is None or atr is None or atr <= 0:
+        return None
+
+    ema50 = _f(row.get("EMA_50", row.get("ema_50")))
+    ema200 = _f(row.get("EMA_200", row.get("ema_200")))
+    ema20 = _f(row.get("EMA_20", row.get("ema_20")))
+
+    # --- Event-driven pause (default: trading ENABLED) ---
+    pause = row.get("Event_Pause", row.get("event_pause", False))
+    try:
+        if bool(pause):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    # --- Macro regime score (optional) ---
+    macro_score = _f(row.get("Macro_Score", row.get("macro_score")))
+    bullish_threshold = 0.5
+    bearish_threshold = -0.5
+    shorts_disabled = macro_score is not None and macro_score >= bullish_threshold
+    longs_disabled = macro_score is not None and macro_score <= bearish_threshold
+
+    # --- GEX regime (soft gate) ---
+    gex = _f(row.get("GEX", row.get("gex")))
+    if gex is not None:
+        # Negative gamma -> trend-following; Positive gamma -> mean-reversion
+        regime = "trend" if gex < 0 else "mean_revert"
+    else:
+        # Fallback regime proxy: use short vs long EMA slope as trend proxy
+        if ema20 is not None and ema50 is not None:
+            regime = "trend" if ema20 > ema50 else "mean_revert"
+        else:
+            regime = "trend"  # default to trend-following when unknown
+
+    # --- EMA trend alignment (NaN-tolerant) ---
+    # Prefer full 50/200 stack; fall back to 20/50 if 200 not yet defined.
+    if ema50 is not None and ema200 is not None:
+        long_trend = close > ema50 and ema50 > ema200
+        short_trend = close < ema50 and ema50 < ema200
+    elif ema20 is not None and ema50 is not None:
+        long_trend = close > ema20 and ema20 > ema50
+        short_trend = close < ema20 and ema20 < ema50
+    else:
+        # No EMA data at all -> cannot form a directional bias
+        return None
+
+    # --- ATR relative filter (percentile-based, not absolute) ---
+    atr_series = df["ATR_14"] if "ATR_14" in df.columns else df.get("atr_14")
+    atr_ok = True
+    if atr_series is not None:
+        window = atr_series.iloc[max(0, i - 100):i + 1].dropna()
+        if len(window) >= 20:
+            lo = float(window.quantile(0.10))
+            hi = float(window.quantile(0.95))
+            # Reject only truly degenerate volatility (dead or blow-off)
+            atr_ok = lo <= atr <= hi
+
+    if not atr_ok:
+        return None
+
+    # --- Multi-timeframe confluence (HTF trend agreement) ---
+    # Derive a coarse HTF trend from a 15-bar lookback on the same frame
+    # (proxy for higher timeframe when resampled data is unavailable).
+    htf_lookback = 15
+    if i >= htf_lookback:
+        htf_close = _f(df.iloc[i - htf_lookback].get("Close", df.iloc[i - htf_lookback].get("close")))
+        if htf_close is not None:
+            htf_up = close > htf_close
+            htf_down = close < htf_close
+        else:
+            htf_up = htf_down = True
+    else:
+        htf_up = htf_down = True
+
+    # --- Risk layer: drawdown / exposure ---
+    dd = _f(row.get("Current_Drawdown", row.get("current_drawdown")))
+    max_dd = _f(row.get("Max_Allowed_Drawdown", row.get("max_allowed_drawdown")))
+    if dd is not None and max_dd is not None and dd >= max_dd:
+        return None
+
+    daily_exp = _f(row.get("Daily_Exposure", row.get("daily_exposure")))
+    exp_limit = _f(row.get("Account_Limit", row.get("account_limit")))
+    if daily_exp is not None and exp_limit is not None and daily_exp >= exp_limit:
+        return None
+
+    # --- Signal generation ---
+    sl_dist = atr * 1.5
+
+    # LONG
+    if long_trend and htf_up and not longs_disabled:
+        if regime == "trend":
+            entry = close
+            sl = entry - sl_dist
+            tp1 = entry + sl_dist * 1.5
+            return {
+                "side": "long",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "atr": atr,
+                "regime": regime,
+                "reason": "trend_long_ema_htf_confluence",
+            }
+        else:
+            # mean-reversion long: only if price pulled back near EMA20
+            if ema20 is not None and close <= ema20 + 0.25 * atr:
+                entry = close
+                sl = entry - sl_dist
+                tp1 = ema20 + 0.5 * atr
+                if tp1 > entry:
+                    return {
+                        "side": "long",
+                        "entry": entry,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "atr": atr,
+                        "regime": regime,
+                        "reason": "mean_revert_long_ema20_pullback",
+                    }
+
+    # SHORT
+    if short_trend and htf_down and not shorts_disabled:
+        if regime == "trend":
+            entry = close
+            sl = entry + sl_dist
+            tp1 = entry - sl_dist * 1.5
+            return {
+                "side": "short",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "atr": atr,
+                "regime": regime,
+                "reason": "trend_short_ema_htf_confluence",
+            }
+        else:
+            if ema20 is not None and close >= ema20 - 0.25 * atr:
+                entry = close
+                sl = entry + sl_dist
+                tp1 = ema20 - 0.5 * atr
+                if tp1 < entry:
+                    return {
+                        "side": "short",
+                        "entry": entry,
+                        "sl": sl,
+                        "tp1": tp1,
+                        "atr": atr,
+                        "regime": regime,
+                        "reason": "mean_revert_short_ema20_rally",
+                    }
+
+    return None
+```

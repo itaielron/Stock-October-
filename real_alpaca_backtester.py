@@ -434,38 +434,39 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v22) — QA feedback integration:
-      * QA flagged v21 for: (a) trend branch still under-firing on
-        clean pullback continuations because the slope_strong gate
-        (0.60*ATR) was applied as a hard pre-filter even when the
-        pullback structure and MTF vote were unambiguous, (b) mean-rev
-        branch still under-firing on 1m/3m because the stretch
-        threshold (0.05*ATR) plus the reclaim/wick requirement were
-        jointly too strict for fast bars, (c) the composite reversal
-        veto still occasionally clipped healthy trend pullbacks, (d)
-        the distance gate (2.0*ATR directional cap) was rejecting
-        valid breakout continuations that had already extended.
-      * Fixes (v22):
+    Hardened cluster (v23) — QA feedback integration:
+      * QA flagged v22 for: (a) trend branch still under-firing on
+        clean pullback continuations because the two-tier slope gate
+        was still gated behind a strong MTF majority (>=3 votes) that
+        rarely materializes on 1m/3m, (b) mean-rev branch still
+        under-firing because the stretch threshold (0.03*ATR) plus the
+        reclaim/wick requirement were jointly too strict for fast
+        bars, (c) the composite reversal veto still occasionally
+        clipped healthy trend pullbacks, (d) the distance gate
+        (2.0*ATR directional cap) was rejecting valid breakout
+        continuations that had already extended.
+      * Fixes (v23):
           - Trend branch: slope_strong (>=0.60*ATR) is now required
             ONLY when the setup is NOT a clean pullback-to-EMA21 with
             a directional prior bar. Clean pullbacks with a strong MTF
-            majority (>=3 votes) are allowed with slope >= 0.35*ATR.
+            majority (>=2 votes) are allowed with slope >= 0.30*ATR.
             This recovers the under-firing pullback-continuation class
             without re-opening the weak-edge chop loser class.
           - MTF gate: with >=4 TFs require strict majority AND >=2
             votes (kept). With 3 TFs require >=2 agreeing AND slope
-            magnitude >= 0.35*ATR (relaxed from 0.60) when the setup
+            magnitude >= 0.30*ATR (relaxed from 0.35) when the setup
             is a pullback; otherwise keep 0.60*ATR.
-          - Mean-rev stretch threshold relaxed to 0.03*ATR (was 0.05);
+          - Mean-rev stretch threshold relaxed to 0.02*ATR (was 0.03);
             hard veto kept at 3.0*ATR. Reclaim/wick logic broadened:
-            accept a reclaim OR a wick OR a close in the outer 60% of
+            accept a reclaim OR a wick OR a close in the outer 55% of
             the bar range in the fade direction. Recovers the
             under-firing 1m/3m mean-rev class.
           - Composite reversal veto relaxed: require combined against
-            move >= 8.0*ATR (was 7.5) AND the current bar fails to
-            reclaim the prior bar's close by more than 0.85*ATR.
-          - Distance gate: directional cap raised to 2.5*ATR (was 2.0)
-            for breakout setups; kept at 2.0*ATR for pullback/mean-rev.
+            move >= 8.5*ATR (was 8.0) AND the current bar fails to
+            reclaim the prior bar's close by more than 0.95*ATR.
+          - Distance gate: directional cap raised to 2.75*ATR (was
+            2.5) for breakout setups; kept at 2.0*ATR for
+            pullback/mean-rev.
           - Anti-chase kept at 3.5*ATR over 3 bars.
           - Kept ATR regime, risk gates, structural SL/TP, macro gate,
             GEX routing, pullback-to-EMA21 structure, momentum
@@ -504,11 +505,11 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     bar_range = max(high - low, 1e-9)
     ema_slope = ema9 - ema21
     slope_flat = abs(ema_slope) < 0.08 * atr
-    # v22: two-tier slope gate. Strong slope is the default requirement
-    # for trend entries; a relaxed tier (0.35*ATR) is allowed ONLY for
+    # v23: two-tier slope gate. Strong slope is the default requirement
+    # for trend entries; a relaxed tier (0.30*ATR) is allowed ONLY for
     # clean pullback continuations with a strong MTF majority.
     slope_strong = abs(ema_slope) >= 0.60 * atr
-    slope_pullback_ok = abs(ema_slope) >= 0.35 * atr
+    slope_pullback_ok = abs(ema_slope) >= 0.30 * atr
 
     # EMA21 slope over last 3 bars (trend confirmation)
     ema21_3ago = float(prev3["EMA21"]) if np.isfinite(prev3["EMA21"]) else ema21
@@ -555,15 +556,15 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 elif v < 0:
                     mtf_short_votes += 1
 
-    # v22: MTF gate. With >=4 TFs require strict majority AND >=2 votes.
-    # With 3 TFs require >=2 agreeing AND slope magnitude >= 0.35*ATR
-    # (relaxed from 0.60 to allow clean pullbacks through).
+    # v23: MTF gate. With >=4 TFs require strict majority AND >=2 votes.
+    # With 3 TFs require >=2 agreeing AND slope magnitude >= 0.30*ATR
+    # (relaxed from 0.35 to allow clean pullbacks through).
     if mtf_available >= 4:
         mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 2)
         mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 2)
     elif mtf_available == 3:
-        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope >= 0.35 * atr)
-        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope <= -0.35 * atr)
+        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope >= 0.30 * atr)
+        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope <= -0.30 * atr)
     else:
         mtf_long_ok = True
         mtf_short_ok = True
@@ -577,8 +578,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             mtf_short_ok = False
 
     # Strong MTF majority flag (used to relax the slope gate for pullbacks)
-    mtf_strong_long = mtf_long_votes >= 3 and mtf_long_votes > mtf_short_votes
-    mtf_strong_short = mtf_short_votes >= 3 and mtf_short_votes > mtf_long_votes
+    mtf_strong_long = mtf_long_votes >= 2 and mtf_long_votes > mtf_short_votes
+    mtf_strong_short = mtf_short_votes >= 2 and mtf_short_votes > mtf_long_votes
 
     # --- macro gate (optional) -------------------------------------------
     macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
@@ -617,9 +618,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     setup_type = None
 
     if regime == "trend":
-        # v22: two-tier slope gate. Strong slope (>=0.60*ATR) is the
+        # v23: two-tier slope gate. Strong slope (>=0.60*ATR) is the
         # default. A clean pullback-to-EMA21 with a strong MTF majority
-        # (>=3 votes) is allowed with the relaxed slope tier (>=0.35*ATR).
+        # (>=2 votes) is allowed with the relaxed slope tier (>=0.30*ATR).
         long_slope_ok = slope_strong or (pullback_long and mtf_strong_long and slope_pullback_ok)
         short_slope_ok = slope_strong or (pullback_short and mtf_strong_short and slope_pullback_ok)
 
@@ -634,24 +635,24 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 direction = "short"
                 setup_type = "trend_follow_short"
     else:
-        # Mean reversion: fade exhaustion. v22: stretch threshold relaxed
-        # to 0.03*ATR (was 0.05); hard veto kept at 3.0*ATR. Reclaim/wick
-        # logic broadened to include outer-60% close in fade direction.
+        # Mean reversion: fade exhaustion. v23: stretch threshold relaxed
+        # to 0.02*ATR (was 0.03); hard veto kept at 3.0*ATR. Reclaim/wick
+        # logic broadened to include outer-55% close in fade direction.
         if ema50 is not None:
             stretch = (close - ema50) / atr
             reclaim_up = close > prev_close
             reclaim_dn = close < prev_close
             wick_up = low < min(prev_low, float(prev2["Low"]))
             wick_dn = high > max(prev_high, float(prev2["High"]))
-            # v22: outer-60% close in fade direction.
-            close_upper = close >= low + 0.40 * bar_range
-            close_lower = close <= low + 0.60 * bar_range
+            # v23: outer-55% close in fade direction.
+            close_upper = close >= low + 0.45 * bar_range
+            close_lower = close <= low + 0.55 * bar_range
 
             if abs(stretch) <= 3.0:
-                if stretch <= -0.03 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
+                if stretch <= -0.02 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
                     direction = "long"
                     setup_type = "mean_revert_long"
-                elif stretch >= 0.03 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
+                elif stretch >= 0.02 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
                     direction = "short"
                     setup_type = "mean_revert_short"
 
@@ -659,12 +660,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         return None
 
     # --- distance gate (don't chase) -------------------------------------
-    # v22: directional cap raised to 2.5*ATR for breakout setups; kept
+    # v23: directional cap raised to 2.75*ATR for breakout setups; kept
     # at 2.0*ATR for pullback/mean-rev.
     breakout_up_pre = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     breakout_dn_pre = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
     is_breakout = (direction == "long" and breakout_up_pre) or (direction == "short" and breakout_dn_pre)
-    dir_cap = 2.5 * atr if is_breakout else 2.0 * atr
+    dir_cap = 2.75 * atr if is_breakout else 2.0 * atr
 
     if abs(close - ema21) > DISTANCE_GATE_ATR * atr:
         return None
@@ -680,18 +681,18 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if direction == "short" and -move_3 > 3.5 * atr:
         return None
 
-    # --- composite reversal veto (v22 relaxed) ---------------------------
-    # Require combined against move >= 8.0*ATR (was 7.5) AND the current
-    # bar fails to reclaim the prior bar's close by more than 0.85*ATR.
+    # --- composite reversal veto (v23 relaxed) ---------------------------
+    # Require combined against move >= 8.5*ATR (was 8.0) AND the current
+    # bar fails to reclaim the prior bar's close by more than 0.95*ATR.
     prev_move = prev_close - float(prev2["Close"])
     prev2_move = float(prev["Close"]) - float(prev2["Close"])
     if direction == "long":
         combined_against = -(prev_move + prev2_move)
-        if combined_against >= 8.0 * atr and close < prev_close - 0.85 * atr:
+        if combined_against >= 8.5 * atr and close < prev_close - 0.95 * atr:
             return None
     else:
         combined_against = prev_move + prev2_move
-        if combined_against >= 8.0 * atr and close > prev_close + 0.85 * atr:
+        if combined_against >= 8.5 * atr and close > prev_close + 0.95 * atr:
             return None
 
     # --- structure confirmation ------------------------------------------
@@ -708,7 +709,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return None
 
     # --- momentum confirmation (trend only; mean-rev already encoded) ----
-    # v22: accept if close is on the trend side of EMA21 (structural) OR
+    # v23: accept if close is on the trend side of EMA21 (structural) OR
     # close > prev_close OR close in the trend half of the bar range.
     if regime == "trend":
         if direction == "long":
