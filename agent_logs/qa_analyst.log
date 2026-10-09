@@ -6223,3 +6223,152 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "near_resistance": bool(near_resistance),
     }
 ```
+
+--- Sat Oct 10 02:35:55 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. Each gate below is annotated with
+    the reason it can zero out the entire run so the QA agent can diagnose
+    which filter is the culprit without re-running the whole engine:
+
+      1. Warmup / index guard  -> i < 200 kills the first 200 bars.
+      2. NaN guard             -> EMA_200 / ATR_14 not yet seeded.
+      3. Regime gate (GEX)     -> if gex column is missing or all-zero,
+                                  the regime never matches and every bar
+                                  is dropped.
+      4. EMA trend gate        -> in a flat/choppy week Close never clears
+                                  EMA_50 > EMA_200 (or vice-versa), so no
+                                  directional bias is ever established.
+      5. ATR band gate         -> if ATR is outside [min,max] band for the
+                                  whole sample (e.g. low-vol week), every
+                                  bar is rejected.
+      6. Macro / event gate    -> if the macro score is stuck below the
+                                  bullish threshold AND shorts are disabled,
+                                  no direction is tradeable.
+      7. Risk layer            -> drawdown / daily exposure caps can drop
+                                  otherwise-valid signals.
+
+    The function therefore returns None (no trade) rather than raising, and
+    the caller is expected to tally rejection reasons so a trades=0 run can
+    be explained by the dominant gate.
+    """
+
+    # ---- 0. Structural guards -------------------------------------------
+    if i < 200:
+        return None  # warmup: EMA_200 not defined
+
+    row = df.iloc[i]
+
+    # Required columns must exist; missing data => no trade (not a crash).
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "GEX")
+    for col in required:
+        if col not in df.columns:
+            return None
+        if pd.isna(row[col]):
+            return None
+
+    close = float(row["Close"])
+    ema50 = float(row["EMA_50"])
+    ema200 = float(row["EMA_200"])
+    gex = float(row["GEX"])
+    atr_val = float(row["ATR_14"]) if atr is None else float(atr)
+
+    if atr_val <= 0:
+        return None
+
+    # ---- 1. Regime filter (GEX) -----------------------------------------
+    # GEX < 0 -> trend-following ; GEX > 0 -> mean-reversion.
+    # If GEX is exactly 0 or the column is flat, no regime is defined and
+    # we refuse to trade (this is a common cause of trades=0).
+    if gex == 0.0:
+        return None
+    trend_regime = gex < 0.0
+    mean_rev_regime = gex > 0.0
+
+    # ---- 2. Directional bias (EMA) --------------------------------------
+    long_bias = (close > ema50) and (ema50 > ema200)
+    short_bias = (close < ema50) and (ema50 < ema200)
+
+    # ---- 3. ATR band gate -----------------------------------------------
+    # Reject dead-vol and blow-off-vol regimes. Band is intentionally wide
+    # so a normal week still produces trades; tighten only if proven.
+    atr_pct = atr_val / close if close > 0 else 0.0
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        return None
+
+    # ---- 4. Macro / event gate ------------------------------------------
+    macro_score = float(row["Macro_Score"]) if "Macro_Score" in df.columns and not pd.isna(row.get("Macro_Score")) else 0.0
+    trading_enabled = bool(row["Trading_Enabled"]) if "Trading_Enabled" in df.columns and not pd.isna(row.get("Trading_Enabled")) else True
+    if not trading_enabled:
+        return None
+
+    BULLISH_THRESHOLD = 0.5
+    BEARISH_THRESHOLD = -0.5
+    if macro_score >= BULLISH_THRESHOLD:
+        short_bias = False  # macro veto on shorts
+    if macro_score <= BEARISH_THRESHOLD:
+        long_bias = False   # macro veto on longs
+
+    # ---- 5. Signal synthesis --------------------------------------------
+    direction = None
+    strategy = None
+
+    if trend_regime and long_bias:
+        direction, strategy = "long", "trend_follow"
+    elif trend_regime and short_bias:
+        direction, strategy = "short", "trend_follow"
+    elif mean_rev_regime and long_bias:
+        direction, strategy = "long", "mean_revert"
+    elif mean_rev_regime and short_bias:
+        direction, strategy = "short", "mean_revert"
+
+    if direction is None:
+        return None
+
+    # ---- 6. Risk sizing (ATR) -------------------------------------------
+    stop_dist = atr_val * 1.5
+    if direction == "long":
+        entry = close
+        stop = entry - stop_dist
+        tp1 = entry + stop_dist * 1.5   # 1.5R
+        tp2 = entry + stop_dist * 2.5   # 2.5R
+    else:
+        entry = close
+        stop = entry + stop_dist
+        tp1 = entry - stop_dist * 1.5
+        tp2 = entry - stop_dist * 2.5
+
+    # ---- 7. Risk-management layer ---------------------------------------
+    max_dd = float(row["Current_Drawdown"]) if "Current_Drawdown" in df.columns and not pd.isna(row.get("Current_Drawdown")) else 0.0
+    daily_exp = float(row["Daily_Exposure"]) if "Daily_Exposure" in df.columns and not pd.isna(row.get("Daily_Exposure")) else 0.0
+    if max_dd > 0.10:          # 10% drawdown cap
+        return None
+    if daily_exp > 0.50:       # 50% daily exposure cap
+        return None
+
+    return {
+        "index": i,
+        "direction": direction,
+        "strategy": strategy,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr_val,
+        "gex": gex,
+        "macro_score": macro_score,
+        "reason": f"{strategy}|gex={gex:.3f}|ema50={ema50:.2f}|ema200={ema200:.2f}",
+    }
+```
