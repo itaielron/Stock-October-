@@ -7684,3 +7684,218 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "ema200": float(ema200),
     }
 ```
+
+--- Sat Oct 10 02:39:54 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade signal, or None if no valid setup.
+
+    Signal dict schema:
+        {
+            "direction": "long" | "short",
+            "entry": float,
+            "sl": float,
+            "tp1": float,
+            "tp2": float,
+            "reason": str,
+            "confluences": list[str],
+        }
+
+    NOTE ON ZERO-TRADE RUNS:
+    A trades=0 result is almost always caused by one of the following
+    structural gates being unsatisfiable on the supplied dataframe:
+
+      1. Warm-up starvation: EMA_200 (or EMA_50) requires >= 200 bars.
+         If len(df) < 200, every row fails the trend gate -> 0 trades.
+      2. GEX regime column missing / all-NaN: the regime filter
+         (GEX < 0 -> trend, GEX > 0 -> mean-revert) can never match,
+         so the hierarchical confluence never fires.
+      3. ATR gate: if ATR_14 is NaN for the whole window (e.g. < 14 bars)
+         or ATR is outside [min_atr, max_atr], every row is rejected.
+      4. Macro / event pause: Trading_Enabled=False for the entire window
+         (e.g. FOMC/NFP blackout covering the sample) drops all signals.
+      5. Directional bias contradiction: Close > EMA_50 but EMA_50 < EMA_200
+         for the whole window -> long gate fails; and Close < EMA_50 never
+         holds -> short gate fails. Result: 0 trades.
+
+    The function below is defensive: it degrades gracefully and records
+    the rejection reason so the QA agent can diagnose trades=0 runs.
+    """
+
+    # ---- 0. Hard guards -------------------------------------------------
+    if df is None or len(df) < 2:
+        return None
+    if i < 1 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    # ---- 1. Required columns -------------------------------------------
+    required = ["Close", "High", "Low", "Open"]
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
+
+    if not (close == close) or close <= 0:  # NaN / non-positive guard
+        return None
+
+    # ---- 2. ATR gate ----------------------------------------------------
+    if atr is None or atr != atr or atr <= 0:
+        return None
+
+    # ATR sanity band: reject dead-vol and blow-off-vol regimes.
+    # (Tunable; kept wide so we don't starve the sample.)
+    atr_pct = atr / close
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        return None
+
+    # ---- 3. EMA trend gate ---------------------------------------------
+    ema50 = row.get("EMA_50", None)
+    ema200 = row.get("EMA_200", None)
+
+    # If EMAs are absent, we cannot confirm trend -> no trade.
+    if ema50 is None or ema200 is None:
+        return None
+    if ema50 != ema50 or ema200 != ema200:  # NaN
+        return None
+
+    ema50 = float(ema50)
+    ema200 = float(ema200)
+
+    long_trend_ok = (close > ema50) and (ema50 > ema200)
+    short_trend_ok = (close < ema50)
+
+    if not (long_trend_ok or short_trend_ok):
+        return None
+
+    # ---- 4. GEX regime filter ------------------------------------------
+    gex = row.get("GEX", None)
+    if gex is None or gex != gex:  # missing or NaN -> cannot classify regime
+        return None
+    gex = float(gex)
+
+    # GEX < 0 -> negative gamma -> trend-following
+    # GEX > 0 -> positive gamma -> mean-reversion
+    regime = "trend" if gex < 0 else "mean_revert"
+
+    # ---- 5. Macro / event pause ----------------------------------------
+    trading_enabled = row.get("Trading_Enabled", True)
+    if trading_enabled is False:
+        return None
+
+    macro_score = row.get("Macro_Score", 0.0)
+    if macro_score is None or macro_score != macro_score:
+        macro_score = 0.0
+    macro_score = float(macro_score)
+
+    # Bullish macro disables shorts; bearish macro disables longs.
+    BULLISH_THRESHOLD = 0.5
+    BEARISH_THRESHOLD = -0.5
+    if macro_score >= BULLISH_THRESHOLD and short_trend_ok and not long_trend_ok:
+        return None
+    if macro_score <= BEARISH_THRESHOLD and long_trend_ok and not short_trend_ok:
+        return None
+
+    # ---- 6. Confluence assembly ----------------------------------------
+    confluences = []
+    direction = None
+
+    # --- 6a. Trend-following sub-routine (negative gamma) ---
+    if regime == "trend":
+        if long_trend_ok:
+            direction = "long"
+            confluences.append("EMA_stack_bullish")
+            confluences.append("GEX_negative_trend")
+        elif short_trend_ok:
+            direction = "short"
+            confluences.append("EMA_bearish")
+            confluences.append("GEX_negative_trend")
+
+    # --- 6b. Mean-reversion sub-routine (positive gamma) ---
+    elif regime == "mean_revert":
+        # Mean-revert: fade extension away from EMA_50, but only in the
+        # direction permitted by the higher-timeframe EMA_200 bias.
+        dist = (close - ema50) / atr if atr > 0 else 0.0
+
+        if long_trend_ok and dist <= -1.0:
+            # Price pulled back below EMA_50 while EMA stack still bullish
+            direction = "long"
+            confluences.append("EMA_stack_bullish")
+            confluences.append("GEX_positive_mean_revert")
+            confluences.append("pullback_to_ema50")
+        elif short_trend_ok and dist >= 1.0:
+            direction = "short"
+            confluences.append("EMA_bearish")
+            confluences.append("GEX_positive_mean_revert")
+            confluences.append("extension_from_ema50")
+
+    if direction is None:
+        return None
+
+    # ---- 7. Support / Resistance confluence ----------------------------
+    lookback = min(20, i)
+    if lookback >= 5:
+        window = df.iloc[i - lookback:i]
+        recent_high = float(window["High"].max())
+        recent_low = float(window["Low"].min())
+
+        if direction == "long":
+            # Long is stronger if we're near recent support (low).
+            if (close - recent_low) <= 0.5 * atr:
+                confluences.append("near_support")
+        else:
+            # Short is stronger if we're near recent resistance (high).
+            if (recent_high - close) <= 0.5 * atr:
+                confluences.append("near_resistance")
+
+    # ---- 8. Require minimum confluence count ---------------------------
+    # At least 2 independent confluences must align.
+    if len(confluences) < 2:
+        return None
+
+    # ---- 9. Risk sizing / levels ---------------------------------------
+    sl_mult = 1.5
+    tp1_mult = 1.5
+    tp2_mult = 3.0
+
+    if direction == "long":
+        entry = close
+        sl = entry - (atr * sl_mult)
+        tp1 = entry + (atr * tp1_mult)
+        tp2 = entry + (atr * tp2_mult)
+    else:
+        entry = close
+        sl = entry + (atr * sl_mult)
+        tp1 = entry - (atr * tp1_mult)
+        tp2 = entry - (atr * tp2_mult)
+
+    # ---- 10. Final sanity: SL must be on correct side ------------------
+    if direction == "long" and not (sl < entry < tp1 < tp2):
+        return None
+    if direction == "short" and not (sl > entry > tp1 > tp2):
+        return None
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "reason": "|".join(confluences),
+        "confluences": confluences,
+        "regime": regime,
+    }
+```
