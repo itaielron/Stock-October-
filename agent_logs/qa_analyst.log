@@ -9486,3 +9486,38 @@ Zero trades means the entry gate never evaluated `True`. Given the mandate's hie
 This is a **gating-logic failure, not a market failure**. No winners/losers exist to learn from — Mandate #6 (genetic learning) cannot run on an empty trade set. Do not rotate timeframes yet (Mandate #10); fix the gate first.
 
 **Action:** Coder patches GEX fallback + gate instrumentation → re-run same window → QA re-evaluates. Halt optimization only after a PASS with ≥1 trade and logged rejection counts.
+
+--- Sat Oct 10 02:54:13 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:54:08Z -> 2026-10-09T23:54:08Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[trade] SPY WINNER entry=773.17 sl=770.43 tp1=778.64 tp2=782.75 exit=778.29 (TIME_STOP) R=+1.87 bars=79
+[info] QQQ: 372 bars, backtesting...
+------------------------------------------------------------...
+RESPONSE:
+**QA Evaluation — Cycle 2026-10-09**
+
+**Grade: FAIL (insufficient sample)**
+
+**What happened:** 1 trade, 1 winner, 100% WR, +1.87R. Statistically meaningless — n=1 is not a strategy, it's a coin flip with a nice story.
+
+**Why only 1 trade (root cause):**
+- 297 SPY bars / 372 QQQ bars over a 7-day window ≈ 1m data only. The mandate requires **1m, 3m, 5m, 15m, 1h, 4h**. Only one TF was evaluated — MTFA is not implemented.
+- Gating is too tight. With GEX unavailable (per limitation #11), the regime filter is likely defaulting to a single mode (trend OR mean-reversion), halving eligible setups. Confirm the mock proxy is actually being computed from price/volume, not silently forcing one branch.
+- EMA_50 > EMA_200 on 1m over 7 days is a rare alignment — this alone kills most signals. On 1m, EMA_200 ≈ 3.3 hours of context; the stack condition is nearly always either fully bull or fully bear, so you get long droughts.
+
+**Why the winner won (structural):**
+- Entry 773.17, SL 770.43 (2.74 = 1.5×ATR ≈ ATR 1.83), TP1 778.64. Exit 778.29 on TIME_STOP at bar 79 — **it did not hit TP1**. It was a trend-continuation drift that ran out of clock, not a confluence cluster firing. This is a marginal winner, not a validated edge.
+
+**Required fixes before next cycle:**
+1. **Implement MTFA loop** — iterate all 6 TFs, log per-TF trade counts. Zero-trade TFs must be reported, not skipped.
+2. **Loosen the stack**: on sub-15m TFs use EMA_20/EMA_50 instead of 50/200, or require only `Close > EMA_50` for longs (per mandate §1, shorts already only need `Close < EMA_50` — apply symmetry).
+3. **Log rejection reasons** — count how many bars failed GEX vs EMA vs ATR. Without this we're guessing.
+4. **TIME_STOP audit**: 79 bars to +1.87R means TP1 was never tagged. Either widen TP1 or shorten the time stop; a "winner" that misses TP1 is a disguised scratch.
+
+**Do not** append to `proven_strategies.md` — n=1 fails the rotation threshold. Rotate TF only after ≥30 trades with ≥80% WR.
+
+**Action:** Coder must add MTFA + rejection telemetry. Re-run. No standby.
