@@ -40,3 +40,6 @@ Modern systems do not rely solely on technicals; they filter technical setups us
 
 ## Credit Optimization & Runaway Prevention
 9. **Smart Sleep Protocol (Credit Conservation):** DeepSeek agents are strictly forbidden from rewriting code or running deep heuristic evaluations if the current backtest script achieves the target >80% win rate with structurally sound charts. If a cycle receives a `PASS` grade from the QA Analyst, the optimization engine MUST halt and enter standby mode. Do not waste API tokens over-optimizing a working system. The orchestrator is hard-limited to prevent infinite runaway loops.
+
+## Anti-Overfitting & Diverse Regime Learning
+10. **Success Memory & Rotation:** Do not overfit to a single timeframe or chart. Once a confluence cluster achieves >80% on a specific timeframe (e.g., 5Min), append the winning parameters to `agent_logs/proven_strategies.md`. The orchestrator will then rotate the backtester to a DIFFERENT timeframe (e.g., 15Min, 1Hour) or a different market condition. The Coder must read the `proven_strategies.md` log to deduce universal regime rules based on these verified successes.

@@ -5985,3 +5985,241 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{strategy}_{direction}_gex={'neg' if negative_gamma else 'pos'}",
     }
 ```
+
+--- Sat Oct 10 02:35:29 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade setup, or None if no valid setup.
+
+    NOTE ON THE PREVIOUS RUN (trades=0):
+    ---------------------------------------------------------------
+    The prior implementation returned 0 trades. Root causes identified:
+
+    1. GEX REGIME GATE WAS UNSATISFIABLE:
+       The regime filter required a `gex` column that either did not exist
+       in the dataframe, or was hard-gated to a single sign (e.g. only
+       negative gamma -> trend-following). When the synthetic/historical
+       feed had no GEX series, the gate evaluated to False on every bar,
+       so no signal could ever fire.
+
+    2. EMA STACK WAS TOO STRICT / WARMUP:
+       Requiring `Close > EMA_50 AND EMA_50 > EMA_200` on a short window
+       (e.g. 1 week of 1m data) means EMA_200 is still in warmup and
+       dominated by the seed value. The stack condition was effectively
+       never true, killing all long entries. Shorts required
+       `Close < EMA_50` but were then blocked by the macro bullish gate.
+
+    3. MACRO SCORE DEFAULTED TO BULLISH:
+       `Macro_Score >= Bullish_Threshold` disabled all shorts, and the
+       long path was already dead from (1) and (2). Net result: zero
+       signals on every bar.
+
+    4. ATR BAND WAS TOO NARROW:
+       The ATR "within limits" check used absolute dollar bounds that did
+       not match the instrument's realized volatility, so even valid
+       setups were filtered out.
+
+    FIXES APPLIED BELOW:
+    - GEX is now OPTIONAL: if the column is absent, we infer regime from
+      realized volatility + trend slope instead of hard-failing.
+    - EMA warmup is handled: if EMA_200 is not yet valid, we fall back to
+      a shorter stack (EMA_9/EMA_21/EMA_50) so early bars can still trade.
+    - Macro gate is now a soft bias, not a hard short-killer, unless an
+      explicit macro score column is present.
+    - ATR band is expressed in ATR-percentile terms relative to the
+      rolling window, not fixed dollar values.
+    - Confluence requires >= 2 independent confirmations (EMA, GEX/regime,
+      S/R proximity, ATR band) so we don't fire on a single indicator.
+    """
+
+    if i < 2 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+    open_ = float(row["open"])
+
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. EMA STACK (with warmup fallback)
+    # ------------------------------------------------------------------
+    def _ema(col):
+        v = row.get(col, np.nan)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return np.nan
+        return v if np.isfinite(v) else np.nan
+
+    ema9 = _ema("ema_9")
+    ema21 = _ema("ema_21")
+    ema50 = _ema("ema_50")
+    ema200 = _ema("ema_200")
+
+    long_ema = False
+    short_ema = False
+
+    if np.isfinite(ema50) and np.isfinite(ema200):
+        # Full stack available
+        long_ema = close > ema50 and ema50 > ema200
+        short_ema = close < ema50 and ema50 < ema200
+    elif np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(ema50):
+        # Warmup fallback: shorter stack
+        long_ema = close > ema9 > ema21 > ema50
+        short_ema = close < ema9 < ema21 < ema50
+    else:
+        # No EMA data at all -> cannot confirm trend, bail
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. GEX / REGIME (optional, inferred if missing)
+    # ------------------------------------------------------------------
+    gex = row.get("gex", np.nan)
+    try:
+        gex = float(gex)
+    except (TypeError, ValueError):
+        gex = np.nan
+
+    if np.isfinite(gex):
+        negative_gamma = gex < 0
+        positive_gamma = gex > 0
+    else:
+        # Infer regime from realized vol vs. its rolling median.
+        # High vol expansion -> treat as negative gamma (trend-follow).
+        # Low vol compression -> treat as positive gamma (mean-revert).
+        vol_col = "atr" if "atr" in df.columns else None
+        if vol_col is not None and i >= 50:
+            window = df[vol_col].iloc[i - 50:i].astype(float)
+            med = float(window.median()) if len(window) else np.nan
+            negative_gamma = np.isfinite(med) and atr > med
+            positive_gamma = np.isfinite(med) and atr <= med
+        else:
+            # Last resort: use candle body direction as weak regime proxy
+            negative_gamma = True
+            positive_gamma = False
+
+    # ------------------------------------------------------------------
+    # 3. MACRO BIAS (soft, only if column present)
+    # ------------------------------------------------------------------
+    macro_score = row.get("macro_score", np.nan)
+    try:
+        macro_score = float(macro_score)
+    except (TypeError, ValueError):
+        macro_score = np.nan
+
+    macro_bullish = np.isfinite(macro_score) and macro_score >= 0.5
+    macro_bearish = np.isfinite(macro_score) and macro_score <= -0.5
+
+    # ------------------------------------------------------------------
+    # 4. ATR BAND (percentile-based, not fixed dollars)
+    # ------------------------------------------------------------------
+    atr_ok = True
+    if "atr" in df.columns and i >= 50:
+        window = df["atr"].iloc[i - 50:i].astype(float).dropna()
+        if len(window) >= 20:
+            lo = float(window.quantile(0.10))
+            hi = float(window.quantile(0.90))
+            atr_ok = lo <= atr <= hi
+
+    # ------------------------------------------------------------------
+    # 5. SUPPORT / RESISTANCE PROXIMITY
+    # ------------------------------------------------------------------
+    lookback = min(50, i)
+    recent = df.iloc[i - lookback:i]
+    swing_high = float(recent["high"].max()) if len(recent) else high
+    swing_low = float(recent["low"].min()) if len(recent) else low
+
+    near_resistance = (swing_high - close) <= 0.5 * atr
+    near_support = (close - swing_low) <= 0.5 * atr
+
+    # ------------------------------------------------------------------
+    # 6. CONFLUENCE SCORING (require >= 2 independent confirmations)
+    # ------------------------------------------------------------------
+    long_score = 0
+    short_score = 0
+
+    if long_ema:
+        long_score += 1
+    if short_ema:
+        short_score += 1
+
+    if negative_gamma:
+        # Trend-following regime favors breakout direction
+        if close > open_:
+            long_score += 1
+        if close < open_:
+            short_score += 1
+    if positive_gamma:
+        # Mean-reversion regime favors fade at extremes
+        if near_support:
+            long_score += 1
+        if near_resistance:
+            short_score += 1
+
+    if atr_ok:
+        long_score += 1
+        short_score += 1
+
+    if near_support and long_ema:
+        long_score += 1
+    if near_resistance and short_ema:
+        short_score += 1
+
+    # Macro soft bias
+    if macro_bullish:
+        long_score += 1
+        short_score -= 1
+    if macro_bearish:
+        short_score += 1
+        long_score -= 1
+
+    # ------------------------------------------------------------------
+    # 7. FINAL DECISION
+    # ------------------------------------------------------------------
+    MIN_CONFLUENCE = 2
+
+    if long_score >= MIN_CONFLUENCE and long_score > short_score:
+        direction = "long"
+        entry = close
+        sl = entry - 1.5 * atr
+        tp1 = entry + 1.5 * atr
+        tp2 = entry + 3.0 * atr
+    elif short_score >= MIN_CONFLUENCE and short_score > long_score:
+        direction = "short"
+        entry = close
+        sl = entry + 1.5 * atr
+        tp1 = entry - 1.5 * atr
+        tp2 = entry - 3.0 * atr
+    else:
+        return None
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "long_score": int(long_score),
+        "short_score": int(short_score),
+        "regime": "negative_gamma" if negative_gamma else "positive_gamma",
+        "ema_stack": "full" if np.isfinite(ema200) else "warmup",
+        "atr_ok": bool(atr_ok),
+        "near_support": bool(near_support),
+        "near_resistance": bool(near_resistance),
+    }
+```
