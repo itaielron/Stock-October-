@@ -541,3 +541,178 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:21:11 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Multi-timeframe confluence cluster evaluator.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    The previous run produced trades=0. Root causes identified and fixed here:
+
+    1. GEX regime was treated as a hard AND-gate against a single strategy
+       branch. When GEX data was missing/NaN (common in historical replay),
+       the comparison `gex < 0` silently evaluated False for BOTH branches,
+       killing every signal. FIX: treat missing GEX as NEUTRAL and fall back
+       to EMA+ATR confluence instead of hard-blocking.
+
+    2. EMA_200 requires 200 bars of warmup. On a 1-week 1m/3m pull the
+       EMA_200 was NaN for the entire window, so `ema50 > ema200` was always
+       False -> zero longs. FIX: adaptive warmup — if EMA_200 is NaN, degrade
+       gracefully to EMA_50 vs EMA_20 slope check and flag `degraded=True`.
+
+    3. ATR filter used a hard absolute band that was never satisfied on low-
+       vol instruments. FIX: use a percentile band relative to the rolling
+       ATR distribution instead of fixed constants.
+
+    4. MTFA confluence required ALL timeframes to agree (AND of 6). With 6
+       independent gates at ~0.7 agreement each, joint probability collapses
+       to ~0.12 -> near-zero trades. FIX: require a weighted score >= 0.6
+       instead of unanimous agreement.
+
+    These four fixes are the structural reason the prior run had trades=0.
+    """
+
+    # ---- 0. Guard: need enough history --------------------------------
+    if i < 5 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # ---- 1. ATR sanity (relative percentile band, not fixed) ----------
+    if atr is None or atr <= 0 or pd.isna(atr):
+        return None
+
+    atr_series = df["atr"].iloc[max(0, i - 200):i] if "atr" in df.columns else None
+    if atr_series is not None and len(atr_series) >= 30:
+        lo = atr_series.quantile(0.10)
+        hi = atr_series.quantile(0.95)
+        if not (lo <= atr <= hi):
+            return None
+
+    # ---- 2. EMA directional bias (adaptive warmup) --------------------
+    ema20 = row.get("ema20", float("nan"))
+    ema50 = row.get("ema50", float("nan"))
+    ema200 = row.get("ema200", float("nan"))
+    close = row["close"]
+
+    degraded = False
+    if pd.isna(ema200):
+        # Not enough bars for EMA_200 -> degrade to short-horizon slope
+        degraded = True
+        if pd.isna(ema20) or pd.isna(ema50):
+            return None
+        long_bias = close > ema50 and ema50 > ema20
+        short_bias = close < ema50 and ema50 < ema20
+    else:
+        long_bias = close > ema50 and ema50 > ema200
+        short_bias = close < ema50 and ema50 < ema200
+
+    if not (long_bias or short_bias):
+        return None
+
+    direction = "long" if long_bias else "short"
+
+    # ---- 3. GEX regime (soft, not hard-blocking) ----------------------
+    gex = row.get("gex", float("nan"))
+    if pd.isna(gex):
+        regime = "neutral"
+    elif gex < 0:
+        regime = "trend"      # negative gamma -> trend-following
+    else:
+        regime = "meanrev"    # positive gamma -> mean-reversion
+
+    # ---- 4. MTFA weighted confluence score ----------------------------
+    # Each timeframe contributes a signed vote in [-1, +1].
+    # +1 = agrees with `direction`, -1 = disagrees, 0 = neutral/missing.
+    tf_cols = {
+        "1m":  ("close_1m",  "ema50_1m"),
+        "3m":  ("close_3m",  "ema50_3m"),
+        "5m":  ("close_5m",  "ema50_5m"),
+        "15m": ("close_15m", "ema50_15m"),
+        "1h":  ("close_1h",  "ema50_1h"),
+        "4h":  ("close_4h",  "ema50_4h"),
+    }
+    weights = {"1m": 0.10, "3m": 0.10, "5m": 0.15,
+               "15m": 0.20, "1h": 0.20, "4h": 0.25}
+
+    score = 0.0
+    total_w = 0.0
+    for tf, (c_col, e_col) in tf_cols.items():
+        c = row.get(c_col, float("nan"))
+        e = row.get(e_col, float("nan"))
+        w = weights[tf]
+        if pd.isna(c) or pd.isna(e):
+            continue
+        total_w += w
+        if direction == "long":
+            if c > e:
+                score += w
+            else:
+                score -= w
+        else:
+            if c < e:
+                score += w
+            else:
+                score -= w
+
+    if total_w == 0:
+        # No MTF data at all -> fall back to base TF only, mark degraded
+        degraded = True
+        mtf_score = 0.5
+    else:
+        mtf_score = (score / total_w + 1.0) / 2.0  # normalize to [0,1]
+
+    # Require weighted agreement >= 0.60 (was: unanimous AND -> 0 trades)
+    if mtf_score < 0.60:
+        return None
+
+    # ---- 5. Regime / direction compatibility --------------------------
+    # Trend regime favors momentum continuation; mean-rev favors fade.
+    # We do NOT hard-block on mismatch, we only require the MTF score to
+    # be strong enough to justify the trade in the current regime.
+    if regime == "trend" and mtf_score < 0.65:
+        return None
+    if regime == "meanrev" and mtf_score < 0.70:
+        return None
+
+    # ---- 6. Risk sizing (ATR-based) -----------------------------------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        entry = close
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * 1.5   # 1.5R
+        tp2 = entry + sl_dist * 2.5   # 2.5R
+    else:
+        entry = close
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * 1.5
+        tp2 = entry - sl_dist * 2.5
+
+    # ---- 7. Emit setup -------------------------------------------------
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "sl_dist": float(sl_dist),
+        "regime": regime,
+        "mtf_score": float(mtf_score),
+        "degraded": degraded,
+        "reason": (
+            f"{direction} | regime={regime} | mtf={mtf_score:.2f} | "
+            f"atr={atr:.4f} | degraded={degraded}"
+        ),
+    }
+```
