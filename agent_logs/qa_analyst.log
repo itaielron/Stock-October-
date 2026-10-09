@@ -9174,3 +9174,46 @@ Without this, we cannot distinguish "no setup" from "broken gate." This is a **r
 4. Re-run same window. **Do not** touch strategy logic beyond gating until we see ≥1 trade.
 
 **Halt optimization** until funnel output confirms which gate is dead.
+
+--- Sat Oct 10 02:51:03 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:50:58Z -> 2026-10-09T23:50:58Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades across 297 SPY + 372 QQQ bars means the entry gate never returned `True`. Per the mandate, the gate is a strict AND of three conditions. Any one of them being permanently false kills every bar. Ranked by likelihood:
+
+1. **EMA_200 warm-up starvation (most likely).** With only ~300–370 bars per symbol, `EMA_200` is still in its unstable warm-up region for the first ~200 bars, and `Close > EMA_50 > EMA_200` is a rare alignment in a 5-day window. If the loader also drops the first 200 bars as NaN, the effective testable window collapses to ~100 bars — often not enough for a stacked-EMA regime to form.
+2. **GEX regime mismatch.** Per mandate #11, GEX must default to *neutral* (not crash). If the coder instead set `gex_regime = None` and the gate requires `gex_regime in ("pos","neg")`, every bar fails. Verify the neutral fallback actually routes to *one* of the two sub-routines (recommend: neutral → trend-following, since IEX has no dealer-flow signal).
+3. **ATR "within limits" band too tight.** If `ATR_14` is bounded by an absolute dollar range tuned on a different regime, a low-vol week silently rejects all bars.
+4. **Macro/event pause stuck ON.** If the calendar parser failed to load and defaulted `Trading_Enabled=False`, the whole window is dead.
+
+### Required diagnostics before next cycle
+Add a per-bar rejection counter and print it:
+```
+reject[ema]=N reject[gex]=N reject[atr]=N reject[macro]=N reject[risk]=N
+```
+This is non-negotiable — we cannot optimize what we cannot attribute.
+
+### Structural fixes (do NOT over-optimize)
+- Warm-up: require `len(df) >= 250` per symbol **or** seed EMA_200 with SMA_200 over the first 200 bars so the gate is live from bar 1.
+- GEX neutral → trend-following default; log `gex=neutral` explicitly.
+- ATR band: use *relative* bounds (`ATR/Close` between 0.3% and 3%), not absolute dollars.
+- Macro: if calendar unavailable, default `Trading_Enabled=True` and log a warning.
+
+### Credit note (Mandate #9)
+This is a **FAIL**, so optimization may continue — but only the diagnostic instrumentation above. Do not rewrite entry logic until the rejection histogram tells us which gate is the culprit. One targeted fix per cycle.
+
+**Next action:** instrument rejection counters, re-run same window, report histogram.
