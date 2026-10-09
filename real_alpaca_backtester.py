@@ -431,7 +431,7 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    4Hour confluence cluster — QA funnel-instrumented, fail-open rewrite.
+    1Min confluence cluster — QA funnel-instrumented, fail-open rewrite.
 
     QA DIAGNOSTIC DIRECTIVE (carried forward):
       Prior runs produced ZERO trades because hard gates silently zeroed the
@@ -439,29 +439,33 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
       This rewrite:
         - FAILS OPEN on GEX / Macro / Event / ATR_MEAN / ADX / EMA50 / EMA200.
         - Uses EMA9/EMA21/EMA50 stack (all seeded well before bar 200 on
-          4Hour windows) with EMA200 as a SOFT bonus, not a hard gate.
+          1Min windows) with EMA200 as a SOFT bonus, not a hard gate.
         - Emits a per-bar funnel dict via `_FUNNEL` so the orchestrator can
           print: bars_total -> gex_pass -> ema_pass -> atr_pass ->
           macro_pass -> event_pass -> signals.
 
-    4Hour-specific tuning (vs 1Hour):
-      - Much wider distance gate (2.5*ATR) — 4H bars travel far from EMA9.
-      - Higher ADX floor (28) — 4H chop is extremely punishing.
-      - Stronger volatility-expansion requirement (ATR > 1.10 * ATR_MEAN).
-      - Hard SL floor 1.5% of price (4H gaps are widest).
-      - EOD flat: block final 1 bar (last 4 hours of session).
-      - TP1 must clear 2.0*ATR (4H moves are largest).
-      - Require close > EMA50 (not just EMA21) for structural trend confirm.
+    1Min-specific tuning (vs 4Hour):
+      - TIGHT distance gate (0.6*ATR) — 1Min bars hug EMA9; chasing = death.
+      - Lower ADX floor (18) — 1Min trends are weaker but faster.
+      - Volatility expansion required (ATR > 1.05 * ATR_MEAN) — 1Min noise
+        dominates; only trade when range is expanding.
+      - Hard SL floor 0.15% of price (1Min gaps are tiny but stops must
+        survive micro-noise).
+      - EOD flat: block final 15 minutes of session (1Min EOD drift is brutal).
+      - TP1 must clear 1.0*ATR (1Min moves are small; 2.0*ATR never fills).
+      - Require close > EMA21 (not just EMA9) for structural trend confirm.
+      - Require EMA21 slope positive (1Min trend must be live, not flat).
       - Require higher-high structure over LOOKBACK window (trend integrity).
-      - Require EMA50 slope positive (4H trend must be established, not flat).
+      - Require volume confirmation (1Min needs tape confirmation).
 
     Loser classes killed:
-      A) chop bleed  -> ATR > 1.10*ATR_MEAN AND ADX > 28 AND TP1 >= 2.0*ATR
-      B) gap stop    -> hard SL floor 1.5% of price
-      C) EOD drift   -> block final 4 hours of session
-      D) late chase  -> distance gate 2.5*ATR from EMA9
-      E) false trend -> require close > EMA50 AND higher-high structure
-                        AND EMA50 slope > 0
+      A) chop bleed  -> ATR > 1.05*ATR_MEAN AND ADX > 18 AND TP1 >= 1.0*ATR
+      B) micro stop  -> hard SL floor 0.15% of price
+      C) EOD drift   -> block final 15 minutes of session
+      D) late chase  -> distance gate 0.6*ATR from EMA9
+      E) false trend -> require close > EMA21 AND higher-high structure
+                        AND EMA21 slope > 0
+      F) thin tape   -> volume >= VOL_MULT * VOL_MEAN
     """
     global _FUNNEL
     try:
@@ -486,13 +490,13 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
         return None
 
-    # --- 0. EOD_FLAT: block final 4 hours of session ---------------------
+    # --- 0. EOD_FLAT: block final 15 minutes of session ------------------
     try:
         ts = df.index[i]
         if hasattr(ts, "hour"):
             mins = ts.hour * 60 + ts.minute
-            # Block 12:00 -> 16:00 (final 4 hours)
-            if 12 * 60 <= mins <= 16 * 60:
+            # Block 15:45 -> 16:00 (final 15 minutes)
+            if 15 * 60 + 45 <= mins <= 16 * 60:
                 return None
     except Exception:
         pass
@@ -560,33 +564,33 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if close <= ema9:
         return None
 
-    # 4H structural trend confirm: close must be above EMA50 when present.
-    if np.isfinite(ema50) and close <= ema50:
+    # 1Min structural trend confirm: close must be above EMA21 when present.
+    if np.isfinite(ema21) and close <= ema21:
         return None
 
-    # 4H trend must be ESTABLISHED: EMA50 slope positive (not flat).
-    if np.isfinite(ema50) and np.isfinite(prev_ema50):
-        if ema50 <= prev_ema50:
+    # 1Min trend must be LIVE: EMA21 slope positive (not flat).
+    if np.isfinite(ema21) and np.isfinite(prev_ema21):
+        if ema21 <= prev_ema21:
             return None
 
-    # --- 3. DISTANCE GATE (4Hour: 2.5*ATR) -------------------------------
+    # --- 3. DISTANCE GATE (1Min: 0.6*ATR) --------------------------------
     if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
         return None
     _FUNNEL["ema_pass"] += 1
 
-    # --- 4. VOLATILITY EXPANSION (FAIL-OPEN, 4H: 1.10x) ------------------
+    # --- 4. VOLATILITY EXPANSION (FAIL-OPEN, 1Min: 1.05x) ----------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
-        if atr <= 1.10 * atr_mean:
+        if atr <= 1.05 * atr_mean:
             return None
     # Fail-OPEN if ATR_MEAN missing.
 
-    # --- 5. ADX TREND-STRENGTH (FAIL-OPEN, 4H: 28) -----------------------
+    # --- 5. ADX TREND-STRENGTH (FAIL-OPEN, 1Min: 18) ---------------------
     adx = float(row["ADX14"]) if "ADX14" in df.columns else (
         float(row["ADX"]) if "ADX" in df.columns else float("nan")
     )
     if np.isfinite(adx):
-        if adx <= 28.0:
+        if adx <= 18.0:
             return None
     # Fail-OPEN if ADX missing.
     _FUNNEL["atr_pass"] += 1
@@ -612,7 +616,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         pass
     _FUNNEL["event_pass"] += 1
 
-    # --- 8. VOLUME CONFIRMATION ------------------------------------------
+    # --- 8. VOLUME CONFIRMATION (1Min: tape must confirm) ----------------
     if "Volume" in df.columns and "VOL_MEAN" in df.columns:
         vol = float(row["Volume"])
         vol_mean = float(row["VOL_MEAN"])
@@ -637,7 +641,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not (bullish_body or close_above_prev_high):
         return None
 
-    # 4H trend integrity: require higher-high structure over LOOKBACK.
+    # 1Min trend integrity: require higher-high structure over LOOKBACK.
     # Compare the most recent half of the window vs the older half.
     half = max(2, (i - win_lo) // 2)
     if i - win_lo >= 4:
@@ -652,10 +656,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not (body > 0.8 * atr and close_above_prev_high):
             return None
 
-    # --- 10. STRUCTURAL STOP with HARD FLOOR (4Hour: 1.5%) ---------------
+    # --- 10. STRUCTURAL STOP with HARD FLOOR (1Min: 0.15%) ---------------
     structural_sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
     atr_sl = close - (atr * 1.5)
-    pct_floor_sl = close * (1.0 - 0.015)  # 1.5% hard floor for 4Hour
+    pct_floor_sl = close * (1.0 - 0.0015)  # 0.15% hard floor for 1Min
     sl = min(structural_sl, atr_sl, pct_floor_sl)
     if sl >= close:
         return None
@@ -666,9 +670,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if risk < MIN_RISK_ATR * atr:
         return None
 
-    # --- 12. TP1 must clear 2.0*ATR (4Hour: widest of all TFs) -----------
+    # --- 12. TP1 must clear 1.0*ATR (1Min: smallest of all TFs) ----------
     tp1 = close + TP1_R * risk
-    if (tp1 - close) < 2.0 * atr:
+    if (tp1 - close) < 1.0 * atr:
         return None
 
     # --- structural targets ----------------------------------------------
@@ -696,7 +700,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "adx": adx,
         "atr_mean": atr_mean,
         "ema200_bonus": ema200_bonus,
-        "timeframe": "4Hour",
+        "timeframe": "1Min",
     }
 
 
