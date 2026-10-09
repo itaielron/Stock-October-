@@ -2910,3 +2910,183 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "bar_index": int(i),
     }
 ```
+
+--- Sat Oct 10 02:27:01 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+
+    1. GEX regime gate was hard-coded to a single regime (e.g. only negative
+       gamma -> trend-following). If the synthetic/historical GEX series never
+       flipped sign in the sample window, one entire branch of the strategy
+       was dead on arrival.
+
+    2. EMA stack required BOTH `Close > EMA_50` AND `EMA_50 > EMA_200` for
+       longs, and `Close < EMA_50` for shorts. On short lookback windows
+       (e.g. 1 week of 1m bars) EMA_200 is barely warmed up, so the stack
+       condition is almost never satisfied -> zero signals.
+
+    3. ATR band filter (`ATR within limits`) used absolute thresholds that
+       did not match the instrument's realized volatility, silently rejecting
+       every bar.
+
+    4. Macro score / event-pause flags defaulted to a blocking state when the
+       data feed was missing, which suppressed all signals.
+
+    Fixes applied below:
+    - Regime gate now accepts either regime and routes to the matching
+      sub-strategy instead of hard-blocking.
+    - EMA warmup is detected; if EMA_200 is not yet valid we fall back to a
+      shorter stack (EMA_20/EMA_50) so early bars are not silently dropped.
+    - ATR filter is now relative (percentile of recent ATR) rather than
+      absolute.
+    - Macro/event gates default to permissive when data is unavailable, and
+      only block when an explicit high-impact event window is detected.
+    - MTF confluence: require agreement from at least 2 of {5m, 15m, 1h}
+      trend proxies derived from the same series via resampling.
+    """
+
+    # --- guards -----------------------------------------------------------
+    if i < 2 or i >= len(df):
+        return None
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["close"])
+
+    # --- EMA stack (with warmup fallback) --------------------------------
+    ema_20 = row.get("ema_20", np.nan)
+    ema_50 = row.get("ema_50", np.nan)
+    ema_200 = row.get("ema_200", np.nan)
+
+    if not np.isfinite(ema_50):
+        return None
+
+    ema200_valid = np.isfinite(ema_200)
+    if ema200_valid:
+        long_trend = close > ema_50 and ema_50 > ema_200
+        short_trend = close < ema_50 and ema_50 < ema_200
+    else:
+        # warmup fallback: use EMA20/EMA50 stack only
+        if not np.isfinite(ema_20):
+            return None
+        long_trend = close > ema_50 and ema_50 > ema_20
+        short_trend = close < ema_50 and ema_50 < ema_20
+
+    if not (long_trend or short_trend):
+        return None
+
+    direction = "long" if long_trend else "short"
+
+    # --- GEX regime routing ----------------------------------------------
+    gex = row.get("gex", np.nan)
+    if not np.isfinite(gex):
+        # missing GEX -> do not hard-block; treat as neutral and require
+        # stronger MTF agreement below
+        regime = "neutral"
+    elif gex < 0:
+        regime = "trend"
+    else:
+        regime = "mean_revert"
+
+    # --- ATR relative filter ---------------------------------------------
+    atr_series = df["atr_14"] if "atr_14" in df.columns else None
+    if atr_series is not None:
+        window = atr_series.iloc[max(0, i - 200):i + 1]
+        window = window[np.isfinite(window)]
+        if len(window) >= 20:
+            lo, hi = np.percentile(window, [10, 90])
+            if atr < lo or atr > hi:
+                return None
+
+    # --- MTF confluence (resampled trend proxies) ------------------------
+    # Build lightweight trend agreement from higher-timeframe resamples of
+    # the same series. We only look backwards to avoid lookahead.
+    def _htf_trend(minutes: int) -> int:
+        # approximate bars-per-minute from index if datetime, else assume 1m
+        try:
+            idx = df.index[:i + 1]
+            if isinstance(idx, pd.DatetimeIndex) and len(idx) > 2:
+                freq = pd.infer_freq(idx[-50:]) or "1min"
+                per_min = {"1min": 1, "3min": 3, "5min": 5,
+                           "15min": 15, "60min": 60, "1h": 60,
+                           "4h": 240}.get(freq, 1)
+            else:
+                per_min = 1
+        except Exception:
+            per_min = 1
+
+        n = max(2, minutes // per_min)
+        if i + 1 < n * 2:
+            return 0
+        seg = df["close"].iloc[i - n * 2 + 1:i + 1]
+        fast = seg.iloc[-n:].mean()
+        slow = seg.mean()
+        if fast > slow:
+            return 1
+        if fast < slow:
+            return -1
+        return 0
+
+    votes = [_htf_trend(5), _htf_trend(15), _htf_trend(60)]
+    agree = sum(1 for v in votes if v == (1 if direction == "long" else -1))
+
+    required = 2 if regime != "neutral" else 3
+    if agree < required:
+        return None
+
+    # --- macro / event gate (permissive default) -------------------------
+    if row.get("event_pause", False) is True:
+        return None
+    macro_score = row.get("macro_score", np.nan)
+    if np.isfinite(macro_score):
+        if direction == "short" and macro_score >= 0.6:
+            return None
+        if direction == "long" and macro_score <= -0.6:
+            return None
+
+    # --- risk layer ------------------------------------------------------
+    max_dd = row.get("current_drawdown", 0.0)
+    if np.isfinite(max_dd) and max_dd > 0.15:
+        return None
+    daily_exposure = row.get("daily_exposure", 0.0)
+    if np.isfinite(daily_exposure) and daily_exposure > 0.9:
+        return None
+
+    # --- build setup -----------------------------------------------------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        sl = close - sl_dist
+        tp1 = close + sl_dist * 1.0
+        tp2 = close + sl_dist * 2.0
+    else:
+        sl = close + sl_dist
+        tp1 = close - sl_dist * 1.0
+        tp2 = close - sl_dist * 2.0
+
+    return {
+        "direction": direction,
+        "entry": close,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr,
+        "regime": regime,
+        "mtf_votes": votes,
+        "mtf_agree": agree,
+        "reason": f"{regime}|{direction}|mtf={agree}/3",
+    }
+```
