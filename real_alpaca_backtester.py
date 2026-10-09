@@ -431,47 +431,44 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    5Min confluence cluster — QA funnel-instrumented, fail-open, MTFA-aware.
+    15Min confluence cluster — QA FAIL-CLOSED rewrite (v2).
 
-    QA DIRECTIVE (carried forward from 1Min cycle):
-      Prior runs produced ZERO trades because hard gates silently zeroed the
-      pipeline on missing feeds (GEX, Macro, Event, ATR_MEAN, ADX, EMA200).
-      This rewrite:
-        - FAILS OPEN on GEX / Macro / Event / ATR_MEAN / ADX / EMA50 / EMA200.
-        - Uses EMA9/EMA21/EMA50 stack (all seeded well before bar 200 on
-          5Min windows) with EMA200 as a SOFT bonus, not a hard gate.
-        - Emits a per-bar funnel dict via `_FUNNEL` so the orchestrator can
-          print: bars_total -> gex_pass -> ema_pass -> atr_pass ->
-          macro_pass -> event_pass -> signals.
-        - Logs GEX_UNAVAILABLE once when the column is missing entirely so
-          the orchestrator can fail-loud instead of silently zeroing.
+    QA DIRECTIVE (this cycle):
+      Prior 5Min run produced ZERO trades because the pipeline FAILED OPEN on
+      missing feeds (GEX, MTFA, ATR_MEAN, ADX, EMA200) and then silently
+      zeroed on NaN EMA200. QA verdict: "uninitialized run", not a backtest.
+      Required fixes:
+        1. HARD-FAIL on missing GEX / MTFA columns (raise, do not proceed).
+        2. Warm-up guard: require i >= 250 (EMA200 + ATR_14 + signal window).
+        3. Diagnostic counters: signals_evaluated, gated_by_GEX, gated_by_EMA,
+           gated_by_ATR, gated_by_MTFA, gated_by_STRUCT, signals.
+        4. No silent fail-open on mandate-critical feeds.
 
-    5Min-specific tuning (vs 1Min and 4Hour):
-      - MEDIUM distance gate (0.9*ATR) — 5Min bars breathe more than 1Min
-        but still punish chasing; 4Hour uses 1.5*ATR.
-      - ADX floor 20 — 5Min trends are more reliable than 1Min but weaker
-        than 4Hour; 20 is the sweet spot for structural trend confirmation.
-      - Volatility expansion 1.02x ATR_MEAN — 5Min noise is lower than 1Min
-        so we don't need as aggressive an expansion filter.
-      - Hard SL floor 0.25% of price — 5Min swings are wider than 1Min.
-      - EOD flat: block final 20 minutes of session (5Min bars = 4 bars).
-      - TP1 must clear 1.2*ATR (5Min moves are larger than 1Min).
-      - Require close > EMA21 (structural trend confirm).
-      - Require EMA21 slope positive (trend must be live, not flat).
+    15Min-specific tuning (vs 5Min and 1Hour):
+      - DISTANCE gate 1.1*ATR (15Min bars breathe more than 5Min; chasing
+        is punished harder because the next bar is 15 minutes away).
+      - ADX floor 22 (15Min trends are more reliable than 5Min; 22 filters
+        the 5Min-grade chop that survives into 15Min).
+      - Volatility expansion 1.05x ATR_MEAN (15Min noise is lower than
+        5Min, so a mild expansion filter is sufficient).
+      - Hard SL floor 0.35% of price (15Min swings are wider than 5Min).
+      - EOD flat: block final 30 minutes (2 x 15Min bars).
+      - TP1 must clear 1.5*ATR (15Min moves are larger than 5Min).
+      - Require close > EMA21 AND EMA21 slope > 0 (live trend).
       - Require higher-high structure over LOOKBACK window.
-      - Require volume confirmation (>= 1.1x VOL_MEAN).
-      - MTFA CONFLUENCE: if higher-TF columns (EMA50_15M, EMA50_1H) exist,
-        require alignment; otherwise fail-open (log MTFA_UNAVAILABLE once).
+      - Require volume >= 1.15x VOL_MEAN (15Min tape must confirm).
+      - MTFA: require alignment with EMA50_1H AND EMA50_4H (mandate §5).
+        EMA50_15M is the local TF and is not used as a higher-TF gate.
 
     Loser classes killed:
-      A) chop bleed  -> ATR > 1.02*ATR_MEAN AND ADX > 20 AND TP1 >= 1.2*ATR
-      B) micro stop  -> hard SL floor 0.25% of price
-      C) EOD drift   -> block final 20 minutes of session
-      D) late chase  -> distance gate 0.9*ATR from EMA9
-      E) false trend -> require close > EMA21 AND higher-high structure
-                        AND EMA21 slope > 0
-      F) thin tape   -> volume >= VOL_MULT * VOL_MEAN
-      G) TF conflict -> higher-TF EMA alignment when available
+      A) chop bleed   -> ATR > 1.05*ATR_MEAN AND ADX > 22 AND TP1 >= 1.5*ATR
+      B) micro stop   -> hard SL floor 0.35% of price
+      C) EOD drift    -> block final 30 minutes of session
+      D) late chase   -> distance gate 1.1*ATR from EMA9
+      E) false trend  -> close > EMA21 AND higher-high structure AND slope>0
+      F) thin tape    -> volume >= 1.15 * VOL_MEAN
+      G) TF conflict  -> hard MTFA alignment (1H + 4H) — FAIL-CLOSED
+      H) cold start   -> warm-up guard i >= 250 (EMA200 stability)
     """
     global _FUNNEL, _GEX_WARNED, _MTFA_WARNED
     try:
@@ -479,7 +476,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     except Exception:
         _FUNNEL = {
             "bars_total": 1, "gex_pass": 0, "ema_pass": 0, "atr_pass": 0,
-            "macro_pass": 0, "event_pass": 0, "mtfa_pass": 0, "signals": 0,
+            "macro_pass": 0, "event_pass": 0, "mtfa_pass": 0,
+            "struct_pass": 0, "signals": 0,
         }
     try:
         _GEX_WARNED
@@ -490,8 +488,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     except Exception:
         _MTFA_WARNED = False
 
-    # --- guard: need enough history --------------------------------------
-    if i < 3:
+    # --- 0. WARM-UP GUARD (FAIL-CLOSED) ----------------------------------
+    # EMA200 needs ~200 bars; ATR_14 + signal window need ~50 more.
+    # Below 250 bars the EMA200 is undefined and every long silently dies.
+    if i < 250:
         return None
 
     row = df.iloc[i]
@@ -504,67 +504,64 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
         return None
 
-    # --- 0. EOD_FLAT: block final 20 minutes of session ------------------
+    # --- 1. HARD-FAIL ON MISSING MANDATE-CRITICAL COLUMNS ----------------
+    # QA: "If GEX or higher-TF EMA columns are absent, the run must raise,
+    # not proceed." A silent 0-trade run wastes a full cycle (§3).
+    if "GEX" not in df.columns:
+        raise RuntimeError(
+            "[FAIL_CLOSED] GEX column missing — mandate §1 requires GEX "
+            "regime filter. Fix the data puller (or synthesize GEX_PROXY "
+            "from dealer OI) before re-running."
+        )
+    htf_required = ("EMA50_1H", "EMA50_4H")
+    missing_htf = [c for c in htf_required if c not in df.columns]
+    if missing_htf:
+        raise RuntimeError(
+            f"[FAIL_CLOSED] MTFA columns missing: {missing_htf} — mandate §5 "
+            "requires 1m/3m/5m/15m/1h/4h alignment. Fix the data puller "
+            "before re-running."
+        )
+
+    # --- 2. EOD_FLAT: block final 30 minutes (2 x 15Min bars) ------------
     try:
         ts = df.index[i]
         if hasattr(ts, "hour"):
             mins = ts.hour * 60 + ts.minute
-            # Block 15:40 -> 16:00 (final 20 minutes = 4 x 5Min bars)
-            if 15 * 60 + 40 <= mins <= 16 * 60:
+            if 15 * 60 + 30 <= mins <= 16 * 60:
                 return None
     except Exception:
         pass
 
-    # --- 1. GEX REGIME (FAIL-OPEN, FAIL-LOUD ONCE) -----------------------
-    gex_ok = True
-    try:
-        if "GEX" in df.columns:
-            gex_val = float(row["GEX"])
-            if np.isfinite(gex_val) and gex_val != 0.0:
-                gex_ok = True
-            else:
-                gex_ok = True  # fail-open on NaN/0
-        else:
-            gex_ok = True  # fail-open on missing column
-            if not _GEX_WARNED:
-                try:
-                    print("[GEX_UNAVAILABLE] column missing — failing open "
-                          "(regime filter disabled for this run).")
-                except Exception:
-                    pass
-                _GEX_WARNED = True
-    except Exception:
-        gex_ok = True
-    if not gex_ok:
+    # --- 3. GEX REGIME (FAIL-CLOSED on NaN/0) ----------------------------
+    gex_val = float(row["GEX"])
+    if not np.isfinite(gex_val) or gex_val == 0.0:
+        # NaN/0 GEX is not a valid regime — do not silently pass.
+        return None
+    # Negative gamma -> trend-following regime (longs valid).
+    # Positive gamma -> mean-reversion regime (long breakout invalid).
+    if gex_val > 0:
         return None
     _FUNNEL["gex_pass"] += 1
 
-    # --- 2. EMA STACK (EMA9 > EMA21 > EMA50; EMA200 soft) ----------------
+    # --- 4. EMA STACK (EMA9 > EMA21 > EMA50 > EMA200) --------------------
     ema9 = float(row["EMA9"]) if "EMA9" in df.columns else float("nan")
     ema21 = float(row["EMA21"]) if "EMA21" in df.columns else float("nan")
     ema50 = float(row["EMA50"]) if "EMA50" in df.columns else float("nan")
     ema200 = float(row["EMA200"]) if "EMA200" in df.columns else float("nan")
     prev_ema9 = float(prev["EMA9"]) if "EMA9" in df.columns else float("nan")
     prev_ema21 = float(prev["EMA21"]) if "EMA21" in df.columns else float("nan")
-    prev_ema50 = float(prev["EMA50"]) if "EMA50" in df.columns else float("nan")
 
-    if not (np.isfinite(ema9) and np.isfinite(ema21)):
+    if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(ema50)):
         return None
-    if not (ema9 > ema21):
+    if not (ema9 > ema21 > ema50):
         return None
-    if np.isfinite(ema50):
-        if not (ema21 > ema50):
-            return None
-    else:
-        # EMA50 missing -> require EMA9 rising to avoid flat chop.
-        if not (np.isfinite(prev_ema9) and ema9 > prev_ema9):
-            return None
-
-    # EMA200 is a SOFT bonus: if present and close < EMA200, require a
-    # stronger momentum bar to compensate (don't hard-block).
-    ema200_bonus = True
-    if np.isfinite(ema200) and close < ema200:
-        ema200_bonus = False
+    # EMA200 is now a HARD gate (warm-up guard guarantees it is defined).
+    if not np.isfinite(ema200):
+        return None
+    if not (ema50 > ema200):
+        return None
+    if not (close > ema50):
+        return None
 
     # Freshness: fresh cross OR reclaim OR clean continuation.
     fresh_cross = (
@@ -584,38 +581,37 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if close <= ema9:
         return None
 
-    # 5Min structural trend confirm: close must be above EMA21.
-    if np.isfinite(ema21) and close <= ema21:
+    # 15Min structural trend confirm: close must be above EMA21.
+    if close <= ema21:
         return None
 
-    # 5Min trend must be LIVE: EMA21 slope positive (not flat).
-    if np.isfinite(ema21) and np.isfinite(prev_ema21):
-        if ema21 <= prev_ema21:
-            return None
+    # 15Min trend must be LIVE: EMA21 slope positive (not flat).
+    if np.isfinite(prev_ema21) and ema21 <= prev_ema21:
+        return None
 
-    # --- 3. DISTANCE GATE (5Min: 0.9*ATR) --------------------------------
+    # --- 5. DISTANCE GATE (15Min: 1.1*ATR) -------------------------------
     if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
         return None
     _FUNNEL["ema_pass"] += 1
 
-    # --- 4. VOLATILITY EXPANSION (FAIL-OPEN, 5Min: 1.02x) ----------------
+    # --- 6. VOLATILITY EXPANSION (15Min: 1.05x ATR_MEAN) -----------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
-        if atr <= 1.02 * atr_mean:
+        if atr <= 1.05 * atr_mean:
             return None
-    # Fail-OPEN if ATR_MEAN missing.
+    # Fail-OPEN if ATR_MEAN missing (non-mandate-critical).
 
-    # --- 5. ADX TREND-STRENGTH (FAIL-OPEN, 5Min: 20) ---------------------
+    # --- 7. ADX TREND-STRENGTH (15Min: 22) -------------------------------
     adx = float(row["ADX14"]) if "ADX14" in df.columns else (
         float(row["ADX"]) if "ADX" in df.columns else float("nan")
     )
     if np.isfinite(adx):
-        if adx <= 20.0:
+        if adx <= 22.0:
             return None
-    # Fail-OPEN if ADX missing.
+    # Fail-OPEN if ADX missing (non-mandate-critical).
     _FUNNEL["atr_pass"] += 1
 
-    # --- 6. MACRO SCORE (FAIL-OPEN) --------------------------------------
+    # --- 8. MACRO SCORE (FAIL-OPEN) --------------------------------------
     try:
         if "Macro_Score" in df.columns:
             ms = float(row["Macro_Score"])
@@ -626,7 +622,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         pass
     _FUNNEL["macro_pass"] += 1
 
-    # --- 7. EVENT PAUSE (FAIL-OPEN) --------------------------------------
+    # --- 9. EVENT PAUSE (FAIL-OPEN) --------------------------------------
     try:
         if "Event_Pause" in df.columns:
             ep = row["Event_Pause"]
@@ -636,40 +632,25 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         pass
     _FUNNEL["event_pass"] += 1
 
-    # --- 8. MTFA CONFLUENCE (FAIL-OPEN, FAIL-LOUD ONCE) ------------------
-    # If higher-TF EMA columns are present, require alignment. Otherwise
-    # fail-open and warn once so the orchestrator can fix the data path.
-    mtfa_available = False
-    try:
-        htf_cols = [c for c in ("EMA50_15M", "EMA50_1H", "EMA50_4H")
-                    if c in df.columns]
-        if htf_cols:
-            mtfa_available = True
-            for c in htf_cols:
-                v = float(row[c])
-                if np.isfinite(v) and close < v:
-                    return None
-        else:
-            if not _MTFA_WARNED:
-                try:
-                    print("[MTFA_UNAVAILABLE] no higher-TF EMA columns — "
-                          "failing open (MTFA confluence disabled).")
-                except Exception:
-                    pass
-                _MTFA_WARNED = True
-    except Exception:
-        pass
+    # --- 10. MTFA CONFLUENCE (FAIL-CLOSED, mandate §5) -------------------
+    # Require alignment with 1H AND 4H EMA50. 15M is the local TF.
+    for c in htf_required:
+        v = float(row[c])
+        if not np.isfinite(v):
+            return None
+        if close < v:
+            return None
     _FUNNEL["mtfa_pass"] += 1
 
-    # --- 9. VOLUME CONFIRMATION (5Min: tape must confirm) ----------------
+    # --- 11. VOLUME CONFIRMATION (15Min: 1.15x VOL_MEAN) -----------------
     if "Volume" in df.columns and "VOL_MEAN" in df.columns:
         vol = float(row["Volume"])
         vol_mean = float(row["VOL_MEAN"])
         if np.isfinite(vol_mean) and vol_mean > 0:
-            if vol < VOL_MULT * vol_mean:
+            if vol < 1.15 * vol_mean:
                 return None
 
-    # --- 10. STRUCTURE: swing levels + higher-high integrity -------------
+    # --- 12. STRUCTURE: swing levels + higher-high integrity -------------
     win_lo = max(0, i - LOOKBACK)
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
@@ -686,7 +667,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not (bullish_body or close_above_prev_high):
         return None
 
-    # 5Min trend integrity: require higher-high structure over LOOKBACK.
+    # 15Min trend integrity: require higher-high structure over LOOKBACK.
     half = max(2, (i - win_lo) // 2)
     if i - win_lo >= 4:
         recent_high = float(df["High"].iloc[i - half:i].max())
@@ -694,29 +675,25 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if np.isfinite(recent_high) and np.isfinite(older_high):
             if recent_high < older_high:
                 return None
+    _FUNNEL["struct_pass"] += 1
 
-    # If EMA200 bonus is False, demand a stronger momentum bar.
-    if not ema200_bonus:
-        if not (body > 0.8 * atr and close_above_prev_high):
-            return None
-
-    # --- 11. STRUCTURAL STOP with HARD FLOOR (5Min: 0.25%) ---------------
+    # --- 13. STRUCTURAL STOP with HARD FLOOR (15Min: 0.35%) --------------
     structural_sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
     atr_sl = close - (atr * 1.5)
-    pct_floor_sl = close * (1.0 - 0.0025)  # 0.25% hard floor for 5Min
+    pct_floor_sl = close * (1.0 - 0.0035)  # 0.35% hard floor for 15Min
     sl = min(structural_sl, atr_sl, pct_floor_sl)
     if sl >= close:
         return None
 
     risk = close - sl
 
-    # --- 12. MINIMUM RISK GATE -------------------------------------------
+    # --- 14. MINIMUM RISK GATE -------------------------------------------
     if risk < MIN_RISK_ATR * atr:
         return None
 
-    # --- 13. TP1 must clear 1.2*ATR (5Min: mid-range of TFs) -------------
+    # --- 15. TP1 must clear 1.5*ATR (15Min: larger than 5Min) ------------
     tp1 = close + TP1_R * risk
-    if (tp1 - close) < 1.2 * atr:
+    if (tp1 - close) < 1.5 * atr:
         return None
 
     # --- structural targets ----------------------------------------------
@@ -743,9 +720,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "atr": atr,
         "adx": adx,
         "atr_mean": atr_mean,
-        "ema200_bonus": ema200_bonus,
-        "mtfa_available": mtfa_available,
-        "timeframe": "5Min",
+        "gex": gex_val,
+        "mtfa_1h": float(row["EMA50_1H"]),
+        "mtfa_4h": float(row["EMA50_4H"]),
+        "timeframe": "15Min",
     }
 
 

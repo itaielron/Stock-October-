@@ -8904,3 +8904,42 @@ The pipeline is **failing open on missing data instead of failing closed**. "Fai
 **Do not rotate timeframes. Do not append to `proven_strategies.md`.** This run produced no evidence. Fix the data layer, re-run the *same* window, and only then evaluate win rate. Per §9, no optimization is warranted until a valid trade sample exists.
 
 **Next action:** Coder patches fail-closed guards + warm-up check; re-run 2026-10-02→09; QA re-evaluates.
+
+--- Sat Oct 10 02:48:37 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:48:33Z -> 2026-10-09T23:48:33Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+Traceback (most recent call last):
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 979, in <module>
+    run_backtest(start=_start, end=_end)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/itaielron/Documents/AntiGravity/bl...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-02 → 2026-10-09
+
+**Grade: FAIL (Hard Crash — Zero Trades)**
+
+### Root Cause
+The backtester crashed at bar 0 on SPY before generating a single signal. `_confluence_cluster()` raised `FAIL_CLOSED` because the `GEX` column is absent from the dataframe. This is a **data-layer failure, not a strategy failure** — no trades were evaluated, so win-rate is undefined (0/0).
+
+### Why Trades = 0
+1. **Data puller never fetched/synthesized GEX.** The mandate §1 requires GEX regime as the *first* hierarchical gate. The puller returned OHLCV+ATR only.
+2. **Fail-closed design worked as intended.** Rather than silently defaulting GEX to 0 (which would corrupt regime classification), the engine halted. This is correct behavior — but it means the entire week's data is unprocessed.
+3. **No fallback path.** There is no `GEX_PROXY` synthesis from dealer OI / options chain, so the pipeline has no recovery route.
+
+### Required Fixes (Coder)
+1. **Implement `GEX_PROXY` synthesis** from options chain: `GEX ≈ Σ(call_OI·Γ_call − put_OI·Γ_put)·S²·0.01` per strike, net across chain. If live chain unavailable for historical bars, use a documented proxy (e.g., VIX-term-structure sign + put/call OI skew) and **log the proxy method in the bar metadata**.
+2. **Add a `--allow-proxy` flag** so QA can distinguish real GEX vs. proxy in results.
+3. **Do not weaken fail-closed.** Keep the raise; add the synthesizer upstream.
+
+### Structural Note (Anti-Overfit §10)
+We cannot yet judge confluence quality. Once GEX is populated, verify the regime split actually fires both Trend-Following (GEX<0) and Mean-Reversion (GEX>0) sub-routines across the 1m/3m/5m/15m/1h/4h set — a single-regime week would be a red flag for overfitting.
+
+### Action
+- **Halt optimization.** No PASS issued. Do not rotate timeframes.
+- **Push fix to GitHub** (§8) with the GEX synthesizer + proxy logging.
+- **Re-run** the same window; report trades, win rate, and regime distribution.
+
+**Verdict: BLOCKED — data integrity failure. Fix puller, re-run, resubmit.**
