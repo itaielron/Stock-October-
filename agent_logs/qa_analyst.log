@@ -9266,3 +9266,51 @@ Without these, we are guessing. **Zero-trade output is a bug, not a result.**
 4. Push to GitHub (Mandate #8).
 
 **Do not enter standby** — standby is only valid after a PASS with >80% WR.
+
+--- Sat Oct 10 02:51:55 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:51:50Z -> 2026-10-09T23:51:50Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades is a **gating failure**, not a market condition. With 297 SPY + 372 QQQ bars across 1m–4h, a functioning engine should produce *some* signals. The complete absence points to a hard AND-chain that never resolves True.
+
+**Most likely culprits (in order):**
+
+1. **EMA_200 warmup on 1m/3m/5m.** 297 SPY 1m bars < 200-period EMA_200 requirement + lookback. If the engine requires `Close > EMA_50 > EMA_200` on every timeframe simultaneously, short timeframes never satisfy it → zero signals. **Fix:** compute EMA_200 on the highest available TF (1h/4h) and only require EMA_50 alignment on lower TFs.
+
+2. **GEX gate still blocking.** Per Mandate #11, GEX must default to *neutral* (allow both regimes) when unavailable. If the code treats missing GEX as `GEX < 0` only, all mean-reversion setups are silently dropped. **Verify:** log the resolved GEX value per bar.
+
+3. **ATR "within limits" band too tight.** If `ATR_14` bounds were hardcoded from a prior regime, current ATR may sit outside → every bar rejected. **Fix:** log min/max ATR observed vs. threshold.
+
+4. **Macro_Score / event pause.** If the macro stub returns a default that disables shorts AND the EMA filter disables longs, the intersection is empty. **Fix:** assert `Trading_Enabled=True` and print macro score.
+
+### Required diagnostics before next run
+Add per-bar counters and print at end:
+```
+rejected_by_gex, rejected_by_ema, rejected_by_atr, rejected_by_macro, rejected_by_risk
+```
+This is non-negotiable — we cannot optimize a black box.
+
+### Structural note
+Mandate #5 requires MTFA confluence across 1m/3m/5m/15m/1h/4h. A strict AND across all six is statistically near-impossible. **Rewrite as a weighted score** (e.g., ≥4 of 6 TFs aligned) rather than unanimous agreement.
+
+### Action
+- **Do NOT** append to `proven_strategies.md` (no winners to learn from).
+- **Do NOT** enter standby (no PASS).
+- Coder: instrument rejection counters, relax EMA_200 to HTF-only, force GEX=neutral fallback, then re-run.
+- Push diagnostics to GitHub per Mandate #8.
+
+**Next cycle target:** trades > 0 with rejection histogram populated. Win rate is meaningless until signals exist.
