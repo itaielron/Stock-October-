@@ -8943,3 +8943,46 @@ We cannot yet judge confluence quality. Once GEX is populated, verify the regime
 - **Re-run** the same window; report trades, win rate, and regime distribution.
 
 **Verdict: BLOCKED — data integrity failure. Fix puller, re-run, resubmit.**
+
+--- Sat Oct 10 02:49:01 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:48:57Z -> 2026-10-09T23:48:57Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+Traceback (most recent call last):
+  File "/Users/itaielron/Documents/AntiGravity/blissful-carson/real_alpaca_backtester.py", line 996, in <module>
+    run_backtest(start=_start, end=_end)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/itaielron/Documents/AntiGravity/bl...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Hard Block — Data Integrity)**
+
+### Why trades = 0
+Not a strategy failure — a **pre-trade abort**. The engine crashed at bar 0 of SPY inside `_confluence_cluster()` before any signal evaluation. Zero trades is the *correct* fail-closed behavior per mandate §1: without a GEX regime, the hierarchical confluence (GEX → EMA → ATR) cannot be validated, so no signal may be emitted.
+
+### Root Cause
+`GEX` column absent from the dataframe returned by the data puller. The backtester correctly refused to default GEX=0 (which would silently misclassify every bar as "positive gamma" and force mean-reversion logic into trend regimes — a classic silent-overfit trap).
+
+### Required Fix (Coder)
+1. **Data puller**: pull dealer gamma exposure per symbol per bar. If unavailable from Alpaca, synthesize `GEX_PROXY`:
+   - `sign(put_call_OI_skew) × VIX_term_structure_slope × dealer_net_OI`
+   - Document the proxy formula in code comments and in `agent_logs/proven_strategies.md`.
+2. **Schema guard**: assert `{'GEX','EMA_50','EMA_200','ATR_14'}` ⊆ df.columns *before* the bar loop, not inside it. Fail fast at load, not at bar 0.
+3. **Unit test**: feed a synthetic df missing GEX → expect `RuntimeError` at load; feed with GEX → expect clean run.
+
+### Structural Notes (for next cycle)
+- Cannot yet assess win-rate, MTFA confluence, or regime rotation — no trades executed.
+- **Do not** rotate timeframes or tune parameters this cycle. Mandate §10 rotation only triggers *after* a >80% PASS on a given TF. We have no baseline.
+- **Do not** enter standby (§9) — standby requires a PASS grade.
+
+### Next Cycle Deliverable
+Re-run with GEX populated. Report must include:
+- trades count, win rate, avg R
+- per-TF breakdown (1m/3m/5m/15m/1h/4h)
+- loser post-mortems: was the loss a GEX-regime mismatch, EMA whipsaw, or ATR stop-too-tight?
+- chart PNGs with entry arrow + TP1/SL markers (§4)
+
+**Action: BLOCKED pending GEX data fix. Push fix + logs to GitHub (§8).**

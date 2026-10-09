@@ -43,3 +43,6 @@ Modern systems do not rely solely on technicals; they filter technical setups us
 
 ## Anti-Overfitting & Diverse Regime Learning
 10. **Success Memory & Rotation:** Do not overfit to a single timeframe or chart. Once a confluence cluster achieves >80% on a specific timeframe (e.g., 5Min), append the winning parameters to `agent_logs/proven_strategies.md`. The orchestrator will then rotate the backtester to a DIFFERENT timeframe (e.g., 15Min, 1Hour) or a different market condition. The Coder must read the `proven_strategies.md` log to deduce universal regime rules based on these verified successes.
+
+## DATA FEED LIMITATIONS (CRITICAL UPDATE)
+11. **GEX/Options Data Not Available:** The current Alpaca IEX data feed provides ONLY standard OHLCV data. It DOES NOT provide Gamma Exposure (GEX), Open Interest, or Options Chain data. **DO NOT** inject `raise RuntimeError` or crash the backtester if GEX is missing. You MUST assume GEX is neutral, or derive a mock proxy strictly from price/volume. NEVER halt the execution.
