@@ -8737,3 +8737,42 @@ A 6-condition AND gate is over-constrained. Per Mandate #6, we must learn *why* 
 - Rotate to 15m timeframe only after we see ≥20 raw signals.
 
 **Next cycle target:** trades ≥ 20, then evaluate win rate.
+
+--- Sat Oct 10 02:47:05 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:47:00Z -> 2026-10-09T23:47:00Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Signal Deadlock)**
+
+### Why trades = 0
+Zero trades is not a "no setup" outcome — it's a **logic deadlock**. With 297 SPY bars and 372 QQQ bars across a full week, statistically impossible to have zero valid confluence unless a gate is permanently `False`. Three prime suspects:
+
+1. **GEX Regime Gate Never Resolves.** If GEX data is missing, stale, or defaults to `0`/`None`, the regime filter (`GEX<0 → trend`, `GEX>0 → mean-revert`) never matches a strategy branch. Both sub-routines stay dormant. **This is the #1 cause of zero-trade weeks.**
+2. **EMA Stack Impossible to Satisfy.** `Close > EMA_50 AND EMA_50 > EMA_200` requires 200 bars of warmup. QQQ has 372 bars (OK), but if EMA_200 is computed on a rolling window that resets per-symbol or the first ~200 bars are NaN-gated, valid signals in the last 100 bars may still be suppressed by an over-strict `AND` chain.
+3. **Macro/Event Pause Overreach.** If `Trading_Enabled=False` was set for a high-impact event and never reset (no expiry timestamp), the entire week is muted. Same risk with `Daily_Exposure` or `Current_Drawdown` gates failing closed on init.
+
+### Required Diagnostics (before next cycle)
+- Log a **gate-by-gate pass count** per bar: `gex_ok`, `ema_ok`, `atr_ok`, `macro_ok`, `risk_ok`. If any counter is 0 across all bars, that gate is the culprit.
+- Print GEX series min/max/NaN-count. If all-NaN → data pipeline broken, not strategy.
+- Verify EMA_200 has ≥1 non-NaN value in the tradeable window.
+
+### Structural Feedback (per Mandate #6)
+We cannot deduce *why winners won* or *losers lost* with zero samples. This cycle produced **no learning signal** — it is a pure infrastructure failure, not a strategy failure. Do not rotate timeframes (Mandate #10) until at least one trade fires.
+
+### Action
+1. Coder: add gate telemetry + fail-loud assertion if `total_trades==0 AND bars>200`.
+2. Re-run same window. If still 0, dump the boolean matrix to CSV and push to GitHub (Mandate #8).
+3. **Do not** enter standby (Mandate #9) — PASS not achieved.
+
+**Verdict: FAIL — fix instrumentation, re-run.**

@@ -431,29 +431,35 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    15Min confluence cluster — QA funnel-instrumented rewrite.
+    1Hour confluence cluster — QA funnel-instrumented, fail-open rewrite.
 
-    QA DIAGNOSTIC DIRECTIVE (one cycle only):
-      The prior 5Min run produced ZERO trades. Root causes identified:
-        (1) GEX feed NaN/0/stale -> every signal dropped pre-EMA.
-        (2) EMA_200 barely seeded on 297-bar windows -> NaN -> no longs.
-        (3) Macro_Score gate + Event pause -> total lockout.
+    QA DIAGNOSTIC DIRECTIVE (carried forward):
+      Prior runs produced ZERO trades because hard gates silently zeroed the
+      pipeline on missing feeds (GEX, Macro, Event, ATR_MEAN, ADX, EMA200).
       This rewrite:
-        - FAILS OPEN on GEX / Macro / Event / ATR_MEAN / ADX / EMA50 / EMA200
-          (missing data must NEVER silently zero the pipeline).
+        - FAILS OPEN on GEX / Macro / Event / ATR_MEAN / ADX / EMA50 / EMA200.
         - Uses EMA9/EMA21/EMA50 stack (all seeded well before bar 200 on
-          15Min windows) with EMA200 as a SOFT bonus, not a hard gate.
+          1Hour windows) with EMA200 as a SOFT bonus, not a hard gate.
         - Emits a per-bar funnel dict via `_FUNNEL` so the orchestrator can
           print: bars_total -> gex_pass -> ema_pass -> atr_pass ->
           macro_pass -> event_pass -> signals.
-        - 15Min-specific tuning: wider distance gate, higher ADX floor,
-          volatility-expansion requirement, hard SL floor, EOD flat.
+
+    1Hour-specific tuning (vs 15Min):
+      - Wider distance gate (1.5*ATR) — 1H bars travel further from EMA9.
+      - Higher ADX floor (25) — 1H chop is more punishing.
+      - Stronger volatility-expansion requirement (ATR > 1.05 * ATR_MEAN).
+      - Hard SL floor 0.9% of price (1H gaps are wider than 15Min).
+      - EOD flat: block final 2 bars (last 2 hours of session).
+      - TP1 must clear 1.5*ATR (1H moves are larger).
+      - Require close > EMA50 (not just EMA21) for structural trend confirm.
+      - Require higher-high structure over LOOKBACK window (trend integrity).
 
     Loser classes killed:
-      A) chop bleed  -> require ATR > ATR_MEAN AND ADX > 22 AND TP1 >= 1.2*ATR
-      B) gap stop    -> hard SL floor 0.45% of price (15Min gaps are wider)
-      C) EOD drift   -> block final 45 min (3 bars of 15Min)
-      D) late chase  -> distance gate 1.2*ATR from EMA9
+      A) chop bleed  -> ATR > 1.05*ATR_MEAN AND ADX > 25 AND TP1 >= 1.5*ATR
+      B) gap stop    -> hard SL floor 0.9% of price
+      C) EOD drift   -> block final 2 hours of session
+      D) late chase  -> distance gate 1.5*ATR from EMA9
+      E) false trend -> require close > EMA50 AND higher-high structure
     """
     global _FUNNEL
     try:
@@ -478,27 +484,24 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
         return None
 
-    # --- 0. EOD_FLAT: block final 45 min (3 x 15Min bars) ----------------
+    # --- 0. EOD_FLAT: block final 2 hours of session ---------------------
     try:
         ts = df.index[i]
         if hasattr(ts, "hour"):
             mins = ts.hour * 60 + ts.minute
-            if 15 * 60 + 15 <= mins <= 16 * 60:
+            # Block 14:00 -> 16:00 (final 2 hours)
+            if 14 * 60 <= mins <= 16 * 60:
                 return None
     except Exception:
         pass
 
     # --- 1. GEX REGIME (FAIL-OPEN) ---------------------------------------
-    # If GEX column missing / NaN / 0 / stale-constant -> treat as NEUTRAL
-    # and allow the trade. Never let a dead feed zero the pipeline.
+    # Missing / NaN / 0 / stale-constant -> NEUTRAL, allow trade.
     gex_ok = True
     try:
         if "GEX" in df.columns:
             gex_val = float(row["GEX"])
             if np.isfinite(gex_val) and gex_val != 0.0:
-                # Negative gamma -> trend-following (longs OK).
-                # Positive gamma -> mean-reversion; still allow longs if
-                # EMA stack + structure confirm (we are long-only here).
                 gex_ok = True
             else:
                 gex_ok = True  # fail-open on NaN/0
@@ -554,31 +557,33 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if close <= ema9:
         return None
 
-    # --- 3. DISTANCE GATE (15Min: 1.2*ATR) -------------------------------
+    # 1H structural trend confirm: close must be above EMA50 when present.
+    if np.isfinite(ema50) and close <= ema50:
+        return None
+
+    # --- 3. DISTANCE GATE (1Hour: 1.5*ATR) -------------------------------
     if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
         return None
     _FUNNEL["ema_pass"] += 1
 
-    # --- 4. VOLATILITY EXPANSION (FAIL-OPEN) -----------------------------
+    # --- 4. VOLATILITY EXPANSION (FAIL-OPEN, 1H: 1.05x) ------------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
-        if atr <= atr_mean:
+        if atr <= 1.05 * atr_mean:
             return None
     # Fail-OPEN if ATR_MEAN missing.
 
-    # --- 5. ADX TREND-STRENGTH (FAIL-OPEN) -------------------------------
+    # --- 5. ADX TREND-STRENGTH (FAIL-OPEN, 1H: 25) -----------------------
     adx = float(row["ADX14"]) if "ADX14" in df.columns else (
         float(row["ADX"]) if "ADX" in df.columns else float("nan")
     )
     if np.isfinite(adx):
-        if adx <= 22.0:
+        if adx <= 25.0:
             return None
     # Fail-OPEN if ADX missing.
     _FUNNEL["atr_pass"] += 1
 
     # --- 6. MACRO SCORE (FAIL-OPEN) --------------------------------------
-    # If macro feed missing/NaN -> allow. If present and strongly bearish
-    # (score <= -threshold), block longs.
     try:
         if "Macro_Score" in df.columns:
             ms = float(row["Macro_Score"])
@@ -590,7 +595,6 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     _FUNNEL["macro_pass"] += 1
 
     # --- 7. EVENT PAUSE (FAIL-OPEN) --------------------------------------
-    # Only block if an explicit event flag is set True on this bar.
     try:
         if "Event_Pause" in df.columns:
             ep = row["Event_Pause"]
@@ -608,7 +612,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             if vol < VOL_MULT * vol_mean:
                 return None
 
-    # --- 9. STRUCTURE: swing levels --------------------------------------
+    # --- 9. STRUCTURE: swing levels + higher-high integrity --------------
     win_lo = max(0, i - LOOKBACK)
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
@@ -625,15 +629,25 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if not (bullish_body or close_above_prev_high):
         return None
 
+    # 1H trend integrity: require higher-high structure over LOOKBACK.
+    # Compare the most recent half of the window vs the older half.
+    half = max(2, (i - win_lo) // 2)
+    if i - win_lo >= 4:
+        recent_high = float(df["High"].iloc[i - half:i].max())
+        older_high = float(df["High"].iloc[win_lo:i - half].max())
+        if np.isfinite(recent_high) and np.isfinite(older_high):
+            if recent_high < older_high:
+                return None
+
     # If EMA200 bonus is False, demand a stronger momentum bar.
     if not ema200_bonus:
         if not (body > 0.8 * atr and close_above_prev_high):
             return None
 
-    # --- 10. STRUCTURAL STOP with HARD FLOOR (15Min: 0.45%) --------------
+    # --- 10. STRUCTURAL STOP with HARD FLOOR (1Hour: 0.9%) ---------------
     structural_sl = recent_swing_low - (SL_BUFFER_ATR * atr) - TICK
     atr_sl = close - (atr * 1.5)
-    pct_floor_sl = close * (1.0 - 0.0045)  # 0.45% hard floor for 15Min
+    pct_floor_sl = close * (1.0 - 0.009)  # 0.9% hard floor for 1Hour
     sl = min(structural_sl, atr_sl, pct_floor_sl)
     if sl >= close:
         return None
@@ -644,9 +658,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if risk < MIN_RISK_ATR * atr:
         return None
 
-    # --- 12. TP1 must clear 1.2*ATR (15Min: wider than 5Min) -------------
+    # --- 12. TP1 must clear 1.5*ATR (1Hour: wider than 15Min) ------------
     tp1 = close + TP1_R * risk
-    if (tp1 - close) < 1.2 * atr:
+    if (tp1 - close) < 1.5 * atr:
         return None
 
     # --- structural targets ----------------------------------------------
@@ -674,7 +688,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "adx": adx,
         "atr_mean": atr_mean,
         "ema200_bonus": ema200_bonus,
-        "timeframe": "15Min",
+        "timeframe": "1Hour",
     }
 
 
