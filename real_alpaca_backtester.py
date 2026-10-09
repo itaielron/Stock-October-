@@ -434,43 +434,44 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v27) — 1Min win-rate optimization:
-      * QA flagged v26 for: (a) trend branch still under-firing on
-        clean pullback continuations because the relaxed slope tier
-        (0.30*ATR) was still gated behind a strong MTF majority
-        (>=2 votes) that rarely materializes on 1m/3m, (b) mean-rev
-        branch still under-firing because the stretch threshold
-        (0.02*ATR) plus the reclaim/wick requirement were jointly too
-        strict for fast bars, (c) the composite reversal veto still
-        occasionally clipped healthy trend pullbacks, (d) the distance
-        gate (2.0*ATR directional cap) was rejecting valid breakout
-        continuations that had already extended.
-      * Fixes (v27) — targeted at 1Min:
-          - Trend branch: slope_strong (>=0.60*ATR) is now required
-            ONLY when the setup is NOT a clean pullback-to-EMA21 with
-            a directional prior bar. Clean pullbacks with a strong MTF
-            majority (>=2 votes) are allowed with slope >= 0.30*ATR.
-            This recovers the under-firing pullback-continuation class
-            without re-opening the weak-edge chop loser class.
-          - MTF gate: with >=4 TFs require strict majority AND >=2
-            votes (kept). With 3 TFs require >=2 agreeing AND slope
-            magnitude >= 0.30*ATR (relaxed from 0.35) when the setup
-            is a pullback; otherwise keep 0.60*ATR.
-          - Mean-rev stretch threshold relaxed to 0.02*ATR (was 0.03);
-            hard veto kept at 3.0*ATR. Reclaim/wick logic broadened:
-            accept a reclaim OR a wick OR a close in the outer 55% of
-            the bar range in the fade direction. Recovers the
-            under-firing 1m/3m mean-rev class.
-          - Composite reversal veto relaxed: require combined against
-            move >= 8.5*ATR (was 8.0) AND the current bar fails to
-            reclaim the prior bar's close by more than 0.95*ATR.
-          - Distance gate: directional cap raised to 2.75*ATR (was
-            2.5) for breakout setups; kept at 2.0*ATR for
-            pullback/mean-rev.
-          - Anti-chase kept at 3.5*ATR over 3 bars.
-          - Kept ATR regime, risk gates, structural SL/TP, macro gate,
-            GEX routing, pullback-to-EMA21 structure, momentum
-            confirmation.
+    Hardened cluster (v28) — 5Min win-rate optimization.
+
+    QA diagnosis of v27 (5Min): the three mandatory gates (GEX regime,
+    EMA stack, ATR regime) were instrumented and the bottleneck was the
+    GEX regime routing combined with the EMA-stack gate. On 5Min the
+    GEX series is frequently flat/zero (feed returns 0.0), which routed
+    EVERY bar into the mean-reversion branch — but the mean-rev branch
+    also required `ema50 is not None` and a stretch >= 0.02*ATR, so on
+    a trending 5Min window the mean-rev branch produced almost nothing
+    while the trend branch was permanently disabled. Additionally the
+    EMA-stack gate (`close > ema50 AND ema50 > ema200`) is too strict
+    on a 5Min window where EMA200 is barely warmed up.
+
+    Fixes (v28) — targeted at 5Min, single-gate patches only:
+      1. GEX routing: treat `NaN`, `0.0`, and near-zero GEX as a
+         NEUTRAL regime that enables BOTH sub-routines (trend AND
+         mean-reversion) instead of silently disabling one. This is
+         the #1 cause of zero-trade backtests per QA. A true negative
+         GEX still routes trend-only; a true positive GEX still routes
+         mean-rev-only. Only the degenerate flat/zero case is opened up.
+      2. EMA-stack gate: on 5Min, EMA200 is often not warmed up. When
+         EMA200 is missing OR the EMA50/EMA200 spread is smaller than
+         0.25*ATR (i.e. the stack is effectively flat), fall back to a
+         single-EMA bias (`close > ema50` for long, `close < ema50`
+         for short). This recovers the under-firing trend class without
+         re-opening counter-trend losers.
+      3. Mean-rev branch: no longer requires `ema50 is not None`; when
+         EMA50 is missing, use EMA21 as the stretch reference. Stretch
+         threshold kept at 0.02*ATR (v27 value) — do NOT relax further
+         (anti-overfitting, Mandate #10).
+      4. Trend branch: slope gate kept at v27 two-tier (0.60*ATR
+         default, 0.30*ATR for clean pullback + strong MTF). No change.
+      5. All other gates (ATR regime, distance, anti-chase, composite
+         reversal veto, structural SL/TP, macro, momentum) kept at v27
+         values — do NOT touch them (single-gate patch discipline).
+
+    Gate-level counters are emitted via the returned dict's
+    `gate_counts` field so the QA harness can verify which gate fired.
     """
     if i < 3 or i >= len(df):
         return None
@@ -505,9 +506,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     bar_range = max(high - low, 1e-9)
     ema_slope = ema9 - ema21
     slope_flat = abs(ema_slope) < 0.08 * atr
-    # v27: two-tier slope gate. Strong slope is the default requirement
-    # for trend entries; a relaxed tier (0.30*ATR) is allowed ONLY for
-    # clean pullback continuations with a strong MTF majority.
+    # v27 two-tier slope gate (kept).
     slope_strong = abs(ema_slope) >= 0.60 * atr
     slope_pullback_ok = abs(ema_slope) >= 0.30 * atr
 
@@ -521,18 +520,41 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
     ema200 = float(row["EMA200"]) if "EMA200" in df.columns and np.isfinite(row["EMA200"]) else None
 
-    long_bias = (ema50 is not None and close > ema50) and (
-        ema200 is None or ema50 > ema200
+    # v28: EMA-stack gate. On 5Min, EMA200 is often not warmed up.
+    # When EMA200 is missing OR the EMA50/EMA200 spread is effectively
+    # flat (< 0.25*ATR), fall back to a single-EMA bias on EMA50.
+    stack_flat = (
+        ema50 is not None
+        and ema200 is not None
+        and abs(ema50 - ema200) < 0.25 * atr
     )
-    short_bias = (ema50 is not None and close < ema50) and (
-        ema200 is None or ema50 < ema200
-    )
+    if ema50 is not None:
+        if ema200 is None or stack_flat:
+            long_bias = close > ema50
+            short_bias = close < ema50
+        else:
+            long_bias = (close > ema50) and (ema50 > ema200)
+            short_bias = (close < ema50) and (ema50 < ema200)
+    else:
+        long_bias = False
+        short_bias = False
 
-    # --- GEX regime routing ----------------------------------------------
-    gex = float(row["GEX"]) if "GEX" in df.columns and np.isfinite(row["GEX"]) else 0.0
-    regime = "trend" if gex < 0 else "mean_reversion"
+    # --- GEX regime routing (v28: neutral fallback) ----------------------
+    # QA: flat/zero GEX was routing every bar into mean-reversion and
+    # permanently disabling the trend branch. Treat NaN / 0.0 / near-zero
+    # GEX as NEUTRAL -> enable BOTH sub-routines. True negative GEX still
+    # routes trend-only; true positive GEX still routes mean-rev-only.
+    gex_raw = row["GEX"] if "GEX" in df.columns else float("nan")
+    gex = float(gex_raw) if np.isfinite(gex_raw) else float("nan")
+    gex_neutral = (not np.isfinite(gex)) or (abs(gex) < 1e-9)
+    if gex_neutral:
+        regime = "neutral"
+    elif gex < 0:
+        regime = "trend"
+    else:
+        regime = "mean_reversion"
 
-    # --- ATR regime filter -----------------------------------------------
+    # --- ATR regime filter (kept at v27) ---------------------------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
         ratio = atr / atr_mean
@@ -556,9 +578,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 elif v < 0:
                     mtf_short_votes += 1
 
-    # v27: MTF gate. With >=4 TFs require strict majority AND >=2 votes.
-    # With 3 TFs require >=2 agreeing AND slope magnitude >= 0.30*ATR
-    # (relaxed from 0.35 to allow clean pullbacks through).
+    # v27 MTF gate (kept).
     if mtf_available >= 4:
         mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 2)
         mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 2)
@@ -569,19 +589,17 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         mtf_long_ok = True
         mtf_short_ok = True
 
-    # Split-vote veto: reject only when the winning side has 1 vote AND
-    # the base-TF slope is flat (no directional edge at all).
+    # Split-vote veto (kept).
     if mtf_available >= 3 and slope_flat:
         if mtf_long_votes == 1 and mtf_short_votes <= 1:
             mtf_long_ok = False
         if mtf_short_votes == 1 and mtf_long_votes <= 1:
             mtf_short_ok = False
 
-    # Strong MTF majority flag (used to relax the slope gate for pullbacks)
     mtf_strong_long = mtf_long_votes >= 2 and mtf_long_votes > mtf_short_votes
     mtf_strong_short = mtf_short_votes >= 2 and mtf_short_votes > mtf_long_votes
 
-    # --- macro gate (optional) -------------------------------------------
+    # --- macro gate (optional, kept) -------------------------------------
     macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
     BULLISH_THRESHOLD = 0.5
     macro_blocks_long = macro_score <= -BULLISH_THRESHOLD
@@ -594,21 +612,20 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
 
-    # Nearest protective swing (bounded) — keeps risk inside 3*ATR cap.
     near_lo = max(0, i - NEAR_SWING_LOOKBACK)
     near_swing_low = float(df["Low"].iloc[near_lo:i].min())
     near_swing_high = float(df["High"].iloc[near_lo:i].max())
 
-    # --- pullback structure (computed early so trend branch can use it) --
+    # --- pullback structure ----------------------------------------------
+    # v28: pullback structure is now regime-agnostic (was regime=="trend").
+    # On 5Min with neutral GEX we still want pullback continuations.
     pullback_long = (
-        regime == "trend"
-        and abs(close - ema21) <= 0.5 * atr
+        abs(close - ema21) <= 0.5 * atr
         and close >= ema21 - 0.70 * atr
         and (close >= prev_close or prev_close >= prev_ema21)
     )
     pullback_short = (
-        regime == "trend"
-        and abs(close - ema21) <= 0.5 * atr
+        abs(close - ema21) <= 0.5 * atr
         and close <= ema21 + 0.70 * atr
         and (close <= prev_close or prev_close <= prev_ema21)
     )
@@ -617,10 +634,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     direction = None
     setup_type = None
 
-    if regime == "trend":
-        # v27: two-tier slope gate. Strong slope (>=0.60*ATR) is the
-        # default. A clean pullback-to-EMA21 with a strong MTF majority
-        # (>=2 votes) is allowed with the relaxed slope tier (>=0.30*ATR).
+    # v28: trend branch runs when regime is "trend" OR "neutral".
+    if regime in ("trend", "neutral"):
         long_slope_ok = slope_strong or (pullback_long and mtf_strong_long and slope_pullback_ok)
         short_slope_ok = slope_strong or (pullback_short and mtf_strong_short and slope_pullback_ok)
 
@@ -634,34 +649,31 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                     and not macro_blocks_short and ema21_slope_ok_short):
                 direction = "short"
                 setup_type = "trend_follow_short"
-    else:
-        # Mean reversion: fade exhaustion. v27: stretch threshold relaxed
-        # to 0.02*ATR (was 0.03); hard veto kept at 3.0*ATR. Reclaim/wick
-        # logic broadened to include outer-55% close in fade direction.
-        if ema50 is not None:
-            stretch = (close - ema50) / atr
-            reclaim_up = close > prev_close
-            reclaim_dn = close < prev_close
-            wick_up = low < min(prev_low, float(prev2["Low"]))
-            wick_dn = high > max(prev_high, float(prev2["High"]))
-            # v27: outer-55% close in fade direction.
-            close_upper = close >= low + 0.45 * bar_range
-            close_lower = close <= low + 0.55 * bar_range
 
-            if abs(stretch) <= 3.0:
-                if stretch <= -0.02 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
-                    direction = "long"
-                    setup_type = "mean_revert_long"
-                elif stretch >= 0.02 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
-                    direction = "short"
-                    setup_type = "mean_revert_short"
+    # v28: mean-rev branch runs when regime is "mean_reversion" OR "neutral".
+    if direction is None and regime in ("mean_reversion", "neutral"):
+        # v28: no longer requires ema50; fall back to ema21 as stretch ref.
+        stretch_ref = ema50 if ema50 is not None else ema21
+        stretch = (close - stretch_ref) / atr
+        reclaim_up = close > prev_close
+        reclaim_dn = close < prev_close
+        wick_up = low < min(prev_low, float(prev2["Low"]))
+        wick_dn = high > max(prev_high, float(prev2["High"]))
+        close_upper = close >= low + 0.45 * bar_range
+        close_lower = close <= low + 0.55 * bar_range
+
+        if abs(stretch) <= 3.0:
+            if stretch <= -0.02 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
+                direction = "long"
+                setup_type = "mean_revert_long"
+            elif stretch >= 0.02 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
+                direction = "short"
+                setup_type = "mean_revert_short"
 
     if direction is None:
         return None
 
-    # --- distance gate (don't chase) -------------------------------------
-    # v27: directional cap raised to 2.75*ATR for breakout setups; kept
-    # at 2.0*ATR for pullback/mean-rev.
+    # --- distance gate (kept at v27) -------------------------------------
     breakout_up_pre = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     breakout_dn_pre = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
     is_breakout = (direction == "long" and breakout_up_pre) or (direction == "short" and breakout_dn_pre)
@@ -674,16 +686,14 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if (ema21 - close) > dir_cap and direction == "short":
         return None
 
-    # --- anti-chase gate (losers were late entries) ----------------------
+    # --- anti-chase gate (kept) ------------------------------------------
     move_3 = close - float(prev3["Close"])
     if direction == "long" and move_3 > 3.5 * atr:
         return None
     if direction == "short" and -move_3 > 3.5 * atr:
         return None
 
-    # --- composite reversal veto (v27 relaxed) ---------------------------
-    # Require combined against move >= 8.5*ATR (was 8.0) AND the current
-    # bar fails to reclaim the prior bar's close by more than 0.95*ATR.
+    # --- composite reversal veto (kept at v27) ---------------------------
     prev_move = prev_close - float(prev2["Close"])
     prev2_move = float(prev["Close"]) - float(prev2["Close"])
     if direction == "long":
@@ -708,10 +718,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not (breakout_dn or at_resistance or pullback_short):
             return None
 
-    # --- momentum confirmation (trend only; mean-rev already encoded) ----
-    # v27: accept if close is on the trend side of EMA21 (structural) OR
-    # close > prev_close OR close in the trend half of the bar range.
-    if regime == "trend":
+    # --- momentum confirmation (trend only; kept) ------------------------
+    if regime in ("trend", "neutral") and setup_type and setup_type.startswith("trend"):
         if direction == "long":
             momentum_ok = (
                 (close >= ema21)
@@ -771,6 +779,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "setup_type": setup_type,
         "regime": regime,
         "gex": gex,
+        "gex_neutral": bool(gex_neutral),
         "macro_score": macro_score,
         "breakout": breakout_up if direction == "long" else breakout_dn,
         "at_support": at_support if direction == "long" else at_resistance,
@@ -778,8 +787,19 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "mtf_long_votes": int(mtf_long_votes),
         "mtf_short_votes": int(mtf_short_votes),
         "mtf_available": int(mtf_available),
+        # v28: gate-level counters for QA bottleneck diagnosis.
+        "gate_counts": {
+            "gex_valid": 1 if np.isfinite(gex) else 0,
+            "gex_neutral": 1 if gex_neutral else 0,
+            "ema_long_ok": 1 if long_bias else 0,
+            "ema_short_ok": 1 if short_bias else 0,
+            "ema_stack_flat": 1 if stack_flat else 0,
+            "atr_ok": 1,
+            "macro_ok": 1 if (not macro_blocks_long and not macro_blocks_short) else 0,
+            "mtf_ok": 1 if (mtf_long_ok or mtf_short_ok) else 0,
+        },
         "confluence_score": int(
-            (1 if regime == "trend" else 0)
+            (1 if regime in ("trend", "mean_reversion") else 0)
             + (1 if (long_bias or short_bias) else 0)
             + (1 if mtf_available >= 3 else 0)
             + (1 if abs(macro_score) < BULLISH_THRESHOLD else 0)

@@ -8420,3 +8420,41 @@ Instrument the pipeline with per-gate pass counters:
 The gate with the lowest count is the bottleneck. Fix that single gate — do not touch the others (anti-overfitting, Mandate #10).
 
 **Verdict:** No structural conclusion can be drawn from zero trades. This is a **plumbing failure, not a strategy failure**. Per Mandate #9, do NOT enter standby (no PASS earned) and do NOT rewrite the whole engine — patch the identified dead gate, re-run, and report gate-level counts.
+
+--- Sat Oct 10 02:42:45 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate. If trades=0, explain why....
+RESPONSE:
+**QA EVALUATION — CYCLE HALTED (NO DATA)**
+
+**Status: FAIL — Cannot Evaluate**
+
+You have provided **no backtest output**. The message contains only the mandate and research report — zero trade logs, zero metrics, zero chart artifacts.
+
+**Trades = 0 (or N/A) — Root Cause Analysis:**
+
+Since no output was submitted, I cannot confirm trades executed. But per mandate, if trades=0, the likely structural causes are:
+
+1. **Confluence Deadlock (most probable):** The hierarchical gate requires `[GEX regime] AND [EMA alignment] AND [ATR limits]` simultaneously. If GEX data is unavailable/mocked as 0, or EMA_200 is NaN on 1m/3m (insufficient warmup bars), the AND-chain collapses to `False` on every bar → zero signals.
+2. **Macro Score Override:** If `Macro_Score >= Bullish_Threshold` disables shorts AND the EMA filter blocks longs (Close < EMA_50), all directions are gated off.
+3. **Event Pause Leakage:** If the economic calendar parser defaults to `Trading_Enabled = False` on missing data, the entire week is suppressed.
+4. **Screener Pre-Filter Too Tight:** `Volume > 1M AND Price > SMA_200` on 1m candles may eliminate the universe before signal generation.
+
+**Required to proceed — submit:**
+- Trade count, win rate, avg R, max drawdown
+- Per-timeframe breakdown (1m/3m/5m/15m/1h/4h)
+- Chart PNGs with entry arrows + TP1/SL markers
+- Gate-failure histogram (which condition killed each bar)
+
+**Mandate Compliance Check:**
+- ❌ No MTFA evidence across 6 timeframes
+- ❌ No winner/loser structural deduction
+- ❌ No chart visual clarity artifacts
+- ❌ No GitHub sync confirmation
+- ⚠️ Smart Sleep Protocol: cannot trigger PASS without data
+
+**Directive:** Re-run and return raw output. If trades=0 persists, instrument the gate chain with per-condition counters and report which AND-clause is the bottleneck. Do not re-optimize blind — diagnose first.
+
+**Verdict: INCOMPLETE — resubmit with data.**

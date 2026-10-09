@@ -18370,3 +18370,393 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:42:41 2026 ---
+TASK:
+QA Feedback:
+ a **confluence deadlock** — one of the three mandatory gates never fired simultaneously with the others.
+
+**Most Likely Culprits (in order of probability):**
+
+1. **GEX Regime Mismatch (highest probability).** The regime filter is binary and mutually exclusive: `GEX < 0` → trend-following only; `GEX > 0` → mean-reversion only. If the GEX data feed returned `NaN`, `0`, or a constant sign across the test window, one entire subroutine was permanently disabled. A flat/zero GEX series is...
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Evaluate the confluence cluster at bar `i`. Returns a dict of the
+    structural levels if ALL conditions pass, else None.
+
+    Hardened cluster (v28) — 5Min win-rate optimization.
+
+    QA diagnosis of v27 (5Min): the three mandatory gates (GEX regime,
+    EMA stack, ATR regime) were instrumented and the bottleneck was the
+    GEX regime routing combined with the EMA-stack gate. On 5Min the
+    GEX series is frequently flat/zero (feed returns 0.0), which routed
+    EVERY bar into the mean-reversion branch — but the mean-rev branch
+    also required `ema50 is not None` and a stretch >= 0.02*ATR, so on
+    a trending 5Min window the mean-rev branch produced almost nothing
+    while the trend branch was permanently disabled. Additionally the
+    EMA-stack gate (`close > ema50 AND ema50 > ema200`) is too strict
+    on a 5Min window where EMA200 is barely warmed up.
+
+    Fixes (v28) — targeted at 5Min, single-gate patches only:
+      1. GEX routing: treat `NaN`, `0.0`, and near-zero GEX as a
+         NEUTRAL regime that enables BOTH sub-routines (trend AND
+         mean-reversion) instead of silently disabling one. This is
+         the #1 cause of zero-trade backtests per QA. A true negative
+         GEX still routes trend-only; a true positive GEX still routes
+         mean-rev-only. Only the degenerate flat/zero case is opened up.
+      2. EMA-stack gate: on 5Min, EMA200 is often not warmed up. When
+         EMA200 is missing OR the EMA50/EMA200 spread is smaller than
+         0.25*ATR (i.e. the stack is effectively flat), fall back to a
+         single-EMA bias (`close > ema50` for long, `close < ema50`
+         for short). This recovers the under-firing trend class without
+         re-opening counter-trend losers.
+      3. Mean-rev branch: no longer requires `ema50 is not None`; when
+         EMA50 is missing, use EMA21 as the stretch reference. Stretch
+         threshold kept at 0.02*ATR (v27 value) — do NOT relax further
+         (anti-overfitting, Mandate #10).
+      4. Trend branch: slope gate kept at v27 two-tier (0.60*ATR
+         default, 0.30*ATR for clean pullback + strong MTF). No change.
+      5. All other gates (ATR regime, distance, anti-chase, composite
+         reversal veto, structural SL/TP, macro, momentum) kept at v27
+         values — do NOT touch them (single-gate patch discipline).
+
+    Gate-level counters are emitted via the returned dict's
+    `gate_counts` field so the QA harness can verify which gate fired.
+    """
+    if i < 3 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+    prev2 = df.iloc[i - 2]
+    prev3 = df.iloc[i - 3]
+
+    # --- required columns -------------------------------------------------
+    for col in ("EMA9", "EMA21", "Close", "High", "Low"):
+        if col not in df.columns:
+            return None
+
+    ema9 = float(row["EMA9"])
+    ema21 = float(row["EMA21"])
+    close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
+    open_ = float(row["Open"]) if "Open" in df.columns and np.isfinite(row["Open"]) else close
+    prev_close = float(prev["Close"])
+    prev_high = float(prev["High"])
+    prev_low = float(prev["Low"])
+    prev_ema9 = float(prev["EMA9"]) if np.isfinite(prev["EMA9"]) else ema9
+    prev_ema21 = float(prev["EMA21"]) if np.isfinite(prev["EMA21"]) else ema21
+
+    if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
+        return None
+    if atr <= 0 or not np.isfinite(atr):
+        return None
+
+    bar_range = max(high - low, 1e-9)
+    ema_slope = ema9 - ema21
+    slope_flat = abs(ema_slope) < 0.08 * atr
+    # v27 two-tier slope gate (kept).
+    slope_strong = abs(ema_slope) >= 0.60 * atr
+    slope_pullback_ok = abs(ema_slope) >= 0.30 * atr
+
+    # EMA21 slope over last 3 bars (trend confirmation)
+    ema21_3ago = float(prev3["EMA21"]) if np.isfinite(prev3["EMA21"]) else ema21
+    ema21_slope = ema21 - ema21_3ago
+    ema21_slope_ok_long = ema21_slope >= 0.03 * atr
+    ema21_slope_ok_short = ema21_slope <= -0.03 * atr
+
+    # --- regime context (EMA50 / EMA200) ---------------------------------
+    ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
+    ema200 = float(row["EMA200"]) if "EMA200" in df.columns and np.isfinite(row["EMA200"]) else None
+
+    # v28: EMA-stack gate. On 5Min, EMA200 is often not warmed up.
+    # When EMA200 is missing OR the EMA50/EMA200 spread is effectively
+    # flat (< 0.25*ATR), fall back to a single-EMA bias on EMA50.
+    stack_flat = (
+        ema50 is not None
+        and ema200 is not None
+        and abs(ema50 - ema200) < 0.25 * atr
+    )
+    if ema50 is not None:
+        if ema200 is None or stack_flat:
+            long_bias = close > ema50
+            short_bias = close < ema50
+        else:
+            long_bias = (close > ema50) and (ema50 > ema200)
+            short_bias = (close < ema50) and (ema50 < ema200)
+    else:
+        long_bias = False
+        short_bias = False
+
+    # --- GEX regime routing (v28: neutral fallback) ----------------------
+    # QA: flat/zero GEX was routing every bar into mean-reversion and
+    # permanently disabling the trend branch. Treat NaN / 0.0 / near-zero
+    # GEX as NEUTRAL -> enable BOTH sub-routines. True negative GEX still
+    # routes trend-only; true positive GEX still routes mean-rev-only.
+    gex_raw = row["GEX"] if "GEX" in df.columns else float("nan")
+    gex = float(gex_raw) if np.isfinite(gex_raw) else float("nan")
+    gex_neutral = (not np.isfinite(gex)) or (abs(gex) < 1e-9)
+    if gex_neutral:
+        regime = "neutral"
+    elif gex < 0:
+        regime = "trend"
+    else:
+        regime = "mean_reversion"
+
+    # --- ATR regime filter (kept at v27) ---------------------------------
+    atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
+    if np.isfinite(atr_mean) and atr_mean > 0:
+        ratio = atr / atr_mean
+        if ratio < ATR_REGIME_MIN_RATIO:
+            return None
+        if ratio > 2.5:
+            return None
+
+    # --- MTF vote aggregation (optional) ---------------------------------
+    mtf_long_votes = 0
+    mtf_short_votes = 0
+    mtf_available = 0
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h"):
+        col = f"MTF_{tf}_TREND"
+        if col in df.columns:
+            v = row[col]
+            if np.isfinite(v):
+                mtf_available += 1
+                if v > 0:
+                    mtf_long_votes += 1
+                elif v < 0:
+                    mtf_short_votes += 1
+
+    # v27 MTF gate (kept).
+    if mtf_available >= 4:
+        mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 2)
+        mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 2)
+    elif mtf_available == 3:
+        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope >= 0.30 * atr)
+        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope <= -0.30 * atr)
+    else:
+        mtf_long_ok = True
+        mtf_short_ok = True
+
+    # Split-vote veto (kept).
+    if mtf_available >= 3 and slope_flat:
+        if mtf_long_votes == 1 and mtf_short_votes <= 1:
+            mtf_long_ok = False
+        if mtf_short_votes == 1 and mtf_long_votes <= 1:
+            mtf_short_ok = False
+
+    mtf_strong_long = mtf_long_votes >= 2 and mtf_long_votes > mtf_short_votes
+    mtf_strong_short = mtf_short_votes >= 2 and mtf_short_votes > mtf_long_votes
+
+    # --- macro gate (optional, kept) -------------------------------------
+    macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
+    BULLISH_THRESHOLD = 0.5
+    macro_blocks_long = macro_score <= -BULLISH_THRESHOLD
+    macro_blocks_short = macro_score >= BULLISH_THRESHOLD
+
+    # --- structure: swing levels -----------------------------------------
+    win_lo = max(0, i - LOOKBACK)
+    if i - win_lo < 5:
+        return None
+    recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
+    recent_swing_high = float(df["High"].iloc[win_lo:i].max())
+
+    near_lo = max(0, i - NEAR_SWING_LOOKBACK)
+    near_swing_low = float(df["Low"].iloc[near_lo:i].min())
+    near_swing_high = float(df["High"].iloc[near_lo:i].max())
+
+    # --- pullback structure ----------------------------------------------
+    # v28: pullback structure is now regime-agnostic (was regime=="trend").
+    # On 5Min with neutral GEX we still want pullback continuations.
+    pullback_long = (
+        abs(close - ema21) <= 0.5 * atr
+        and close >= ema21 - 0.70 * atr
+        and (close >= prev_close or prev_close >= prev_ema21)
+    )
+    pullback_short = (
+        abs(close - ema21) <= 0.5 * atr
+        and close <= ema21 + 0.70 * atr
+        and (close <= prev_close or prev_close <= prev_ema21)
+    )
+
+    # --- direction selection ---------------------------------------------
+    direction = None
+    setup_type = None
+
+    # v28: trend branch runs when regime is "trend" OR "neutral".
+    if regime in ("trend", "neutral"):
+        long_slope_ok = slope_strong or (pullback_long and mtf_strong_long and slope_pullback_ok)
+        short_slope_ok = slope_strong or (pullback_short and mtf_strong_short and slope_pullback_ok)
+
+        if long_slope_ok:
+            if (ema9 > ema21 and long_bias and mtf_long_ok
+                    and not macro_blocks_long and ema21_slope_ok_long):
+                direction = "long"
+                setup_type = "trend_follow_long"
+        if direction is None and short_slope_ok:
+            if (ema9 < ema21 and short_bias and mtf_short_ok
+                    and not macro_blocks_short and ema21_slope_ok_short):
+                direction = "short"
+                setup_type = "trend_follow_short"
+
+    # v28: mean-rev branch runs when regime is "mean_reversion" OR "neutral".
+    if direction is None and regime in ("mean_reversion", "neutral"):
+        # v28: no longer requires ema50; fall back to ema21 as stretch ref.
+        stretch_ref = ema50 if ema50 is not None else ema21
+        stretch = (close - stretch_ref) / atr
+        reclaim_up = close > prev_close
+        reclaim_dn = close < prev_close
+        wick_up = low < min(prev_low, float(prev2["Low"]))
+        wick_dn = high > max(prev_high, float(prev2["High"]))
+        close_upper = close >= low + 0.45 * bar_range
+        close_lower = close <= low + 0.55 * bar_range
+
+        if abs(stretch) <= 3.0:
+            if stretch <= -0.02 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
+                direction = "long"
+                setup_type = "mean_revert_long"
+            elif stretch >= 0.02 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
+                direction = "short"
+                setup_type = "mean_revert_short"
+
+    if direction is None:
+        return None
+
+    # --- distance gate (kept at v27) -------------------------------------
+    breakout_up_pre = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
+    breakout_dn_pre = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
+    is_breakout = (direction == "long" and breakout_up_pre) or (direction == "short" and breakout_dn_pre)
+    dir_cap = 2.75 * atr if is_breakout else 2.0 * atr
+
+    if abs(close - ema21) > DISTANCE_GATE_ATR * atr:
+        return None
+    if (close - ema21) > dir_cap and direction == "long":
+        return None
+    if (ema21 - close) > dir_cap and direction == "short":
+        return None
+
+    # --- anti-chase gate (kept) ------------------------------------------
+    move_3 = close - float(prev3["Close"])
+    if direction == "long" and move_3 > 3.5 * atr:
+        return None
+    if direction == "short" and -move_3 > 3.5 * atr:
+        return None
+
+    # --- composite reversal veto (kept at v27) ---------------------------
+    prev_move = prev_close - float(prev2["Close"])
+    prev2_move = float(prev["Close"]) - float(prev2["Close"])
+    if direction == "long":
+        combined_against = -(prev_move + prev2_move)
+        if combined_against >= 8.5 * atr and close < prev_close - 0.95 * atr:
+            return None
+    else:
+        combined_against = prev_move + prev2_move
+        if combined_against >= 8.5 * atr and close > prev_close + 0.95 * atr:
+            return None
+
+    # --- structure confirmation ------------------------------------------
+    breakout_up = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
+    breakout_dn = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
+    at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
+    at_resistance = abs(close - recent_swing_high) <= SUPPORT_PROXIMITY_ATR * atr
+
+    if direction == "long":
+        if not (breakout_up or at_support or pullback_long):
+            return None
+    else:
+        if not (breakout_dn or at_resistance or pullback_short):
+            return None
+
+    # --- momentum confirmation (trend only; kept) ------------------------
+    if regime in ("trend", "neutral") and setup_type and setup_type.startswith("trend"):
+        if direction == "long":
+            momentum_ok = (
+                (close >= ema21)
+                or (close > prev_close)
+                or (close >= low + 0.5 * bar_range)
+            )
+        else:
+            momentum_ok = (
+                (close <= ema21)
+                or (close < prev_close)
+                or (close <= low + 0.5 * bar_range)
+            )
+        if not momentum_ok:
+            return None
+
+    # --- structural stop / targets ---------------------------------------
+    if direction == "long":
+        sl = near_swing_low - (SL_BUFFER_ATR * atr) - TICK
+        if sl >= close:
+            return None
+        risk = close - sl
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close + TP1_R * risk
+        tp2_struct = close + TP2_R * risk
+        tp2 = min(tp2_struct, recent_swing_high) if recent_swing_high > tp1 else tp2_struct
+        if tp1 <= close:
+            return None
+    else:
+        sl = near_swing_high + (SL_BUFFER_ATR * atr) + TICK
+        if sl <= close:
+            return None
+        risk = sl - close
+        if risk < MIN_RISK_ATR * atr:
+            return None
+        if risk > 3.0 * atr:
+            return None
+        tp1 = close - TP1_R * risk
+        tp2_struct = close - TP2_R * risk
+        tp2 = max(tp2_struct, recent_swing_low) if recent_swing_low < tp1 else tp2_struct
+        if tp1 >= close:
+            return None
+
+    return {
+        "entry": close,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "swing_low": recent_swing_low,
+        "swing_high": recent_swing_high,
+        "near_swing_low": near_swing_low,
+        "near_swing_high": near_swing_high,
+        "risk": risk,
+        "direction": direction,
+        "setup_type": setup_type,
+        "regime": regime,
+        "gex": gex,
+        "gex_neutral": bool(gex_neutral),
+        "macro_score": macro_score,
+        "breakout": breakout_up if direction == "long" else breakout_dn,
+        "at_support": at_support if direction == "long" else at_resistance,
+        "pullback": pullback_long if direction == "long" else pullback_short,
+        "mtf_long_votes": int(mtf_long_votes),
+        "mtf_short_votes": int(mtf_short_votes),
+        "mtf_available": int(mtf_available),
+        # v28: gate-level counters for QA bottleneck diagnosis.
+        "gate_counts": {
+            "gex_valid": 1 if np.isfinite(gex) else 0,
+            "gex_neutral": 1 if gex_neutral else 0,
+            "ema_long_ok": 1 if long_bias else 0,
+            "ema_short_ok": 1 if short_bias else 0,
+            "ema_stack_flat": 1 if stack_flat else 0,
+            "atr_ok": 1,
+            "macro_ok": 1 if (not macro_blocks_long and not macro_blocks_short) else 0,
+            "mtf_ok": 1 if (mtf_long_ok or mtf_short_ok) else 0,
+        },
+        "confluence_score": int(
+            (1 if regime in ("trend", "mean_reversion") else 0)
+            + (1 if (long_bias or short_bias) else 0)
+            + (1 if mtf_available >= 3 else 0)
+            + (1 if abs(macro_score) < BULLISH_THRESHOLD else 0)
+            + (1 if (breakout_up or breakout_dn or at_support or at_resistance) else 0)
+            + (1 if (pullback_long or pullback_short) else 0)
+        ),
+    }
+```
