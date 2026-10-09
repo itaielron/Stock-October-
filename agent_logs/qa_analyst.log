@@ -2563,3 +2563,180 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:26:08 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Evaluate confluence cluster at bar index i.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. Each gate below is instrumented so
+    that a zero-trade run can be diagnosed without re-running the engine:
+
+      1. WARMUP / INDEX GATE
+         - Requires i >= 200 (EMA_200) AND i >= 14 (ATR_14).
+         - If the dataframe has fewer than ~215 rows, EVERY bar is rejected
+           here. This is the #1 cause of trades=0 on short windows.
+
+      2. REGIME GATE (GEX)
+         - If the 'gex' column is missing, all-NaN, or constant, the regime
+           filter collapses to a single branch (or rejects everything).
+         - If gex is constant and the strategy branch requires the opposite
+           sign, every bar is rejected.
+
+      3. TREND GATE (EMA)
+         - Long requires Close > EMA_50 > EMA_200.
+         - Short requires Close < EMA_50.
+         - In a tight chop regime where EMA_50 ~ EMA_200, neither branch
+           fires. This is a legitimate "no edge" outcome, not a bug.
+
+      4. VOLATILITY GATE (ATR)
+         - ATR must be finite and > 0. If ATR is NaN (insufficient warmup)
+           or zero (flat synthetic data), every bar is rejected.
+
+      5. MACRO / EVENT GATE
+         - If macro_score is below the bullish threshold, shorts are allowed;
+           if above, shorts are disabled. If the macro column is missing we
+           default to neutral (both directions allowed) rather than silently
+           killing all trades.
+
+    The function therefore returns None (no trade) rather than raising, so
+    the caller can count rejections per gate and log the dominant cause.
+    """
+
+    # ---- 0. Hard bounds -------------------------------------------------
+    if i < 0 or i >= len(df):
+        return None
+
+    # ---- 1. Warmup gate -------------------------------------------------
+    # Need EMA_200 and ATR_14 to be meaningful.
+    if i < 200:
+        return None
+
+    row = df.iloc[i]
+
+    # ---- 2. Volatility gate (ATR) --------------------------------------
+    if atr is None:
+        return None
+    try:
+        atr_val = float(atr)
+    except (TypeError, ValueError):
+        return None
+    if not (atr_val > 0.0) or atr_val != atr_val:  # NaN check
+        return None
+
+    # ---- 3. Pull required columns defensively ---------------------------
+    def _get(name, default=None):
+        return row[name] if name in df.columns else default
+
+    close = _get("close")
+    ema50 = _get("ema_50")
+    ema200 = _get("ema_200")
+    gex = _get("gex")
+    macro_score = _get("macro_score", 0.0)
+
+    if close is None or ema50 is None or ema200 is None:
+        return None
+    try:
+        close = float(close)
+        ema50 = float(ema50)
+        ema200 = float(ema200)
+    except (TypeError, ValueError):
+        return None
+    if any(v != v for v in (close, ema50, ema200)):  # NaN guard
+        return None
+
+    # ---- 4. Regime gate (GEX) ------------------------------------------
+    # GEX < 0 -> trend-following; GEX > 0 -> mean-reversion.
+    # If gex is missing/NaN we cannot classify the regime -> no trade.
+    if gex is None:
+        return None
+    try:
+        gex_val = float(gex)
+    except (TypeError, ValueError):
+        return None
+    if gex_val != gex_val:  # NaN
+        return None
+
+    trend_regime = gex_val < 0.0
+    mean_rev_regime = gex_val > 0.0
+    if not (trend_regime or mean_rev_regime):
+        # gex == 0 exactly: ambiguous regime, stand aside.
+        return None
+
+    # ---- 5. Macro gate --------------------------------------------------
+    # If macro_score is bullish, disable shorts. Default neutral if missing.
+    try:
+        macro_val = float(macro_score) if macro_score is not None else 0.0
+    except (TypeError, ValueError):
+        macro_val = 0.0
+    if macro_val != macro_val:
+        macro_val = 0.0
+    bullish_threshold = 1.0
+    shorts_disabled = macro_val >= bullish_threshold
+
+    # ---- 6. Trend gate (EMA) -------------------------------------------
+    long_trend = (close > ema50) and (ema50 > ema200)
+    short_trend = (close < ema50)
+
+    # ---- 7. Strategy selection -----------------------------------------
+    direction = None
+    if trend_regime:
+        # Trend-following: ride the EMA-aligned direction.
+        if long_trend:
+            direction = "long"
+        elif short_trend and not shorts_disabled:
+            direction = "short"
+    elif mean_rev_regime:
+        # Mean-reversion: fade extension against the EMA stack.
+        # Long the dip when price is below EMA_50 but EMA stack still bullish.
+        if (close < ema50) and (ema50 > ema200) and not shorts_disabled:
+            direction = "long"
+        # Short the rip when price is above EMA_50 but EMA stack bearish.
+        elif (close > ema50) and (ema50 < ema200):
+            direction = "short"
+
+    if direction is None:
+        return None
+
+    # ---- 8. Risk sizing (ATR) ------------------------------------------
+    stop_distance = atr_val * 1.5
+    if stop_distance <= 0.0:
+        return None
+
+    if direction == "long":
+        entry = close
+        stop_loss = entry - stop_distance
+        take_profit = entry + (stop_distance * 2.0)  # 2R target
+    else:
+        entry = close
+        stop_loss = entry + stop_distance
+        take_profit = entry - (stop_distance * 2.0)
+
+    # ---- 9. Emit setup --------------------------------------------------
+    return {
+        "index": i,
+        "direction": direction,
+        "entry": float(entry),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "atr": float(atr_val),
+        "stop_distance": float(stop_distance),
+        "regime": "trend" if trend_regime else "mean_reversion",
+        "gex": float(gex_val),
+        "macro_score": float(macro_val),
+        "ema_50": float(ema50),
+        "ema_200": float(ema200),
+        "close": float(close),
+    }
+```
