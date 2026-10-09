@@ -1875,3 +1875,205 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "bar_index": int(i),
     }
 ```
+
+--- Sat Oct 10 02:24:25 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid cluster.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    The previous run produced trades=0. Root causes (in order of likelihood):
+
+      1. Warmup starvation: EMA_200 requires >=200 bars. If the backtest window
+         is short (e.g. one week of 1m bars = ~2000 bars is fine, but 1h/4h
+         resamples give <200 bars), every row is NaN and the gate never fires.
+      2. GEX regime mismatch: if the synthetic/real GEX series is all-positive
+         (or all-negative), only one sub-routine can ever fire. If the EMA
+         direction disagrees with that sub-routine, zero trades.
+      3. ATR band too tight: `atr_min`/`atr_max` filters can silently reject
+         every bar if the ATR percentile window is mis-scaled.
+      4. Strict AND-chaining: requiring GEX AND EMA AND ATR AND volume AND
+         MTF alignment simultaneously is a very narrow intersection.
+
+    This rewrite:
+      - Guards every indicator for NaN / insufficient history.
+      - Uses a *scored* confluence (>=3 of 5 votes) instead of hard AND.
+      - Adds MTF alignment as a soft vote, not a hard gate.
+      - Logs the rejection reason via the returned dict's `_debug` field
+        when a near-miss occurs (caller can inspect).
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Bounds & warmup guard
+    # ------------------------------------------------------------------
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # Required columns — bail gracefully if the caller didn't provide them.
+    required = ("close", "ema_50", "ema_200", "atr_14", "volume")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = row["close"]
+    ema50 = row["ema_50"]
+    ema200 = row["ema_200"]
+    atr14 = row["atr_14"]
+    vol = row["volume"]
+
+    # NaN guard — any NaN means we cannot evaluate this bar.
+    if any(pd.isna(x) for x in (close, ema50, ema200, atr14, vol)):
+        return None
+    if atr14 <= 0 or atr <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. Regime filter (GEX) — soft vote
+    # ------------------------------------------------------------------
+    gex = row.get("gex", None)
+    if gex is None or pd.isna(gex):
+        # No GEX data: treat as neutral, do not block.
+        gex_regime = "neutral"
+    elif gex < 0:
+        gex_regime = "trend"      # negative gamma -> trend-following
+    else:
+        gex_regime = "meanrev"    # positive gamma -> mean-reversion
+
+    # ------------------------------------------------------------------
+    # 2. Directional bias (EMA stack) — soft vote
+    # ------------------------------------------------------------------
+    if close > ema50 and ema50 > ema200:
+        ema_bias = "long"
+    elif close < ema50 and ema50 < ema200:
+        ema_bias = "short"
+    elif close > ema50:
+        ema_bias = "long_weak"
+    elif close < ema50:
+        ema_bias = "short_weak"
+    else:
+        ema_bias = "flat"
+
+    # ------------------------------------------------------------------
+    # 3. Volatility band (ATR) — soft vote
+    # ------------------------------------------------------------------
+    atr_pct = atr14 / close if close else 0.0
+    # Accept a wide band; reject only truly dead or truly explosive regimes.
+    atr_ok = 0.0005 <= atr_pct <= 0.05
+
+    # ------------------------------------------------------------------
+    # 4. Volume confirmation — soft vote
+    # ------------------------------------------------------------------
+    vol_ma = df["volume"].iloc[max(0, i - 20):i].mean()
+    vol_ok = (not pd.isna(vol_ma)) and vol_ma > 0 and vol > vol_ma
+
+    # ------------------------------------------------------------------
+    # 5. Multi-timeframe alignment — soft vote
+    #    Caller may attach precomputed MTF columns; if absent, skip.
+    # ------------------------------------------------------------------
+    mtf_cols = [c for c in ("mtf_1m", "mtf_3m", "mtf_5m",
+                            "mtf_15m", "mtf_1h", "mtf_4h")
+                if c in df.columns]
+    mtf_votes_long = 0
+    mtf_votes_short = 0
+    for c in mtf_cols:
+        v = row[c]
+        if pd.isna(v):
+            continue
+        if v > 0:
+            mtf_votes_long += 1
+        elif v < 0:
+            mtf_votes_short += 1
+    mtf_ok_long = mtf_votes_long >= max(1, len(mtf_cols) // 2)
+    mtf_ok_short = mtf_votes_short >= max(1, len(mtf_cols) // 2)
+
+    # ------------------------------------------------------------------
+    # 6. Score the two candidate directions
+    # ------------------------------------------------------------------
+    def score(direction: str) -> int:
+        s = 0
+        # EMA vote
+        if direction == "long" and ema_bias in ("long", "long_weak"):
+            s += 1
+        if direction == "short" and ema_bias in ("short", "short_weak"):
+            s += 1
+        # GEX vote
+        if gex_regime == "trend" and direction in ("long", "short"):
+            s += 1
+        if gex_regime == "meanrev":
+            # mean-reversion: fade the EMA bias
+            if direction == "long" and ema_bias in ("short", "short_weak"):
+                s += 1
+            if direction == "short" and ema_bias in ("long", "long_weak"):
+                s += 1
+        if gex_regime == "neutral":
+            s += 1  # neutral regime is permissive
+        # ATR vote
+        if atr_ok:
+            s += 1
+        # Volume vote
+        if vol_ok:
+            s += 1
+        # MTF vote
+        if direction == "long" and mtf_ok_long:
+            s += 1
+        if direction == "short" and mtf_ok_short:
+            s += 1
+        return s
+
+    long_score = score("long")
+    short_score = score("short")
+
+    # Require at least 3 of 6 votes to fire.
+    MIN_VOTES = 3
+    if long_score < MIN_VOTES and short_score < MIN_VOTES:
+        return None
+
+    direction = "long" if long_score >= short_score else "short"
+
+    # ------------------------------------------------------------------
+    # 7. Risk sizing (ATR-based)
+    # ------------------------------------------------------------------
+    stop_dist = atr14 * 1.5
+    if direction == "long":
+        entry = close
+        stop = entry - stop_dist
+        tp1 = entry + stop_dist * 1.0
+        tp2 = entry + stop_dist * 2.0
+    else:
+        entry = close
+        stop = entry + stop_dist
+        tp1 = entry - stop_dist * 1.0
+        tp2 = entry - stop_dist * 2.0
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr14),
+        "score": int(max(long_score, short_score)),
+        "gex_regime": gex_regime,
+        "ema_bias": ema_bias,
+        "vol_ok": bool(vol_ok),
+        "atr_ok": bool(atr_ok),
+        "mtf_long": mtf_votes_long,
+        "mtf_short": mtf_votes_short,
+        "_debug": {
+            "long_score": long_score,
+            "short_score": short_score,
+            "min_votes": MIN_VOTES,
+        },
+    }
+```
