@@ -8679,3 +8679,61 @@ This isolates which gate is zeroing the pipeline. Without it, any "fix" is guess
 4. Re-run **once**. If funnel shows a single gate at 0, patch that gate only.
 
 **Do not tune thresholds blindly. Do not rotate timeframes. Do not push to GitHub until the funnel report is attached.**
+
+--- Sat Oct 10 02:46:44 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:46:38Z -> 2026-10-09T23:46:38Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+# QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Signal Deadlock)**
+
+## Diagnosis: Why trades=0
+
+Zero trades across 669 bars is not a "no-setup" market — it is a **logic contradiction in the gating stack**. The mandate requires ALL of the following to be `True` simultaneously:
+
+1. GEX regime matches strategy
+2. EMA trend aligns
+3. ATR within limits
+4. Macro score permits direction
+5. Event calendar clear
+6. Drawdown/exposure OK
+
+With 6 AND-gated conditions, the joint probability collapses. The most likely culprits, in order:
+
+**A. GEX data is missing or static.** If GEX is hardcoded/NaN for a historical window, the regime filter returns `False` for every bar → 0 signals. This is the #1 suspect. Historical GEX is not freely available; the script likely defaulted to a null regime.
+
+**B. EMA_200 warmup starvation.** SPY has 297 bars, QQQ 372. If the engine requires `EMA_200` to be *fully seeded* (200 bars) before evaluating, SPY only has ~97 usable bars and QQQ ~172. Combined with a 1-week window, the effective evaluation window is tiny.
+
+**C. Macro/Event layer defaulting to `Trading_Enabled=False`.** If the economic calendar parser failed to load, a fail-safe likely disabled trading for the entire window.
+
+**D. ATR "within limits" band is inverted or too tight.** If `ATR_min > ATR_max` or the band was calibrated on a different volatility regime, every bar is rejected.
+
+## Required Fixes (Coder)
+
+1. **Instrument the gate.** Emit a per-bar counter: `gex_pass`, `ema_pass`, `atr_pass`, `macro_pass`, `event_pass`. Without this, we are blind. This is non-negotiable before the next run.
+2. **Fail-open on missing GEX.** If GEX is unavailable, log `GEX=UNKNOWN` and fall back to EMA+ATR only — do NOT silently zero the regime.
+3. **Extend history.** 1 week is insufficient for EMA_200 confluence. Pull minimum 60 days across 1m/3m/5m/15m/1h/4h per Mandate #5.
+4. **Verify ATR band** is `min < max` and calibrated to current regime.
+
+## Structural Note
+
+A 6-condition AND gate is over-constrained. Per Mandate #6, we must learn *why* setups fail — but we cannot learn from zero samples. **First restore signal flow, then optimize.**
+
+## Action
+
+- **Do NOT** append to `proven_strategies.md` (no winners to prove).
+- **Do NOT** enter standby (no PASS earned).
+- Push gate-instrumented script to GitHub, rerun with 60-day history.
+- Rotate to 15m timeframe only after we see ≥20 raw signals.
+
+**Next cycle target:** trades ≥ 20, then evaluate win rate.
