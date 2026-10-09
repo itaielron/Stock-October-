@@ -9120,3 +9120,57 @@ and a count of how many bars passed each individually. This is a **bug fix, not 
 Do not loosen gates blindly to force trades. Fix the plumbing, re-run, and only then evaluate win rate. If trades still = 0 after the trace, the issue is upstream data alignment, not strategy logic.
 
 **Action:** Coder patches gate defaults + adds trace → re-run → return to QA.
+
+--- Sat Oct 10 02:50:37 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:50:32Z -> 2026-10-09T23:50:32Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+# QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+## Why trades=0
+
+Zero trades is not a "clean run" — it's a **silent failure**. The engine produced no signals across 669 bars. Root causes, in order of likelihood:
+
+1. **GEX gate is blocking everything.** Per Mandate #11, GEX is unavailable on the IEX feed. If the code still requires `GEX < 0` or `GEX > 0` to branch into trend/mean-reversion, and the proxy returns `None`/`0`/`NaN`, every bar fails the regime filter. **Fix:** default GEX to neutral and route to a fallback regime (e.g., ADX>25 → trend, else mean-revert). Never let a missing field kill the signal.
+
+2. **EMA stack too strict for a 1-week window.** `Close > EMA_50 AND EMA_50 > EMA_200` on 297 SPY bars means EMA_200 is barely seeded (~100 bars of warmup). Early bars are NaN → no valid trend. **Fix:** require `min_bars >= 250` before trading, or drop to EMA_20/EMA_50 for short windows.
+
+3. **ATR "within limits" band is undefined or zero-width.** If `ATR_min`/`ATR_max` aren't set, the comparison may reject all bars. **Fix:** log ATR distribution and set bands from percentiles.
+
+4. **Macro/event pause stuck True.** If the calendar parser failed silently, `Trading_Enabled=False` for the whole window.
+
+5. **Screener pre-filter (`Volume>1M AND Price>SMA_200`)** may be dropping both symbols before signal gen.
+
+## Required Diagnostics (before next cycle)
+
+Add a **funnel counter** and print it every run:
+```
+bars_total → gex_pass → ema_pass → atr_pass → macro_pass → signals
+```
+Without this, we cannot distinguish "no setup" from "broken gate." This is a **repeated mistake** — Mandate #3 violated.
+
+## Structural Verdict
+
+- No winners/losers to analyze → **cannot** perform Mandate #6 genetic learning this cycle.
+- Charts are empty → Mandate #4 (entry arrow / TP1 / SL markers) unverifiable.
+- **Do not rotate timeframes** (Mandate #10) — nothing was proven.
+
+## Action for Coder
+
+1. Patch GEX to neutral-default with price/volume proxy (realized vol regime).
+2. Add funnel logging.
+3. Relax EMA warmup for 1-week windows.
+4. Re-run same window. **Do not** touch strategy logic beyond gating until we see ≥1 trade.
+
+**Halt optimization** until funnel output confirms which gate is dead.
