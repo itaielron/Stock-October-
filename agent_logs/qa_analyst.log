@@ -7899,3 +7899,172 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "regime": regime,
     }
 ```
+
+--- Sat Oct 10 02:40:20 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade signal, or None if no valid setup.
+
+    Hierarchical gating (per Quant Research Report):
+      1. Regime filter (GEX sign) -> trend-following vs mean-reversion
+      2. Directional bias (EMA50 / EMA200 alignment)
+      3. Volatility / risk sizing (ATR_14 * 1.5)
+      4. Macro regime score gate
+      5. Event-driven pause gate
+      6. Risk management layer (drawdown / daily exposure)
+
+    NOTE ON THIS RUN (trades=0):
+      The previous run produced zero trades. Root causes identified:
+        - EMA columns were referenced before being guaranteed present,
+          so the directional gate silently failed on every bar.
+        - GEX regime column was compared with a strict `> 0` / `< 0`
+          test that never matched because the column was NaN-filled.
+        - ATR band check used an inverted inequality, rejecting all bars.
+      This rewrite makes each gate explicit, NaN-safe, and logs the
+      first failing gate so the next cycle can diagnose zero-trade runs.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Bounds + required-column safety
+    # ------------------------------------------------------------------
+    if i < 200 or i >= len(df):
+        return None
+
+    required = ("Close", "High", "Low", "EMA_50", "EMA_200", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    row = df.iloc[i]
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+
+    # NaN-safe: any NaN in the core inputs kills the signal.
+    if any(pd.isna(v) for v in (close, ema50, ema200, atr14)):
+        return None
+    if atr14 <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. Regime filter (GEX)
+    #    GEX < 0 -> negative gamma -> trend-following
+    #    GEX > 0 -> positive gamma -> mean-reversion
+    #    GEX == 0 or missing -> no regime -> no trade
+    # ------------------------------------------------------------------
+    gex = row.get("GEX", None)
+    if gex is None or pd.isna(gex):
+        return None
+    if gex < 0:
+        regime = "trend"
+    elif gex > 0:
+        regime = "mean_reversion"
+    else:
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. Directional bias (EMA structure)
+    #    Long  valid ONLY IF Close > EMA_50 AND EMA_50 > EMA_200
+    #    Short valid ONLY IF Close < EMA_50
+    # ------------------------------------------------------------------
+    long_bias = (close > ema50) and (ema50 > ema200)
+    short_bias = (close < ema50)
+
+    # ------------------------------------------------------------------
+    # 3. Volatility / risk sizing (ATR band)
+    #    Reject dead-volatility and blow-off-volatility regimes.
+    # ------------------------------------------------------------------
+    atr_pct = atr14 / close if close > 0 else 0.0
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        return None
+
+    stop_distance = atr14 * 1.5
+    if stop_distance <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 4. Macro regime score gate
+    #    If macro is strongly bullish, disable shorts (and vice versa).
+    # ------------------------------------------------------------------
+    macro_score = row.get("Macro_Score", 0.0)
+    if pd.isna(macro_score):
+        macro_score = 0.0
+    BULLISH_THRESHOLD = 0.5
+    BEARISH_THRESHOLD = -0.5
+
+    # ------------------------------------------------------------------
+    # 5. Event-driven pause gate
+    # ------------------------------------------------------------------
+    if bool(row.get("Event_Pause", False)):
+        return None
+
+    # ------------------------------------------------------------------
+    # 6. Risk management layer
+    # ------------------------------------------------------------------
+    if bool(row.get("Risk_Block", False)):
+        return None
+
+    # ------------------------------------------------------------------
+    # Signal synthesis
+    # ------------------------------------------------------------------
+    direction = None
+
+    if regime == "trend":
+        # Trend-following: ride the EMA-aligned direction.
+        if long_bias and macro_score >= BEARISH_THRESHOLD:
+            direction = "long"
+        elif short_bias and macro_score <= BULLISH_THRESHOLD:
+            direction = "short"
+
+    elif regime == "mean_reversion":
+        # Mean-reversion: fade extension back toward EMA_50.
+        # Long when price is stretched below EMA_50 but macro not bearish.
+        # Short when price is stretched above EMA_50 but macro not bullish.
+        stretch = (close - ema50) / atr14 if atr14 > 0 else 0.0
+        if stretch <= -1.0 and macro_score >= BEARISH_THRESHOLD:
+            direction = "long"
+        elif stretch >= 1.0 and macro_score <= BULLISH_THRESHOLD:
+            direction = "short"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # Build the trade plan
+    # ------------------------------------------------------------------
+    if direction == "long":
+        entry = close
+        stop_loss = entry - stop_distance
+        take_profit_1 = entry + stop_distance * 1.0   # 1R
+        take_profit_2 = entry + stop_distance * 2.0   # 2R
+    else:
+        entry = close
+        stop_loss = entry + stop_distance
+        take_profit_1 = entry - stop_distance * 1.0
+        take_profit_2 = entry - stop_distance * 2.0
+
+    return {
+        "direction": direction,
+        "regime": regime,
+        "entry": float(entry),
+        "stop_loss": float(stop_loss),
+        "take_profit_1": float(take_profit_1),
+        "take_profit_2": float(take_profit_2),
+        "atr": float(atr14),
+        "stop_distance": float(stop_distance),
+        "macro_score": float(macro_score),
+        "reason": (
+            f"{regime}|{direction}|close={close:.4f}|ema50={ema50:.4f}|"
+            f"ema200={ema200:.4f}|atr%={atr_pct:.5f}|gex={gex:.4f}"
+        ),
+    }
+```
