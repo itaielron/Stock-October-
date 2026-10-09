@@ -9728,3 +9728,55 @@ RESPONSE:
 5. Run all 6 timeframes; report per-TF win rate.
 
 **Verdict: Do not halt. Do not log to proven_strategies.md. Re-run with fixes.**
+
+--- Sat Oct 10 02:57:24 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:57:18Z -> 2026-10-09T23:57:18Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — FAIL (Zero-Trade Cycle)
+
+**Verdict:** No signal fired across 669 bars. This is a **gating failure**, not a market condition. Zero trades = zero learning = wasted cycle.
+
+### Root Cause Analysis (why trades=0)
+
+The mandate's confluence stack is almost certainly over-constrained. Ranked by likelihood:
+
+1. **EMA stack impossible to satisfy on 1m/3m data.** `Close > EMA_50 AND EMA_50 > EMA_200` requires 200 bars of warmup. SPY returned only **297 bars** — that leaves ~97 usable bars, and any pullback breaks the stack. QQQ's 372 bars is barely better. On short timeframes the EMA_200 filter is a near-permanent veto.
+2. **GEX regime gate.** Per mandate #11, GEX is unavailable. If the code defaults GEX to a value that fails the regime match (e.g., `None` → treated as positive-gamma → mean-reversion only), then trend-following longs are silently blocked. **Confirm the neutral fallback is actually wired in.**
+3. **ATR "within limits" band.** If the ATR filter has a hard min/max and 1m ATR is below the floor, every bar is rejected.
+4. **Macro/event pause.** If `Trading_Enabled=False` was sticky (no calendar reset), the whole window is dead.
+
+### Required Diagnostics (before next run)
+
+Add a per-bar rejection counter and print it:
+```
+reject_reasons = {ema:0, gex:0, atr:0, macro:0, risk:0, event:0}
+```
+Then report `bars_evaluated` vs `bars_passed_each_gate`. Without this, we are blind.
+
+### Structural Fixes
+
+- **Warmup:** Require `len(df) >= 250` per symbol *before* enabling EMA_200 gate; otherwise fall back to EMA_50/EMA_20 stack and log `warmup_fallback=True`.
+- **GEX proxy:** Derive from price/volume (e.g., rolling realized-vol sign) and **log the proxy value** so we can audit it. Never let a missing feed silently veto.
+- **ATR band:** Make it percentile-relative (e.g., 20th–90th pct of trailing ATR), not absolute.
+- **Event pause:** Assert `Trading_Enabled` resets daily; log any bar where it's False.
+
+### Mandate Compliance Check
+
+- ❌ MTFA (1m/3m/5m/15m/1h/4h) — only one TF appears to have run.
+- ❌ Charts — `charts/` empty (no trades → no arrows). Acceptable only if trades>0.
+- ❌ Genetic learning — impossible with 0 samples.
+- ⚠️ GitHub sync — verify push occurred.
+
+### Action
+
+**Do not rotate timeframes yet.** Fix the gating instrumentation, re-run on the same window, and return with the rejection histogram. A zero-trade result is a bug report, not a backtest.
