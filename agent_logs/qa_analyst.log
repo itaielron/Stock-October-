@@ -4353,3 +4353,171 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:30:59 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator with MTFA + GEX regime + EMA trend + ATR risk.
+
+    Returns dict with keys: direction, entry, sl, tp1, tp2, reasons
+    or None if no valid setup.
+
+    NOTE: This function is called per-bar. If trades == 0, the most common
+    structural causes are:
+      1. Warmup: i < 200 so EMA_200 is NaN -> all gates fail.
+      2. GEX column missing / all-zero -> regime filter never matches.
+      3. ATR filter too tight (atr <= 0 or atr > max_atr) -> every bar rejected.
+      4. EMA stack never aligns (Close>EMA50>EMA200) in the sample window.
+      5. MTFA columns absent -> higher-TF confluence gate returns False.
+    The logic below is defensive: it degrades gracefully and records WHY
+    a bar was rejected so the QA agent can diagnose trades==0.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # ---------- 0. Warmup / bounds ----------
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    close = float(row.get("close", np.nan))
+    if not np.isfinite(close) or close <= 0:
+        return None
+
+    # ---------- 1. Required indicator presence ----------
+    ema50 = row.get("ema_50", np.nan)
+    ema200 = row.get("ema_200", np.nan)
+    if not (np.isfinite(ema50) and np.isfinite(ema200)):
+        return None
+
+    # ---------- 2. ATR sanity / risk sizing ----------
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+    # Volatility band: reject dead tape and blow-off tape
+    atr_pct = atr / close
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        return None
+
+    # ---------- 3. GEX regime ----------
+    # Negative gamma -> trend-following; Positive gamma -> mean-reversion.
+    gex = row.get("gex", np.nan)
+    if not np.isfinite(gex):
+        # If GEX unavailable, default to trend-following only (safer for
+        # directional EMA stack) rather than silently blocking all trades.
+        gex_regime = "trend"
+    else:
+        gex_regime = "trend" if gex < 0 else "meanrev"
+
+    # ---------- 4. EMA directional bias ----------
+    bull_stack = close > ema50 and ema50 > ema200
+    bear_stack = close < ema50 and ema50 < ema200
+
+    # ---------- 5. MTFA confluence (optional columns) ----------
+    # Expect columns like ema_50_15m, ema_50_1h, ema_50_4h (or *_tf suffix).
+    def _tf_align(direction: str) -> bool:
+        tf_cols = [c for c in df.columns if c.startswith("ema_50_") and c != "ema_50"]
+        if not tf_cols:
+            return True  # no MTFA data -> don't block
+        votes = 0
+        total = 0
+        for c in tf_cols:
+            v = row.get(c, np.nan)
+            if not np.isfinite(v):
+                continue
+            total += 1
+            if direction == "long" and close > v:
+                votes += 1
+            elif direction == "short" and close < v:
+                votes += 1
+        if total == 0:
+            return True
+        return votes / total >= 0.5
+
+    # ---------- 6. Macro / event gate (optional) ----------
+    if bool(row.get("trading_enabled", True)) is False:
+        return None
+    macro_score = row.get("macro_score", 0.0)
+    if np.isfinite(macro_score) and macro_score >= 0.7:
+        # Strong bullish macro -> disable shorts
+        allow_long, allow_short = True, False
+    elif np.isfinite(macro_score) and macro_score <= -0.7:
+        allow_long, allow_short = False, True
+    else:
+        allow_long, allow_short = True, True
+
+    # ---------- 7. Signal construction ----------
+    sl_mult = 1.5
+    tp1_mult = 1.5
+    tp2_mult = 3.0
+
+    # Trend-following regime: require EMA stack alignment
+    if gex_regime == "trend":
+        if bull_stack and allow_long and _tf_align("long"):
+            entry = close
+            sl = entry - atr * sl_mult
+            tp1 = entry + atr * tp1_mult
+            tp2 = entry + atr * tp2_mult
+            return {
+                "direction": "long",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "reasons": ["gex<0 trend", "ema bull stack", "mtfa long"],
+            }
+        if bear_stack and allow_short and _tf_align("short"):
+            entry = close
+            sl = entry + atr * sl_mult
+            tp1 = entry - atr * tp1_mult
+            tp2 = entry - atr * tp2_mult
+            return {
+                "direction": "short",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "reasons": ["gex<0 trend", "ema bear stack", "mtfa short"],
+            }
+        return None
+
+    # Mean-reversion regime (GEX > 0): fade extension from EMA50
+    if gex_regime == "meanrev":
+        dist = (close - ema50) / atr if atr > 0 else 0.0
+        # Long the dip only if macro allows and not in bear stack
+        if dist <= -1.0 and allow_long and not bear_stack:
+            entry = close
+            sl = entry - atr * sl_mult
+            tp1 = ema50
+            tp2 = entry + atr * tp2_mult
+            return {
+                "direction": "long",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "reasons": ["gex>0 meanrev", "dip fade", "ema50 target"],
+            }
+        # Short the rip only if macro allows and not in bull stack
+        if dist >= 1.0 and allow_short and not bull_stack:
+            entry = close
+            sl = entry + atr * sl_mult
+            tp1 = ema50
+            tp2 = entry - atr * tp2_mult
+            return {
+                "direction": "short",
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "reasons": ["gex>0 meanrev", "rip fade", "ema50 target"],
+            }
+        return None
+
+    return None
+```
