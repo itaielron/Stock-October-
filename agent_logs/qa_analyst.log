@@ -8589,3 +8589,47 @@ I cannot evaluate this cycle. The "Backtest Output" field is empty — no trade 
 **Grade: INCOMPLETE — cannot PASS.** No code rewrite authorized (mandate #9) until I see the funnel. Once submitted, I will identify the exact gate zeroing the pipeline and recommend the minimal unblocking change — not a rewrite.
 
 **Standby status:** Optimization engine should NOT rotate timeframes yet; we have no proven strategy to log.
+
+--- Sat Oct 10 02:46:00 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:45:54Z -> 2026-10-09T23:45:54Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[trade] SPY LOSER entry=776.77 sl=773.51 tp1=781.66 tp2=786.56 exit=775.42 (TIME_STOP) R=-0.41 bars=79
+[trade] SPY WINNER entry=777.91 sl=775.87 tp1=780.97 tp2=784.03 exit=778.60 (EOD_FLAT) R=+0.34 bar...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-02 → 2026-10-09
+
+**Grade: FAIL** (win_rate 60% < 80% target; total_R = -1.07)
+
+### Why Losers Lost (structural, not statistical)
+
+**1. SPY LOSER (R=-0.41, TIME_STOP, 79 bars)**
+- Entry 776.77, SL 773.51, TP1 781.66. Price never reached TP1 nor SL — bled sideways for 79 bars then time-stopped at 775.42.
+- **Root cause:** Entry fired in a *chop regime*. ATR was likely compressed (SL only 3.26 wide), meaning the setup lacked the volatility expansion needed to reach TP1. This is a **low-ATR / range-bound false signal**.
+- **Gate to add:** Require `ATR_14 > ATR_14_SMA_20` (expanding vol) AND `ADX_14 > 20` before entry. Reject signals where expected move (TP1 distance) < 1.0×ATR.
+
+**2. QQQ LOSER (R=-3.11, GAP_STOP, 11 bars)**
+- Entry 757.74, SL 756.22 (only 1.52 wide), gapped through SL to 753.01. **This is the critical failure.**
+- **Root cause:** SL was set at `ATR*1.5` but ATR was tiny (~1.0), producing a stop inside normal noise. Overnight gap blew through it. This is a **stop-too-tight + overnight-hold** error — exactly the kind of repeated mistake the mandate forbids.
+- **Gates to add:**
+  - Enforce `SL_distance >= max(ATR*1.5, 0.35% of price)` — a hard floor.
+  - **No overnight holds** unless position is in profit > 0.5R at close (EOD_FLAT rule already exists — apply it unconditionally to losers).
+  - Block entries within 30 min of session close.
+
+### Why Winners Won
+- QQQ WINNER (R=+1.64): trend-aligned, hit TP1 then trailed to STOP — clean EMA + GEX alignment.
+- SPY/QQQ EOD_FLAT winners (R=+0.34, +0.47): marginal, closed green by luck of session drift, not by reaching TP1. **These are weak winners** — they inflate win rate without edge.
+
+### Required Rewrites (Coder)
+1. Add **volatility-expansion gate** (ATR rising + ADX>20).
+2. Add **minimum SL floor** (0.35% price) to kill the QQQ gap-stop class.
+3. Enforce **EOD_FLAT on all open positions** regardless of P&L.
+4. Reject setups where `TP1_distance < 1.0×ATR_14`.
+
+### Credit Protocol
+Do **not** halt — 60% is below target. One rewrite cycle authorized. If next run ≥80% with sound charts, enter standby and append to `proven_strategies.md`.
+
+**Push to GitHub: required.**

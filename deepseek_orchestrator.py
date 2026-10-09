@@ -65,6 +65,11 @@ You MUST output ONLY a single ```python block containing the rewritten `def _con
             success = replace_function_source("real_alpaca_backtester.py", "_confluence_cluster", new_func)
             if success:
                 log_activity("[2] Coder actively injected new confluence logic.")
+                # FOOLPROOF: Ensure __main__ exists!
+                with open("real_alpaca_backtester.py", "r") as rfile:
+                    if 'if __name__ == "__main__":' not in rfile.read():
+                        with open("real_alpaca_backtester.py", "a") as afile:
+                            afile.write('\n\nif __name__ == "__main__":\n    _start = sys.argv[1] if len(sys.argv) > 1 else None\n    _end = sys.argv[2] if len(sys.argv) > 2 else None\n    run_backtest(start=_start, end=_end)\n')
             else:
                 log_activity("[2] AST replacement failed. Retry triggered.")
         else:
