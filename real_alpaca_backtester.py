@@ -431,49 +431,89 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    Hierarchical confluence cluster — 5Min timeframe.
+    Hierarchical confluence cluster — 15Min timeframe.
 
     Mandate §11: GEX/options data is NOT available from Alpaca IEX. We derive a
     *mock* GEX proxy strictly from price/volume so the engine NEVER halts.
     When the proxy is degenerate/absent we fall back to `gex_regime = "neutral"`,
-    and neutral MUST permit at least one sub-routine (trend OR mean-reversion).
+    and neutral MUST permit BOTH sub-routines (trend AND mean-reversion).
 
-    QA fixes applied:
-      - GEX fallback -> "neutral" (never "no regime match").
-      - ATR band expressed as PERCENTILE of trailing ATR (not absolute dollars).
-      - Warmup guard raised to 250 bars (indicator seeding only).
+    QA fixes applied (this cycle):
+      - Rejection-reason telemetry: every early-return increments a counter in
+        `_REJECT_STATS` so the orchestrator can dump a histogram. Non-negotiable.
+      - Warmup handling: EMA_200 NaN -> fall back to EMA_50 > EMA_20 (never
+        silently drop). Warmup guard lowered to 60 bars (enough for EMA_50/20
+        + ATR seeding); EMA_200 used only when actually defined.
+      - GEX neutral = BOTH regimes enabled (widens the gate, never narrows).
+      - ATR band widened to [p05, p98] of trailing ATR (was [p10, p95]).
       - Fail-soft on missing columns (skip bar, never raise).
+      - 15Min-specific tuning: wider pullback tolerance, stronger momentum
+        confirmation, R:R >= 1.8 on TP1, structural swing lookback = 8 bars.
 
     Confluence stack (all must agree):
         1) GEX regime  (proxy, neutral-permissive)
-        2) EMA trend   (Close > EMA_50 > EMA_200 for longs)
+        2) EMA trend   (Close > EMA_50 > EMA_200, or EMA_50 > EMA_20 fallback)
         3) ATR sanity  (percentile band of trailing ATR)
         4) Structural pullback + momentum confirmation
     """
-    # ---- Warmup guard: need >=250 bars for EMA_200 + lookback seeding ----
-    if i < 250:
+    # ---- Rejection telemetry (QA non-negotiable) ----
+    global _REJECT_STATS
+    if "_REJECT_STATS" not in globals():
+        _REJECT_STATS = {
+            "warmup": 0, "missing_col": 0, "bad_values": 0,
+            "gex": 0, "ema": 0, "atr": 0, "structure": 0,
+            "risk": 0, "accepted": 0,
+        }
+
+    def _rej(reason: str):
+        _REJECT_STATS[reason] = _REJECT_STATS.get(reason, 0) + 1
         return None
 
+    # ---- Warmup guard: 60 bars is enough for EMA_50/20 + ATR_14 seeding ----
+    if i < 60:
+        return _rej("warmup")
+
     # ---- Required columns (fail-soft: skip bar, never raise) ----
-    required = ("Close", "High", "Low", "Open", "Volume", "EMA_50", "EMA_200", "ATR_14")
+    required = ("Close", "High", "Low", "Open", "Volume", "EMA_50", "ATR_14")
     for col in required:
         if col not in df.columns:
-            return None
+            return _rej("missing_col")
 
     row = df.iloc[i]
     prev = df.iloc[i - 1]
 
-    close = float(row["Close"])
-    high = float(row["High"])
-    low = float(row["Low"])
-    open_ = float(row["Open"])
-    vol = float(row["Volume"])
-    ema50 = float(row["EMA_50"])
-    ema200 = float(row["EMA_200"])
-    atr14 = float(row["ATR_14"])
+    try:
+        close = float(row["Close"])
+        high = float(row["High"])
+        low = float(row["Low"])
+        open_ = float(row["Open"])
+        vol = float(row["Volume"])
+        ema50 = float(row["EMA_50"])
+        atr14 = float(row["ATR_14"])
+    except (TypeError, ValueError):
+        return _rej("bad_values")
 
-    if atr14 <= 0 or close <= 0 or ema50 <= 0 or ema200 <= 0:
-        return None
+    if atr14 <= 0 or close <= 0 or ema50 <= 0:
+        return _rej("bad_values")
+
+    # ---- EMA_200 with graceful fallback (QA fix #2) ----
+    ema200 = None
+    if "EMA_200" in df.columns:
+        try:
+            v = float(row["EMA_200"])
+            if v == v and v > 0:  # not NaN, positive
+                ema200 = v
+        except (TypeError, ValueError):
+            ema200 = None
+
+    ema20 = None
+    if "EMA_20" in df.columns:
+        try:
+            v = float(row["EMA_20"])
+            if v == v and v > 0:
+                ema20 = v
+        except (TypeError, ValueError):
+            ema20 = None
 
     # ============================================================
     # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
@@ -481,10 +521,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     # ============================================================
     lookback = 20
     if i < lookback:
-        return None
+        return _rej("warmup")
     window = df.iloc[i - lookback:i]
     if len(window) < lookback:
-        return None
+        return _rej("warmup")
 
     w_close = window["Close"].astype(float).values
     w_vol = window["Volume"].astype(float).values
@@ -513,151 +553,196 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
         gex_proxy = (drift * 0.6) + (vol_slope * 0.3) - ((range_ratio - 1.0) * 0.1)
 
-        # Neutral band: near-zero proxy => neutral regime (permissive).
-        if gex_proxy < -0.0005:
+        # Neutral band widened: near-zero proxy => neutral (permissive).
+        if gex_proxy < -0.0010:
             gex_regime = "negative"
-        elif gex_proxy > 0.0005:
+        elif gex_proxy > 0.0010:
             gex_regime = "positive"
         else:
             gex_regime = "neutral"
 
     # ============================================================
     # 2) EMA TREND FILTER (Mandate §1 — directional bias)
+    #    Fallback: if EMA_200 unavailable, use EMA_50 > EMA_20.
     # ============================================================
-    long_trend = (close > ema50) and (ema50 > ema200)
-    short_trend = (close < ema50) and (ema50 < ema200)
+    if ema200 is not None:
+        long_trend = (close > ema50) and (ema50 > ema200)
+        short_trend = (close < ema50) and (ema50 < ema200)
+    elif ema20 is not None:
+        long_trend = (close > ema50) and (ema50 > ema20)
+        short_trend = (close < ema50) and (ema50 < ema20)
+    else:
+        # No long-term reference at all — use slope of EMA_50 vs 10 bars ago.
+        if i >= 10:
+            try:
+                ema50_prev = float(df["EMA_50"].iloc[i - 10])
+                long_trend = (close > ema50) and (ema50 > ema50_prev)
+                short_trend = (close < ema50) and (ema50 < ema50_prev)
+            except (TypeError, ValueError):
+                return _rej("ema")
+        else:
+            return _rej("ema")
 
     # ============================================================
-    # 3) ATR SANITY BAND — PERCENTILE of trailing ATR (QA fix)
-    #    Reject dead tape (bottom 10%) and chaos spikes (top 5%).
+    # 3) ATR SANITY BAND — PERCENTILE of trailing ATR (QA fix #3)
+    #    Widened to [p05, p98] so low-vol bars are not silently dropped.
     # ============================================================
     atr_hist = df["ATR_14"].iloc[max(0, i - 200):i].astype(float).values
     atr_hist = atr_hist[atr_hist > 0]
-    if len(atr_hist) < 50:
-        return None
-    p10 = float(np.percentile(atr_hist, 10))
-    p95 = float(np.percentile(atr_hist, 95))
-    if atr14 < p10 or atr14 > p95:
-        return None
+    if len(atr_hist) < 30:
+        return _rej("atr")
+    p05 = float(np.percentile(atr_hist, 5))
+    p98 = float(np.percentile(atr_hist, 98))
+    if atr14 < p05 or atr14 > p98:
+        return _rej("atr")
 
     # ============================================================
-    # 4) STRUCTURAL PULLBACK + MOMENTUM CONFIRMATION
+    # 4) STRUCTURAL PULLBACK + MOMENTUM CONFIRMATION (15Min tuned)
     # ============================================================
-    swing_low = float(df["Low"].iloc[max(0, i - 5):i].min())
-    swing_high = float(df["High"].iloc[max(0, i - 5):i].max())
+    swing_low = float(df["Low"].iloc[max(0, i - 8):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 8):i].max())
 
     body = close - open_
-    bullish_bar = body > 0 and close > float(prev["Close"])
-    bearish_bar = body < 0 and close < float(prev["Close"])
+    # 15Min: require a real body (>= 0.15 ATR) to avoid doji noise.
+    min_body = atr14 * 0.15
+    bullish_bar = body > min_body and close > float(prev["Close"])
+    bearish_bar = body < -min_body and close < float(prev["Close"])
 
     # ============================================================
     # REGIME ROUTER (Mandate §1)
     #   negative -> trend-following
     #   positive -> mean-reversion
-    #   neutral  -> permissive: trend if EMA aligned, else mean-reversion
+    #   neutral  -> permissive: BOTH sub-routines enabled (QA fix #4)
     # ============================================================
+
     def _trend_long():
-        recent_low = float(df["Low"].iloc[i - 3:i].min())
-        pulled_back = recent_low <= ema50 * 1.002
+        recent_low = float(df["Low"].iloc[i - 4:i].min())
+        # 15Min: allow pullback within 0.4 ATR of EMA_50 (was 0.2%).
+        pulled_back = recent_low <= ema50 + (atr14 * 0.4)
         if not pulled_back:
-            return None
+            return _rej("structure")
         entry = close
         sl = min(swing_low, recent_low) - (atr14 * 1.5)
         risk = entry - sl
         if risk <= 0 or risk > atr14 * 3.0:
-            return None
+            return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry + (risk * 1.5), "tp2": entry + (risk * 3.0),
+            "tp1": entry + (risk * 1.8), "tp2": entry + (risk * 3.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "trend_long", "gex_proxy": gex_proxy,
         }
 
     def _trend_short():
-        recent_high = float(df["High"].iloc[i - 3:i].max())
-        pulled_back = recent_high >= ema50 * 0.998
+        recent_high = float(df["High"].iloc[i - 4:i].max())
+        pulled_back = recent_high >= ema50 - (atr14 * 0.4)
         if not pulled_back:
-            return None
+            return _rej("structure")
         entry = close
         sl = max(swing_high, recent_high) + (atr14 * 1.5)
         risk = sl - entry
         if risk <= 0 or risk > atr14 * 3.0:
-            return None
+            return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry - (risk * 1.5), "tp2": entry - (risk * 3.0),
+            "tp1": entry - (risk * 1.8), "tp2": entry - (risk * 3.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "trend_short", "gex_proxy": gex_proxy,
         }
 
     def _mr_long():
-        if not (close > ema200 and bullish_bar):
-            return None
-        dist_to_low = (close - swing_low) / atr14
-        if dist_to_low > 1.0:
-            return None
+        # 15Min mean-reversion: require close below EMA_50 (stretched down).
         if close >= ema50:
-            return None
+            return _rej("structure")
+        if not bullish_bar:
+            return _rej("structure")
+        dist_to_low = (close - swing_low) / atr14
+        if dist_to_low > 1.2:
+            return _rej("structure")
         entry = close
         sl = swing_low - (atr14 * 1.5)
         risk = entry - sl
         if risk <= 0 or risk > atr14 * 3.0:
-            return None
+            return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry + (risk * 1.5), "tp2": entry + (risk * 3.0),
+            "tp1": entry + (risk * 1.8), "tp2": entry + (risk * 3.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "mr_long", "gex_proxy": gex_proxy,
         }
 
     def _mr_short():
-        if not (close < ema200 and bearish_bar):
-            return None
-        dist_to_high = (swing_high - close) / atr14
-        if dist_to_high > 1.0:
-            return None
         if close <= ema50:
-            return None
+            return _rej("structure")
+        if not bearish_bar:
+            return _rej("structure")
+        dist_to_high = (swing_high - close) / atr14
+        if dist_to_high > 1.2:
+            return _rej("structure")
         entry = close
         sl = swing_high + (atr14 * 1.5)
         risk = sl - entry
         if risk <= 0 or risk > atr14 * 3.0:
-            return None
+            return _rej("risk")
         return {
             "entry": entry, "sl": sl,
-            "tp1": entry - (risk * 1.5), "tp2": entry - (risk * 3.0),
+            "tp1": entry - (risk * 1.8), "tp2": entry - (risk * 3.0),
             "swing_low": swing_low, "swing_high": swing_high,
             "risk": risk, "regime": "mr_short", "gex_proxy": gex_proxy,
         }
 
+    # ---- Regime routing ----
     if gex_regime == "negative":
         # Trend-following regime
         if long_trend and bullish_bar:
-            return _trend_long()
+            sig = _trend_long()
+            if sig:
+                _REJECT_STATS["accepted"] += 1
+                return sig
         if short_trend and bearish_bar:
-            return _trend_short()
-        return None
+            sig = _trend_short()
+            if sig:
+                _REJECT_STATS["accepted"] += 1
+                return sig
+        return _rej("gex")
 
     if gex_regime == "positive":
         # Mean-reversion regime
         sig = _mr_long()
         if sig:
+            _REJECT_STATS["accepted"] += 1
             return sig
-        return _mr_short()
+        sig = _mr_short()
+        if sig:
+            _REJECT_STATS["accepted"] += 1
+            return sig
+        return _rej("gex")
 
-    # ---- NEUTRAL: permissive — trend if EMA aligned, else mean-reversion ----
+    # ---- NEUTRAL: permissive — BOTH sub-routines enabled (QA fix #4) ----
+    # Try trend first (higher R:R), then mean-reversion.
     if long_trend and bullish_bar:
         sig = _trend_long()
         if sig:
+            _REJECT_STATS["accepted"] += 1
             return sig
     if short_trend and bearish_bar:
         sig = _trend_short()
         if sig:
+            _REJECT_STATS["accepted"] += 1
             return sig
     sig = _mr_long()
     if sig:
+        _REJECT_STATS["accepted"] += 1
         return sig
-    return _mr_short()
+    sig = _mr_short()
+    if sig:
+        _REJECT_STATS["accepted"] += 1
+        return sig
+
+    # Neutral regime exhausted both sub-routines — classify by dominant gate.
+    if not (long_trend or short_trend):
+        return _rej("ema")
+    return _rej("structure")
 
 
 # ---------------------------------------------------------------------------

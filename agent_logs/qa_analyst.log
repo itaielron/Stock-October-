@@ -9079,3 +9079,44 @@ Zero trades is **worse than a losing strategy** — it means the system cannot b
 Re-run with rejection-reason telemetry. Do **not** tune parameters until we see *which* gate is killing 100% of bars. Push diagnostic logs to GitHub per Mandate #8.
 
 **Verdict: FAIL — diagnostic instrumentation required before any optimization.**
+
+--- Sat Oct 10 02:50:11 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:50:06Z -> 2026-10-09T23:50:06Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades across 297 SPY + 372 QQQ bars means the **entry gate never evaluated True**. Given the mandate's hierarchical confluence stack, the failure is almost certainly a **stacked AND-gate**, not a data problem. Ranked causes:
+
+1. **GEX gate deadlock (most likely).** Per Mandate #11, GEX is unavailable on IEX. If the coder left a `gex_regime == 'negative'` check (or a mock proxy that defaults to `None`/`0`), the regime filter returns False on every bar → no sub-routine ever fires. This is the #1 suspect.
+2. **EMA warm-up starvation.** `Close > EMA_50 AND EMA_50 > EMA_200` requires ~200 bars of history *before* the window. With only 297/372 bars pulled, the first ~200 are consumed by warm-up, leaving a tiny tradable tail — and if the EMA_200 seed is NaN, the comparison is False for the entire run.
+3. **ATR band too tight.** If `ATR_14` is gated to a narrow min/max range, low-volatility windows silently reject every bar.
+4. **Macro/event pause stuck True.** If `Trading_Enabled` defaults to False and no calendar feed populates it, all signals are dropped at the risk layer.
+
+### Required diagnostics (do NOT re-optimize yet)
+Before touching parameters, the Coder must emit a **per-bar gate trace** logging each condition's boolean:
+`gex_ok | ema_ok | atr_ok | macro_ok | risk_ok`
+and a count of how many bars passed each individually. This is a **bug fix, not an optimization** — Mandate #9 (Smart Sleep) does not apply because we have no working baseline.
+
+### Structural fixes to apply
+- **GEX:** default to `neutral` → route to mean-reversion; never block on missing data (Mandate #11).
+- **EMA:** pull ≥ 500 bars so EMA_200 is fully seeded; drop NaN rows explicitly.
+- **ATR:** widen band; log distribution to confirm it's non-degenerate.
+- **Macro:** default `Trading_Enabled = True` unless an event is parsed.
+
+### Anti-overfitting note
+Do not loosen gates blindly to force trades. Fix the plumbing, re-run, and only then evaluate win rate. If trades still = 0 after the trace, the issue is upstream data alignment, not strategy logic.
+
+**Action:** Coder patches gate defaults + adds trace → re-run → return to QA.
