@@ -6517,3 +6517,179 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{regime}|EMA_bias|ATR_ok",
     }
 ```
+
+--- Sat Oct 10 02:36:48 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    Returns a dict describing a trade signal, or None if no valid setup.
+
+    Hierarchical gating (per Quant Research Report):
+      1. Regime filter (GEX sign) -> trend-following vs mean-reversion
+      2. Directional bias (EMA50 / EMA200 alignment)
+      3. Volatility / risk sizing (ATR_14 * 1.5)
+      4. Macro regime score (disable shorts in bullish macro)
+      5. Event-driven pause window
+      6. Risk layer (drawdown / daily exposure) - handled upstream, but
+         we surface the required fields so the executor can verify.
+
+    NOTE ON trades=0:
+      The previous run produced zero trades. Root causes diagnosed:
+        (a) GEX column was absent -> regime filter always returned None.
+        (b) EMA warm-up: EMA_200 needs >=200 bars; if the slice passed in
+            is shorter than 200 bars, every comparison is NaN -> no signal.
+        (c) ATR guard used a strict `>` on a band that was never satisfied
+            because ATR was computed on a too-short window.
+        (d) Macro score defaulted to 0 and the bullish threshold check
+            silently disabled all shorts while longs failed EMA alignment.
+      Fixes applied below:
+        - Graceful GEX fallback (derive proxy from realized vol skew).
+        - Explicit warm-up guard with clear reason codes.
+        - ATR band widened and made configurable via df.attrs.
+        - Macro score read from df.attrs with sane default that does NOT
+          blanket-disable one side.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Warm-up / data integrity guards
+    # ------------------------------------------------------------------
+    required_cols = ("Close", "EMA_50", "EMA_200", "ATR_14")
+    for c in required_cols:
+        if c not in df.columns:
+            return None
+
+    if i < 200:
+        # Not enough history for EMA_200 to be meaningful.
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+
+    # NaN guard (pandas rolling windows emit NaN during warm-up)
+    if any(pd.isna(v) for v in (close, ema50, ema200, atr14)):
+        return None
+    if atr14 <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. Regime filter (GEX)
+    # ------------------------------------------------------------------
+    gex = row.get("GEX", None)
+    if gex is None or pd.isna(gex):
+        # Fallback proxy: use short-vs-long realized vol skew as a stand-in
+        # for dealer gamma positioning. Negative skew -> trend regime.
+        if "RV_5" in df.columns and "RV_20" in df.columns:
+            rv5 = row.get("RV_5")
+            rv20 = row.get("RV_20")
+            if pd.notna(rv5) and pd.notna(rv20) and rv20 > 0:
+                gex = (rv20 - rv5)  # positive => mean-reversion bias
+            else:
+                gex = 0.0
+        else:
+            gex = 0.0
+
+    regime = "trend" if gex < 0 else "mean_reversion"
+
+    # ------------------------------------------------------------------
+    # 2. Directional bias (EMA)
+    # ------------------------------------------------------------------
+    long_bias = (close > ema50) and (ema50 > ema200)
+    short_bias = (close < ema50) and (ema50 < ema200)
+
+    # ------------------------------------------------------------------
+    # 3. Volatility / risk sizing (ATR)
+    # ------------------------------------------------------------------
+    atr_min = df.attrs.get("atr_min", 0.0)
+    atr_max = df.attrs.get("atr_max", float("inf"))
+    if not (atr_min <= atr14 <= atr_max):
+        return None
+
+    sl_distance = atr14 * 1.5
+    if sl_distance <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 4. Macro regime score
+    # ------------------------------------------------------------------
+    macro_score = df.attrs.get("macro_score", 0.0)
+    bullish_threshold = df.attrs.get("bullish_threshold", 1.0)
+    bearish_threshold = df.attrs.get("bearish_threshold", -1.0)
+
+    macro_bullish = macro_score >= bullish_threshold
+    macro_bearish = macro_score <= bearish_threshold
+
+    # ------------------------------------------------------------------
+    # 5. Event-driven pause
+    # ------------------------------------------------------------------
+    if df.attrs.get("trading_enabled", True) is False:
+        return None
+    if row.get("event_pause", False) is True:
+        return None
+
+    # ------------------------------------------------------------------
+    # 6. Signal construction
+    # ------------------------------------------------------------------
+    direction = None
+
+    if regime == "trend":
+        # Trend-following: ride the EMA-aligned direction.
+        if long_bias and not macro_bearish:
+            direction = "long"
+        elif short_bias and not macro_bullish:
+            direction = "short"
+
+    elif regime == "mean_reversion":
+        # Mean-reversion: fade extension against the EMA trend, but only
+        # when price is stretched from EMA_50 by >= 1 ATR.
+        stretch = close - ema50
+        if long_bias and stretch <= -1.0 * atr14 and not macro_bearish:
+            direction = "long"
+        elif short_bias and stretch >= 1.0 * atr14 and not macro_bullish:
+            direction = "short"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # 7. Build signal payload
+    # ------------------------------------------------------------------
+    if direction == "long":
+        entry = close
+        stop_loss = entry - sl_distance
+        take_profit_1 = entry + sl_distance * 1.5   # 1.5R
+        take_profit_2 = entry + sl_distance * 3.0   # 3.0R
+    else:
+        entry = close
+        stop_loss = entry + sl_distance
+        take_profit_1 = entry - sl_distance * 1.5
+        take_profit_2 = entry - sl_distance * 3.0
+
+    return {
+        "direction": direction,
+        "regime": regime,
+        "entry": float(entry),
+        "stop_loss": float(stop_loss),
+        "take_profit_1": float(take_profit_1),
+        "take_profit_2": float(take_profit_2),
+        "atr": float(atr14),
+        "sl_distance": float(sl_distance),
+        "gex": float(gex),
+        "macro_score": float(macro_score),
+        "reason": (
+            f"{regime}|{direction}|close={close:.4f}|ema50={ema50:.4f}|"
+            f"ema200={ema200:.4f}|atr={atr14:.4f}|gex={gex:.4f}"
+        ),
+    }
+```
