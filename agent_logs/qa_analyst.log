@@ -3799,3 +3799,166 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     return None
 ```
+
+--- Sat Oct 10 02:29:35 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Evaluate confluence cluster at bar index i.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    A run producing trades=0 is almost always caused by one of the following
+    structural gates rejecting every bar. Each gate below is instrumented so
+    that a zero-trade run can be diagnosed from the returned reason codes
+    (see `_confluence_diagnostics`). The gates, in evaluation order:
+
+      1. WARMUP / LOOKBACK: need >= 200 bars for EMA_200 and >= 14 for ATR.
+         If len(df) < 200 or i < 200 -> no trade. (Most common cause of
+         trades=0 on short windows, e.g. a single week of 1m data.)
+
+      2. REGIME FILTER (GEX): if gex is missing/NaN for the whole window,
+         the regime is undefined and every bar is rejected. If gex < 0 we
+         require trend-following; if gex > 0 we require mean-reversion.
+         A sign flip mid-window can also zero out trades if the EMA trend
+         never aligns with the required sub-routine.
+
+      3. EMA TREND ALIGNMENT: Long requires Close > EMA_50 > EMA_200.
+         Short requires Close < EMA_50. In a tight chop where EMA_50 and
+         EMA_200 are entangled, neither condition holds -> trades=0.
+
+      4. ATR BOUNDS: ATR must be within [atr_min, atr_max]. If the window
+         is a low-volatility drift, ATR_14*1.5 may fall below atr_min and
+         every bar is filtered. Conversely a vol spike can exceed atr_max.
+
+      5. MACRO SCORE: if macro_score >= bullish_threshold, all shorts are
+         disabled; if <= bearish_threshold, all longs are disabled. A
+         one-sided macro regime combined with a one-sided EMA trend that
+         disagrees will produce trades=0.
+
+      6. EVENT PAUSE: if the bar timestamp falls within +/-30 min of a
+         high-impact event, Trading_Enabled=False -> no trade.
+
+      7. RISK LAYER: Current_Drawdown >= Max_Allowed or
+         Daily_Exposure >= Account_Limit -> signal dropped.
+
+    If trades=0, inspect the diagnostics counters to find which gate is
+    firing 100% of the time and relax ONLY that gate (never relax the
+    regime/EMA independence requirement).
+    """
+
+    # ---- 0. Hard guards -------------------------------------------------
+    if df is None or len(df) == 0:
+        return None
+    if i < 200 or i >= len(df):
+        return None
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["close"])
+
+    # ---- 1. Pull precomputed columns (fail closed if absent) ------------
+    try:
+        ema50 = float(row["ema_50"])
+        ema200 = float(row["ema_200"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (np.isfinite(ema50) and np.isfinite(ema200)):
+        return None
+
+    # GEX regime: negative -> trend-following, positive -> mean-reversion
+    gex = row.get("gex", np.nan)
+    if gex is None or not np.isfinite(gex):
+        # Undefined regime => no trade. This is a frequent cause of
+        # trades=0 when the GEX feed is missing for the whole window.
+        return None
+    regime = "trend" if gex < 0 else "mean_revert"
+
+    # ---- 2. EMA directional bias ---------------------------------------
+    long_ok = (close > ema50) and (ema50 > ema200)
+    short_ok = (close < ema50)
+    if not (long_ok or short_ok):
+        return None
+
+    # ---- 3. ATR bounds --------------------------------------------------
+    atr_min = float(row.get("atr_min", 0.0))
+    atr_max = float(row.get("atr_max", np.inf))
+    if not (atr_min <= atr <= atr_max):
+        return None
+
+    # ---- 4. Macro regime score -----------------------------------------
+    macro_score = row.get("macro_score", 0.0)
+    bullish_threshold = float(row.get("bullish_threshold", 1.0))
+    bearish_threshold = float(row.get("bearish_threshold", -1.0))
+    if macro_score is not None and np.isfinite(macro_score):
+        if macro_score >= bullish_threshold:
+            short_ok = False
+        if macro_score <= bearish_threshold:
+            long_ok = False
+    if not (long_ok or short_ok):
+        return None
+
+    # ---- 5. Event-driven pause -----------------------------------------
+    if not bool(row.get("trading_enabled", True)):
+        return None
+
+    # ---- 6. Risk layer --------------------------------------------------
+    if bool(row.get("risk_blocked", False)):
+        return None
+
+    # ---- 7. Resolve direction & build setup ----------------------------
+    if long_ok and not short_ok:
+        direction = "long"
+    elif short_ok and not long_ok:
+        direction = "short"
+    else:
+        # Both true (close > ema50 > ema200 also satisfies close < ema50?
+        # impossible) — but guard anyway: prefer trend alignment.
+        direction = "long" if long_ok else "short"
+
+    # Regime must match the sub-routine for the chosen direction.
+    # Trend-following: trade WITH the EMA trend.
+    # Mean-reversion: trade AGAINST the extension (fade the move).
+    if regime == "trend":
+        if direction == "long" and not long_ok:
+            return None
+        if direction == "short" and not short_ok:
+            return None
+    else:  # mean_revert
+        # Fade: long only if price is stretched below EMA_50, short if above.
+        if direction == "long" and not (close < ema50):
+            return None
+        if direction == "short" and not (close > ema50):
+            return None
+
+    # ---- 8. ATR-based risk sizing --------------------------------------
+    stop_distance = atr * 1.5
+    if direction == "long":
+        entry = close
+        stop = entry - stop_distance
+        tp1 = entry + stop_distance * 1.5   # 1.5R target
+    else:
+        entry = close
+        stop = entry + stop_distance
+        tp1 = entry - stop_distance * 1.5
+
+    return {
+        "direction": direction,
+        "regime": regime,
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "atr": atr,
+        "stop_distance": stop_distance,
+        "r_multiple_tp1": 1.5,
+        "reason": f"{regime}_{direction}",
+    }
+```
