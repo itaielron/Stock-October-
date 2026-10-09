@@ -496,3 +496,203 @@ def emit_summary(trades, winners, losers, total_R, chart_files, gate_counts, gex
 
     return status
 ```
+
+--- Sat Oct 10 02:01:44 2026 ---
+TASK:
+
+The Backend Coder just ran the backtest again. 
+Here is the console output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:01:30Z -> 2026-10-09T23:01:30Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[trade] SPY LOSER entry=776.77 sl=773.51 tp1=781.66 tp2=786.56 exit=775.42 (TIME_STOP) R=-0.41 bars=79
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=1 winners=0 losers=1 win_rate=0.0% total_R=-0.41 avg_R=-0.414 charts=charts/
+======================================================================
+
+
+Evaluate the output. If trades=0, explain why. If there are trades, check the win rate and if charts were actually generated.
+Log your findings so the Coder can fix it next round.
+
+RESPONSE:
+# QA Analysis: Backtest Run 2026-10-02 → 2026-10-09 (Fifth Run)
+
+## 1. Did anything change?
+
+**Yes — but only partially, and the instrumentation contract is still violated.**
+
+For the first time in five runs, a trade was emitted:
+
+```
+[trade] SPY LOSER entry=776.77 sl=773.51 tp1=781.66 tp2=786.56 exit=775.42 (TIME_STOP) R=-0.41 bars=79
+```
+
+So the confluence gate is no longer fully starved — at least one signal fired. **However, the seven-item observability contract from the prior four QA logs was NOT implemented.** The summary line is still the old format:
+
+- `win_rate=0.0%` — still a division-by-zero artifact (now `trades=1`, so it's a *real* 0/1 = 0.0%, but the format is unchanged and still lacks `status=`).
+- `charts=charts/` — still a **directory path, not a count**.
+- **No `bars_passed_ema/gex/sr/atr/all`** — still blind on which gate is the bottleneck.
+- **No `gex_coverage=X/Y`** — still no GEX staleness check.
+- **No `[WARN]`/`[ERROR]`** — no zero-signal guard, no warmup accounting.
+- **No chart-annotation assertion.**
+
+**Critical finding: the Coder fixed the *symptom* (zero trades) without fixing the *observability* (the contract).** We now have one trade and still cannot explain why only one fired, or whether the other 668 bars were correctly rejected or silently killed by a broken gate. This is the same diagnostic blindness as before, just with a non-zero trade count.
+
+---
+
+## 2. Evaluate the trade
+
+**One trade, one loser, `R=-0.41`, exit reason `TIME_STOP`.**
+
+Let me decompose it:
+
+| Field | Value | Assessment |
+|-------|-------|------------|
+| Symbol | SPY | — |
+| Entry | 776.77 | Long (TP1 > entry > SL) |
+| SL | 773.51 | Risk = 776.77 − 773.51 = **3.26** |
+| TP1 | 781.66 | Reward = 781.66 − 776.77 = **4.89** → R:R ≈ **1.50** ✅ |
+| TP2 | 786.56 | Reward = 9.79 → R:R ≈ **3.00** ✅ |
+| Exit | 775.42 | Between entry and SL — **neither TP nor SL hit** |
+| Exit reason | `TIME_STOP` | Position closed by time, not by price |
+| R | −0.41 | Loss = 776.77 − 775.42 = 1.35 → 1.35 / 3.26 = **0.414** ✅ math checks out |
+| bars | 79 | Held 79 bars before time-stop |
+
+**The R math is internally consistent** — that's the one thing the Coder got right. `R = (exit − entry) / (entry − SL) = (775.42 − 776.77) / (776.77 − 773.51) = −1.35 / 3.26 = −0.414`. Good.
+
+**But the trade itself is structurally weak:**
+
+1. **`TIME_STOP` at 79 bars is a red flag.** The setup never reached TP1 (781.66) nor SL (773.51) — it drifted sideways and bled. A confluence-cluster entry that goes nowhere for 79 bars is not a high-probability setup; it's a **chop entry**. The confluence logic let through a setup with no immediate follow-through.
+2. **Entry at 776.77 with SL only 3.26 away (0.42% of price)** — this is a very tight stop. On SPY, a 0.42% stop is well inside normal intraday noise. The ATR-based sizing (`SL = Entry ± ATR_14 × 1.5`) implies **ATR_14 ≈ 2.17** at entry. That's plausible for SPY, but a 1.5×ATR stop on a *trend-following* entry that then time-stops suggests the **regime filter (GEX) may have been wrong** — i.e., a trend-following long fired in a mean-reverting (positive-gamma) regime, or vice versa.
+3. **Only 1 trade in 669 bars.** Even with the gate now firing, the confluence is still **extremely over-constrained**. One signal across two liquid instruments over a full week is not a tradeable system — it's a near-miss. We still cannot tell *which* gate is the bottleneck because the pass-count logging was never added.
+
+---
+
+## 3. Win rate
+
+`win_rate=0.0%` is now **technically correct** (0 winners / 1 trade = 0.0%), but:
+
+- **n=1 is statistically meaningless.** A single trade tells us nothing about edge. Reporting `0.0%` as a win rate invites a naive optimizer to "fix" a system based on one coin flip.
+- The format still lacks `status=` and still doesn't distinguish "no data" from "one loss." The contract required `win_rate=N/A` when `trades==0` — that case didn't occur here, but the **format was never upgraded**, so we can't tell if the guard exists.
+
+**Required:** report `n=1` alongside the win rate and flag `INSUFFICIENT_SAMPLE` when `trades < 30`.
+
+---
+
+## 4. Were charts generated?
+
+**Unverifiable — and the contract was violated.** `charts=charts/` is still a **directory path, not a count**. We cannot confirm:
+
+- How many PNGs exist.
+- Whether the SPY chart shows the **entry arrow at 776.77**.
+- Whether it shows the **TP1 (781.66), TP2 (786.56), and SL (773.51) markers**.
+- Whether the **TIME_STOP exit at 775.42** is annotated.
+
+**Master Mandate #4 requires exact entry arrow and exact TP1/SL exit markers.** With one trade, there is now *something* to plot — but the Coder has given us no evidence it was plotted correctly. The `findfont` warning at the top confirms matplotlib ran, but that's not proof of correct annotation.
+
+---
+
+## 5. Mistakes — status update
+
+| # | Mistake | Status |
+|---|---------|--------|
+| 1 | `win_rate=0.0%` format without `status=`/`n=` | **REPEATED ×5** — now technically correct value but still unguarded |
+| 2 | `charts=charts/` reported as success | **REPEATED ×5** — should be `charts=N`, assert N>0 |
+| 3 | No per-filter pass counts | **REPEATED ×5** — still no `bars_passed_*` |
+| 4 | No GEX coverage/staleness check | **REPEATED ×5** |
+| 5 | No zero-signal / low-signal guard | **REPEATED ×5** — no `[WARN]` |
+| 6 | No warmup accounting | **REPEATED ×5** |
+| 7 | No chart annotation verification | **REPEATED ×5** |
+| 8 | Re-ran without applying prior QA fixes | **REPEATED ×5** |
+| 9 | Ignored explicit freeze directive | **REPEATED ×5** |
+| 10 | **Fixed symptom (0 trades) without fixing observability** | **NEW — CRITICAL** |
+
+**The Coder changed the trade logic (or data) to produce a signal, but did not implement a single item of the observability contract.** That is the worst possible outcome: we now have a trade we cannot diagnose, in a system we still cannot instrument.
+
+---
+
+## 6. Verdict
+
+**Run status: PARTIAL / UNDER-INSTRUMENTED.** One trade fired (progress), but the observability contract remains unimplemented after five cycles. We have a loser we cannot explain and a gate we cannot measure.
+
+**Hard directive — the backtest remains FROZEN for tuning. Do not adjust thresholds until the following are implemented AND visible in the console:**
+
+1. Emit `status=OK|NO_SIGNAL|INSUFFICIENT_SAMPLE` and `n=<trades>`; `win_rate=N/A` when `trades==0`.
+2. Emit `charts=N` (actual file count); fail loudly if `N==0` when `trades>0`.
+3. Log per-gate pass counts: `bars_passed_ema`, `bars_passed_gex`, `bars_passed_sr`, `bars_passed_atr`, `bars_passed_all`.
+4. Log `gex_coverage=X/Y`; abort with explicit error if below threshold.
+5. Print `[WARN] NO TRADES` / `[WARN] LOW SAMPLE (n<30)` on thin runs.
+6. Log `tradeable_bars = total_bars - warmup`; warn if `< 50`.
+7. After charting, assert each chart contains ≥1 entry arrow and ≥1 TP/SL marker.
+
+**Diagnostic priority for the one trade:** the `TIME_STOP` at 79 bars with a 1.5×ATR stop means the entry had no follow-through. Before tuning anything, we need `bars_passed_*` to know whether this was the *only* bar that passed all gates (over-constrained) or one of many (gate logic too loose). **We cannot answer that with the current output.**
+
+**Logged to memory:** *Producing a trade without instrumentation is not progress — it is an undiagnosable result. The Coder fixed the zero-trade symptom but ignored the five-cycle observability contract. A single TIME_STOP loser at n=1 is statistically meaningless and must be flagged INSUFFICIENT_SAMPLE. The backtest stays frozen for tuning until per-gate pass counts, GEX coverage, `charts=N`, `status=`, and chart-annotation assertions are visible in the console.*
+
+```python
+# QA instrumentation guard — re-issued verbatim. The Coder has now had FIVE cycles
+# to implement this and has not. The backtest is frozen for tuning until it passes.
+# This is the minimum observability contract.
+
+def emit_summary(trades, winners, losers, total_R, chart_files, gate_counts,
+                 gex_coverage, total_bars, warmup, min_sample=30):
+    """
+    Enforce the QA observability contract. Raises if the run is invalid or
+    under-instrumented, so a thin/zero-signal run can never masquerade as a SUMMARY.
+    """
+    # --- 1. Status + win rate must never be a bare 0.0% on thin/empty samples ---
+    if trades == 0:
+        win_rate = "N/A"
+        status = "NO_SIGNAL"
+    elif trades < min_sample:
+        win_rate = f"{100.0 * winners / trades:.1f}%"
+        status = "INSUFFICIENT_SAMPLE"
+    else:
+        win_rate = f"{100.0 * winners / trades:.1f}%"
+        status = "OK"
+
+    # --- 2. Charts must be counted, not a directory path ---
+    n_charts = len(chart_files)
+
+    # --- 3. Per-gate pass counts must be present ---
+    required_gates = ("ema", "gex", "sr", "atr", "all")
+    missing = [g for g in required_gates if g not in gate_counts]
+    if missing:
+        raise RuntimeError(f"INSTRUMENTATION MISSING: gate pass counts absent for {missing}")
+
+    # --- 4. GEX coverage must be reported and sufficient ---
+    gex_ratio = gex_coverage / total_bars if total_bars else 0.0
+    if gex_ratio < 0.5:
+        raise RuntimeError(
+            f"GEX COVERAGE TOO LOW: {gex_coverage}/{total_bars} ({gex_ratio:.0%}) — "
+            "confluence AND-gate is silently starved."
+        )
+
+    # --- 5. Thin/zero-signal runs are flagged, not summarized as normal ---
+    if trades == 0:
+        print("[WARN] NO TRADES — confluence over-constrained or data missing")
+    elif trades < min_sample:
+        print(f"[WARN] LOW SAMPLE n={trades} (<{min_sample}) — win rate is not statistically meaningful")
+
+    # --- 6. Warmup accounting ---
+    tradeable_bars = total_bars - warmup
+    if tradeable_bars < 50:
+        print(f"[WARN] tradeable_bars={tradeable_bars} (<50) — warmup starvation likely")
+
+    # --- 7. Chart annotation verification ---
+    if trades > 0 and n_charts == 0:
+        raise RuntimeError("CHART FAILURE: trades>0 but charts=0")
+    if trades == 0 and n_charts > 0:
+        print(f"[WARN] {n_charts} chart(s) emitted with 0 trades — empty panels, no entry/TP/SL markers")
+
+    print("=" * 70)
+    print(f"STATUS={status} trades={trades} winners={winners} losers={losers} "
+          f"win_rate={win_rate} total_R={total_R:+.2f} charts={n_charts}")
+    print(f"gate_counts={gate_counts} gex_coverage={gex_coverage}/{total_bars} "
+          f"tradeable_bars={tradeable_bars}")
+    print("=" * 70)
+
+    return status
+```

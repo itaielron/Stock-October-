@@ -46,8 +46,10 @@ You must output your thought process, and if writing code, wrap it ONLY in a sin
     return answer
 
 if __name__ == "__main__":
-    for i in range(1, 4):
-        print(f"\n=== CYCLE {i} ===")
+    cycle = 1
+    while True:
+        print(f"\n=== CYCLE {cycle} ===")
+        cycle += 1
         print("[1] Waking up DeepSeek Backend Coder...")
         
         current_code = open("real_alpaca_backtester.py").read()
