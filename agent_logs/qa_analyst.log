@@ -9780,3 +9780,44 @@ Then report `bars_evaluated` vs `bars_passed_each_gate`. Without this, we are bl
 ### Action
 
 **Do not rotate timeframes yet.** Fix the gating instrumentation, re-run on the same window, and return with the rejection histogram. A zero-trade result is a bug report, not a backtest.
+
+--- Sat Oct 10 02:57:58 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:57:53Z -> 2026-10-09T23:57:53Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades across 297 SPY + 372 QQQ bars means the gating stack never returned `True`. Given the mandate's hierarchical confluence (GEX → EMA → ATR), the failure is almost certainly a **stacked AND-gate with no fallback**, not a lack of opportunity. Ranked causes:
+
+1. **GEX gate is dead.** Per Mandate #11, the IEX feed has no options data. If the coder left a `gex is None → skip` branch (or a mock proxy that defaults to a non-trading regime), every bar is rejected before EMA/ATR are even evaluated. This is the #1 suspect.
+2. **EMA_200 warm-up starvation.** 297 bars on SPY is ~1.2 trading days of 5m data. `EMA_200` is undefined for the first 200 bars, and `EMA_50 > EMA_200` needs both seeded. On a 1-week window this leaves a tiny valid slice — and if the window is 1m, EMA_200 never stabilizes.
+3. **ATR band too tight.** If `ATR_14` limits were copied from a higher timeframe, 5m ATR will sit outside the band on every bar.
+4. **Macro/event pause stuck ON.** If the economic-calendar parser failed silently and defaulted `Trading_Enabled=False`, nothing fires.
+
+### Required diagnostics before next cycle
+- Log a **per-bar rejection histogram**: count bars killed by GEX vs EMA vs ATR vs macro vs risk-layer. One line of instrumentation ends this guessing game.
+- Print `EMA_50`, `EMA_200`, `ATR_14` min/max/mean per symbol to confirm seeding.
+- Confirm GEX proxy is **neutral-by-default** (e.g., `gex_regime = "trend"` when data absent), never a hard skip.
+
+### Structural fix (do not over-engineer)
+Replace the rigid AND-gate with a **weighted confluence score** (e.g., EMA=2, ATR=1, GEX-proxy=1; fire at ≥3). This preserves independence while preventing a single missing feed from zeroing the system — directly aligned with Mandate #11.
+
+### Mandate compliance check
+- ❌ MTFA (1m–4h) not evidenced in output — only one implicit TF ran.
+- ❌ No charts with entry/TP1/SL markers (nothing to plot).
+- ⚠️ GitHub sync unverified this cycle.
+- ✅ Correctly did **not** crash on missing GEX.
+
+**Action:** Coder adds rejection telemetry + neutral GEX default, re-runs. Do **not** proceed to optimization until trades > 0. No `proven_strategies.md` entry warranted.
