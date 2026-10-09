@@ -9035,3 +9035,47 @@ Without this, we are guessing. Add it now.
 
 ### Next action
 Patch the funnel instrumentation + warmup + GEX-neutral fallback, rerun **one** cycle, and report the funnel. Do not tune thresholds until we see where bars are dying.
+
+--- Sat Oct 10 02:49:48 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:49:42Z -> 2026-10-09T23:49:42Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Trade Deadlock)**
+
+### Root Cause Analysis: Why trades=0
+
+The engine produced **0 signals across 669 bars** on SPY+QQQ. This is not a "no setup" market — it's a **gating logic failure**. Three probable culprits, in order of likelihood:
+
+1. **EMA_200 warmup starvation.** With only 297 SPY bars (~5 trading days of 1m/5m data), `EMA_200` is undefined or NaN for the first 200 bars. If the directional filter is `Close > EMA_50 AND EMA_50 > EMA_200`, and NaN comparisons return `False`, **every bar is silently rejected**. QQQ's 372 bars barely clears the threshold, leaving ~170 usable bars — and if those coincided with a chop regime, zero confluence.
+
+2. **GEX regime gate defaulting to block.** Per Mandate #11, GEX must default to *neutral* (allow both sub-routines). If the coder instead defaulted to `GEX=0 → mean-reversion only`, and the EMA filter demands trend alignment, the two gates are **mutually exclusive** → guaranteed zero trades. This is the classic "confluence contradiction" bug.
+
+3. **ATR "within limits" band too tight.** If `ATR_14` bounds were hardcoded for a higher-vol regime, low-vol bars get filtered out entirely.
+
+### Required Fixes (Coder)
+
+- **Log rejection reasons per bar.** Emit counters: `rejected_ema`, `rejected_gex`, `rejected_atr`, `rejected_macro`. Without this, we're guessing. This is non-negotiable for the next cycle.
+- **Warmup handling:** Either (a) fetch ≥500 bars per symbol, or (b) fall back to `EMA_50 > EMA_20` when `EMA_200` is NaN. Do not silently drop.
+- **GEX neutral = BOTH regimes enabled.** Neutral must widen the gate, never narrow it.
+- **Assert non-zero signal candidates** before the risk layer. If candidates=0, raise a *warning* (not crash) and dump the rejection histogram.
+
+### Structural Note
+
+Zero trades is **worse than a losing strategy** — it means the system cannot be evaluated, cannot learn, and violates Mandate #6 (genetic learning requires winners *and* losers to analyze). The orchestrator must treat `trades=0` as a hard FAIL and force a diagnostic re-run, not a standby.
+
+### Next Cycle Directive
+
+Re-run with rejection-reason telemetry. Do **not** tune parameters until we see *which* gate is killing 100% of bars. Push diagnostic logs to GitHub per Mandate #8.
+
+**Verdict: FAIL — diagnostic instrumentation required before any optimization.**
