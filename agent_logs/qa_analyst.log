@@ -9604,3 +9604,43 @@ This is a **regression**, not a null result. The prior mandate explicitly forbid
 3. Only after trades fire do we evaluate win-rate structure and push to GitHub (Mandate #8).
 
 **No PASS. Optimization loop continues — but fix the gate, don't tune parameters.**
+
+--- Sat Oct 10 02:55:46 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:55:39Z -> 2026-10-09T23:55:39Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[trade] SPY WINNER entry=774.66 sl=773.57 tp1=776.40 tp2=777.49 exit=775.43 (GAP_STOP) R=+1.16 bars=11
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ LOSER entry=761.18 sl=762.12 tp1=759.68 tp2=758.7...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (below 80% target)**
+
+### Structural Diagnosis
+
+**Win rate 75% (6/8), avg_R +0.442.** Passable expectancy, but the win distribution is pathological.
+
+**Why winners "won":** 5 of 6 winners exited via `GAP_STOP` with R = +1.16, +0.06, +0.02, +1.18, +0.07. Only ONE winner (R=+2.10) hit TP2 legitimately. The +0.02/+0.06/+0.07 "wins" are **noise, not edge** — they are gap-fills on 1-bar holds. These are not confluence trades; they are entry/exit slippage artifacts. Strip them and the real sample is 3 trades: +1.16, +1.18, +2.10, −1.00, −0.05 → 60% true win rate.
+
+**Why losers lost:**
+- QQQ `R=-0.05` (1 bar, GAP_STOP): entered and immediately gapped against. Entry was placed into a micro-gap — no confirmation bar. **Root cause: entry on bar close without requiring next-bar follow-through.**
+- QQQ `R=-1.00` (7 bars, STOP): full ATR stop hit. This is the only structurally honest loss. Entry at 754.64, SL 752.98 — likely a counter-trend short against EMA_50 or a mean-reversion trigger in a trending tape.
+
+### Gating Rewrites Required
+
+1. **Minimum hold filter:** Reject any signal whose exit occurs on bar 1 unless R ≥ +0.5. 1-bar GAP_STOPs are not trades — they are data artifacts inflating win rate. Add `if bars_held < 2 and abs(R) < 0.5: discard`.
+2. **Entry confirmation:** Require `Close[t] > High[t-1]` (long) or `Close[t] < Low[t-1]` (short) before firing. Kills the −0.05 gap-entry loser.
+3. **Regime gate:** The −1.00 loser needs GEX-proxy check. Per mandate #11, derive proxy = `sign(EMA_50 − EMA_200) * volume_zscore`. Block mean-reversion shorts when proxy is strongly bullish.
+4. **ATR floor:** Reject setups where `ATR_14 < 0.15% of price` — the +0.02/+0.06 trades occurred in dead volatility.
+
+### MTFA Gap
+No evidence of 1m/3m/15m/1h/4h confluence evaluation in the log. Entry logic appears single-timeframe. **Mandate #5 unmet.**
+
+### Action
+Do NOT append to `proven_strategies.md` — 75% with 3/6 wins being sub-0.1R noise is not a proven cluster. Rotate to 15Min, apply gates 1–4, re-run. Push to GitHub per mandate #8.
+
+**Verdict: FAIL — rewrite gating, re-test.**

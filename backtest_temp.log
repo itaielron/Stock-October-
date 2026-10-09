@@ -1,7 +1,16 @@
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
 ======================================================================
-Confluence-cluster backtest 2026-10-02T23:55:08Z -> 2026-10-09T23:55:08Z symbols=['SPY', 'QQQ']
+Confluence-cluster backtest 2026-10-02T23:55:39Z -> 2026-10-09T23:55:39Z symbols=['SPY', 'QQQ']
 [info] SPY: 297 bars, backtesting...
+[trade] SPY WINNER entry=774.66 sl=773.57 tp1=776.40 tp2=777.49 exit=775.43 (GAP_STOP) R=+1.16 bars=11
 [info] QQQ: 372 bars, backtesting...
+[trade] QQQ LOSER entry=761.18 sl=762.12 tp1=759.68 tp2=758.74 exit=761.13 (GAP_STOP) R=-0.05 bars=1
+[trade] QQQ LOSER entry=754.64 sl=752.98 tp1=757.30 tp2=758.96 exit=752.98 (STOP) R=-1.00 bars=7
+[trade] QQQ WINNER entry=756.93 sl=758.10 tp1=755.05 tp2=753.88 exit=757.00 (GAP_STOP) R=+0.06 bars=1
+[trade] QQQ WINNER entry=757.36 sl=758.08 tp1=756.20 tp2=755.48 exit=757.37 (GAP_STOP) R=+0.02 bars=1
+[trade] QQQ WINNER entry=753.10 sl=751.54 tp1=755.60 tp2=757.16 exit=757.16 (TP2) R=+2.10 bars=6
+[trade] QQQ WINNER entry=752.99 sl=751.46 tp1=755.43 tp2=756.96 exit=754.16 (GAP_STOP) R=+1.18 bars=3
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.82 tp2=748.93 exit=751.31 (GAP_STOP) R=+0.07 bars=1
 ----------------------------------------------------------------------
-SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+SUMMARY trades=8 winners=6 losers=2 win_rate=75.0% total_R=+3.53 avg_R=+0.442 charts=charts/
 ======================================================================
