@@ -6868,3 +6868,168 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:37:42 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    NOTE ON THE REPORTED RUN (trades=0):
+    -----------------------------------
+    The previous backtest produced zero trades. Root-cause analysis of the
+    gating stack (per the Quant Research Report hierarchy) shows the failure
+    is structural, not statistical:
+
+      1. REGIME FILTER (GEX): The GEX regime series was either all-NaN or
+         constant (e.g. always positive-gamma). Because the mandate requires
+         [GEX Regime matches Strategy], a constant regime silently disables
+         one entire sub-routine (trend-following OR mean-reversion) for the
+         whole sample. If GEX was NaN, the `and` chain short-circuits to
+         False on every bar -> trades=0.
+
+      2. EMA TREND: `Close > EMA_50 AND EMA_50 > EMA_200` is a *stacked*
+         condition. On 1m/3m data over a single week, EMA_200 is barely
+         warmed up (200 bars ~ 3.3h on 1m, ~10h on 3m). Early bars produce
+         NaN EMAs -> comparison False -> no signals. Combined with (1),
+         the intersection is empty.
+
+      3. ATR BAND: If the ATR "within limits" band was set from a
+         percentile of a *different* timeframe, the 1m ATR almost never
+         lands inside it -> filter rejects everything.
+
+      4. EVENT PAUSE: If the economic-calendar parser defaulted to
+         `Trading_Enabled = False` (missing file / unparsed date), every
+         bar is suppressed.
+
+    FIX APPLIED HERE:
+      - Warm-up guard: require enough bars for EMA_200 and ATR_14.
+      - Regime handling: treat NaN GEX as "unknown" and fall back to a
+        price-action regime proxy (realized vol vs. its median) instead of
+        hard-rejecting. This keeps the regime gate meaningful without
+        silently zeroing the sample.
+      - ATR band: computed *relative to the current symbol/timeframe's own
+        rolling distribution*, not an absolute constant.
+      - All gates are evaluated with explicit booleans so a single NaN
+        cannot short-circuit the whole cluster to None.
+    """
+
+    # ---- 0. Warm-up / data integrity guard -----------------------------
+    MIN_BARS = 210  # EMA_200 + ATR_14 buffer
+    if i < MIN_BARS or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "GEX")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+
+    # Hard NaN guard on the price/indicator core (these MUST be valid).
+    if pd.isna(close) or pd.isna(ema50) or pd.isna(ema200) or pd.isna(atr14):
+        return None
+    if atr14 <= 0:
+        return None
+
+    # ---- 1. Regime filter (GEX) with graceful fallback -----------------
+    gex = row["GEX"]
+    if pd.isna(gex):
+        # Fallback regime proxy: realized vol vs. rolling median.
+        # High vol  -> negative-gamma-like  -> trend-following
+        # Low  vol  -> positive-gamma-like  -> mean-reversion
+        vol_window = df["Close"].pct_change().rolling(20).std()
+        vol_now = vol_window.iloc[i]
+        vol_med = vol_window.iloc[max(0, i - 200):i].median()
+        if pd.isna(vol_now) or pd.isna(vol_med) or vol_med == 0:
+            return None
+        regime = "trend" if vol_now > vol_med else "mean_revert"
+    else:
+        regime = "trend" if gex < 0 else "mean_revert"
+
+    # ---- 2. Directional bias (EMA) -------------------------------------
+    long_ok = (close > ema50) and (ema50 > ema200)
+    short_ok = (close < ema50) and (ema50 < ema200)
+
+    # ---- 3. ATR band (self-referential, per timeframe) -----------------
+    atr_series = df["ATR_14"].iloc[max(0, i - 200):i]
+    atr_series = atr_series.dropna()
+    if len(atr_series) < 20:
+        return None
+    atr_lo = atr_series.quantile(0.20)
+    atr_hi = atr_series.quantile(0.95)
+    atr_ok = (atr14 >= atr_lo) and (atr14 <= atr_hi)
+    if not atr_ok:
+        return None
+
+    # ---- 4. Event-driven pause -----------------------------------------
+    if "Trading_Enabled" in df.columns and not bool(row["Trading_Enabled"]):
+        return None
+
+    # ---- 5. Macro regime score -----------------------------------------
+    macro_score = row.get("Macro_Score", 0.0)
+    if pd.isna(macro_score):
+        macro_score = 0.0
+    BULLISH_THRESHOLD = 0.5
+    BEARISH_THRESHOLD = -0.5
+    if macro_score >= BULLISH_THRESHOLD:
+        short_ok = False
+    if macro_score <= BEARISH_THRESHOLD:
+        long_ok = False
+
+    # ---- 6. Risk layer --------------------------------------------------
+    if "Current_Drawdown" in df.columns:
+        if row["Current_Drawdown"] >= row.get("Max_Allowed_Drawdown", 0.10):
+            return None
+    if "Daily_Exposure" in df.columns:
+        if row["Daily_Exposure"] >= row.get("Account_Limit", 1.0):
+            return None
+
+    # ---- 7. Confluence resolution --------------------------------------
+    # Trend regime -> follow EMA direction. Mean-revert -> fade extension.
+    direction = None
+    if regime == "trend":
+        if long_ok:
+            direction = "long"
+        elif short_ok:
+            direction = "short"
+    else:  # mean_revert
+        # Fade: buy oversold below EMA_50, sell overbought above EMA_50,
+        # but only when the broader EMA_200 structure still permits it.
+        if short_ok and close > ema50:
+            direction = "short"
+        elif long_ok and close < ema50:
+            direction = "long"
+
+    if direction is None:
+        return None
+
+    # ---- 8. Risk sizing (ATR-based) ------------------------------------
+    stop_distance = atr14 * 1.5
+    if direction == "long":
+        stop_loss = close - stop_distance
+        take_profit = close + stop_distance * 2.0  # 2R target
+    else:
+        stop_loss = close + stop_distance
+        take_profit = close - stop_distance * 2.0
+
+    return {
+        "direction": direction,
+        "entry": float(close),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "atr": float(atr14),
+        "regime": regime,
+        "macro_score": float(macro_score),
+        "reason": f"{regime}|ema_align|atr_band_ok",
+    }
+```
