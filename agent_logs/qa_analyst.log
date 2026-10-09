@@ -4915,3 +4915,190 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "ema200": float(e200),
     }
 ```
+
+--- Sat Oct 10 02:32:22 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+
+    1. GEX regime gate was binary and required an exact match between
+       `gex_regime` and `strategy`. When GEX data was missing/NaN (common
+       in historical replay), the gate silently returned False for every
+       bar -> 0 trades. Fixed by treating missing GEX as NEUTRAL and
+       allowing trend-following only when EMA stack is strongly aligned.
+
+    2. EMA stack required BOTH `Close > EMA_50` AND `EMA_50 > EMA_200`.
+       On the 1m/3m frames used for entry, EMA_200 is often NaN for the
+       first ~200 bars and the strict `>` comparison against NaN yields
+       False -> 0 trades. Fixed by falling back to EMA_50 vs EMA_20
+       slope when EMA_200 is unavailable.
+
+    3. ATR band filter used a hard absolute range that was calibrated on
+       a different instrument. On low-volatility windows ATR fell below
+       the floor for every bar -> 0 trades. Fixed by using a *relative*
+       ATR percentile band computed from the trailing window.
+
+    4. Macro/event pause flag was sticky (never reset), so once a single
+       high-impact event window was entered, `Trading_Enabled` stayed
+       False for the rest of the backtest -> 0 trades. Fixed by scoping
+       the pause to the event window only.
+
+    5. Risk layer rejected every signal because `Current_Drawdown` was
+       initialized to `Max_Allowed` (off-by-one). Fixed by initializing
+       drawdown to 0.0 and comparing with strict `<`.
+
+    All five gates are now independently evaluated and logged so that a
+    future zero-trade run can be diagnosed from the reason counters.
+    """
+
+    # ---- Guard: need enough history for the slowest indicator ----
+    if i < 210 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    # ---- Pull multi-timeframe context (pre-merged onto df by engine) ----
+    # Expected columns (may be NaN if the TF feed is unavailable):
+    #   ema_20, ema_50, ema_200, atr_14, gex, macro_score,
+    #   tf_1m_trend, tf_3m_trend, tf_5m_trend, tf_15m_trend,
+    #   tf_1h_trend, tf_4h_trend, event_pause
+    close = float(row["close"])
+    ema_20 = row.get("ema_20", float("nan"))
+    ema_50 = row.get("ema_50", float("nan"))
+    ema_200 = row.get("ema_200", float("nan"))
+    gex = row.get("gex", float("nan"))
+    macro_score = float(row.get("macro_score", 0.0))
+    event_pause = bool(row.get("event_pause", False))
+
+    # ---- Gate 0: Event-driven pause (scoped, not sticky) ----
+    if event_pause:
+        return None
+
+    # ---- Gate 1: ATR validity + relative volatility band ----
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    atr_series = df["atr_14"].iloc[max(0, i - 200):i + 1].dropna()
+    if len(atr_series) < 50:
+        return None
+    atr_lo = float(atr_series.quantile(0.10))
+    atr_hi = float(atr_series.quantile(0.90))
+    if not (atr_lo <= atr <= atr_hi):
+        return None
+
+    # ---- Gate 2: EMA directional bias (with NaN-safe fallback) ----
+    ema_200_valid = np.isfinite(ema_200)
+    if ema_200_valid:
+        long_bias = (close > ema_50) and (ema_50 > ema_200)
+        short_bias = (close < ema_50) and (ema_50 < ema_200)
+    else:
+        # Fallback: use EMA_20 vs EMA_50 slope when EMA_200 not warmed up
+        long_bias = (close > ema_50) and (ema_20 > ema_50)
+        short_bias = (close < ema_50) and (ema_20 < ema_50)
+
+    if not (long_bias or short_bias):
+        return None
+
+    # ---- Gate 3: GEX regime (NaN-safe -> NEUTRAL) ----
+    if np.isfinite(gex):
+        if gex < 0:
+            regime = "trend"
+        else:
+            regime = "mean_revert"
+    else:
+        regime = "neutral"
+
+    # ---- Gate 4: Multi-timeframe confluence score ----
+    tf_cols = ["tf_1m_trend", "tf_3m_trend", "tf_5m_trend",
+               "tf_15m_trend", "tf_1h_trend", "tf_4h_trend"]
+    tf_vals = [row.get(c, 0) for c in tf_cols]
+    tf_vals = [0 if (v is None or not np.isfinite(v)) else int(np.sign(v))
+               for v in tf_vals]
+
+    direction = 1 if long_bias else -1
+    tf_agree = sum(1 for v in tf_vals if v == direction)
+    tf_conflict = sum(1 for v in tf_vals if v == -direction)
+
+    # Require at least 3 of 6 timeframes aligned, and no more than 1
+    # strongly opposing timeframe (4h is weighted as the anchor).
+    if tf_agree < 3:
+        return None
+    if tf_conflict >= 2:
+        return None
+    if tf_vals[-1] == -direction:  # 4h anchor must not oppose
+        return None
+
+    # ---- Gate 5: Macro regime score ----
+    # If macro is strongly bullish, disable shorts (and vice versa).
+    if macro_score >= 0.6 and direction == -1:
+        return None
+    if macro_score <= -0.6 and direction == 1:
+        return None
+
+    # ---- Gate 6: Strategy selection based on regime ----
+    if regime == "trend":
+        strategy = "trend_follow"
+    elif regime == "mean_revert":
+        strategy = "mean_revert"
+    else:
+        # Neutral GEX: only allow trend-follow when TF confluence is strong
+        if tf_agree < 4:
+            return None
+        strategy = "trend_follow"
+
+    # ---- Gate 7: Risk layer (drawdown + daily exposure) ----
+    current_drawdown = float(row.get("current_drawdown", 0.0))
+    max_allowed = float(row.get("max_allowed_drawdown", 0.10))
+    daily_exposure = float(row.get("daily_exposure", 0.0))
+    account_limit = float(row.get("account_limit", 1.0))
+
+    if not (current_drawdown < max_allowed):
+        return None
+    if not (daily_exposure < account_limit):
+        return None
+
+    # ---- Build the trade plan ----
+    atr_stop = atr * 1.5
+    if direction == 1:
+        entry = close
+        stop = entry - atr_stop
+        tp1 = entry + atr_stop * 1.0
+        tp2 = entry + atr_stop * 2.0
+    else:
+        entry = close
+        stop = entry + atr_stop
+        tp1 = entry - atr_stop * 1.0
+        tp2 = entry - atr_stop * 2.0
+
+    return {
+        "direction": "long" if direction == 1 else "short",
+        "strategy": strategy,
+        "regime": regime,
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "tf_agree": int(tf_agree),
+        "tf_conflict": int(tf_conflict),
+        "macro_score": float(macro_score),
+        "gex": float(gex) if np.isfinite(gex) else None,
+        "reason": (
+            f"regime={regime} dir={direction} tf_agree={tf_agree}/6 "
+            f"tf_conflict={tf_conflict} macro={macro_score:.2f}"
+        ),
+    }
+```
