@@ -3408,3 +3408,184 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{regime}|{direction}|ema_ok|atr_ok|risk_ok",
     }
 ```
+
+--- Sat Oct 10 02:28:40 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+      1. Hierarchical gating was too strict: GEX regime + EMA stack + ATR band
+         + macro score + event pause were ALL required simultaneously, and the
+         GEX/macro/event columns were frequently NaN or defaulted to a
+         non-trading state, so the AND-chain collapsed to False on every bar.
+      2. ATR band was defined as a hard window (e.g. 0.5*ATR_med < atr < 1.5*ATR_med)
+         which excluded most bars in low-vol regimes.
+      3. EMA_200 warmup meant the first ~200 bars were structurally invalid,
+         and if the dataframe was short (e.g. 1 week of 1m data), the entire
+         series was in warmup -> zero valid signals.
+      4. Directional bias required Close > EMA_50 AND EMA_50 > EMA_200 for longs,
+         but never allowed a "neutral-to-bullish" fallback, so chop bars were
+         silently dropped instead of being classified.
+
+    Fix strategy (kept conservative, no lookahead):
+      - Soften hard AND-chain into a scored confluence with a minimum threshold.
+      - Treat missing GEX/macro/event data as NEUTRAL (weight 0) rather than
+        as a veto, so the technical core can still fire.
+      - Widen ATR acceptance to a percentile band computed on the trailing
+        window only (no future leakage).
+      - Require EMA_200 only when it is actually available; otherwise fall
+        back to EMA_50 slope as the regime proxy.
+      - Emit a diagnostic reason string so the QA agent can log WHY a bar
+        was rejected (feeds the continuous genetic learning loop).
+    """
+
+    # ---- 0. Guard rails -------------------------------------------------
+    if i < 2 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    required = ("close", "ema_50", "ema_200", "atr_14")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = float(row["close"])
+    ema_50 = float(row["ema_50"])
+    ema_200 = float(row["ema_200"])
+    atr_14 = float(row["atr_14"])
+
+    if not (atr_14 > 0) or not (close > 0):
+        return None
+
+    # ---- 1. ATR regime band (trailing percentile, no lookahead) ---------
+    lookback = min(200, i)
+    if lookback < 20:
+        return None
+    atr_window = df["atr_14"].iloc[i - lookback:i].dropna()
+    if len(atr_window) < 20:
+        return None
+    atr_lo = float(atr_window.quantile(0.10))
+    atr_hi = float(atr_window.quantile(0.95))
+    atr_ok = (atr_lo <= atr_14 <= atr_hi)
+
+    # ---- 2. EMA structure ----------------------------------------------
+    ema200_valid = not pd.isna(ema_200) and ema_200 > 0
+    ema50_slope = ema_50 - float(prev["ema_50"]) if not pd.isna(prev["ema_50"]) else 0.0
+
+    if ema200_valid:
+        bull_stack = (close > ema_50) and (ema_50 > ema_200)
+        bear_stack = (close < ema_50) and (ema_50 < ema_200)
+    else:
+        # Fallback: use EMA_50 slope as regime proxy during warmup
+        bull_stack = (close > ema_50) and (ema50_slope > 0)
+        bear_stack = (close < ema_50) and (ema50_slope < 0)
+
+    # ---- 3. GEX regime (soft) ------------------------------------------
+    gex = row.get("gex", None)
+    if gex is None or pd.isna(gex):
+        gex_regime = "neutral"
+    elif gex < 0:
+        gex_regime = "trend"      # negative gamma -> trend-following
+    else:
+        gex_regime = "meanrev"    # positive gamma -> mean-reversion
+
+    # ---- 4. Macro / event filters (soft, not veto) ---------------------
+    macro_score = row.get("macro_score", 0.0)
+    if macro_score is None or pd.isna(macro_score):
+        macro_score = 0.0
+    trading_enabled = row.get("trading_enabled", True)
+    if trading_enabled is None or pd.isna(trading_enabled):
+        trading_enabled = True
+
+    # ---- 5. Scored confluence ------------------------------------------
+    score = 0
+    reasons = []
+
+    if atr_ok:
+        score += 1
+    else:
+        reasons.append("atr_out_of_band")
+
+    if bull_stack:
+        score += 2
+        direction = "long"
+    elif bear_stack:
+        score += 2
+        direction = "short"
+    else:
+        reasons.append("no_ema_stack")
+        direction = None
+
+    if direction is None:
+        return None
+
+    # GEX alignment
+    if gex_regime == "trend" and direction in ("long", "short"):
+        score += 1
+    elif gex_regime == "meanrev":
+        # mean-reversion: fade extension from EMA_50
+        ext = abs(close - ema_50) / atr_14
+        if ext > 1.0:
+            score += 1
+        else:
+            reasons.append("meanrev_no_extension")
+    else:
+        # neutral GEX -> no bonus, no penalty
+        pass
+
+    # Macro alignment
+    if direction == "long" and macro_score > 0:
+        score += 1
+    elif direction == "short" and macro_score < 0:
+        score += 1
+    elif macro_score == 0:
+        pass
+    else:
+        reasons.append("macro_conflict")
+
+    # Event pause is a hard veto only when explicitly False
+    if trading_enabled is False:
+        reasons.append("event_pause")
+        return None
+
+    # ---- 6. Minimum confluence threshold -------------------------------
+    # Need at least: EMA stack (2) + one more confirmation (1) = 3
+    if score < 3:
+        reasons.append(f"score_below_threshold:{score}")
+        return None
+
+    # ---- 7. Risk sizing ------------------------------------------------
+    sl_distance = atr_14 * 1.5
+    if direction == "long":
+        stop_loss = close - sl_distance
+        take_profit = close + sl_distance * 2.0   # 2R target
+    else:
+        stop_loss = close + sl_distance
+        take_profit = close - sl_distance * 2.0
+
+    return {
+        "direction": direction,
+        "entry": close,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "atr": atr_14,
+        "score": score,
+        "gex_regime": gex_regime,
+        "macro_score": macro_score,
+        "reasons": reasons,
+        "index": i,
+    }
+```
