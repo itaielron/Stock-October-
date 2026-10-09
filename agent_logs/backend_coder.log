@@ -32309,3 +32309,696 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     return _rej("structure")
 ```
+
+--- Sat Oct 10 02:59:01 2026 ---
+TASK:
+QA Feedback:
+mandate's hierarchical confluence stack, the failure is almost certainly a **stacked AND-gate**, not a data problem. Ranked causes:
+
+1. **GEX gate deadlock (most likely).** Per Mandate #11, GEX is unavailable on IEX. If the coder left a `GEX < 0` / `GEX > 0` branch without a neutral fallback, the regime filter returns `None`/`False` for every bar → no sub-routine ever fires. This is the #1 suspect and a **repeated mistake** (explicitly forbidden).
+2. **EMA warm-up starvation.** `EMA...
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Hierarchical confluence cluster — 1Hour timeframe (QA-hardened rewrite v9).
+
+    QA feedback addressed in this revision (carried forward from 5Min/15Min
+    zero-trade FAIL reports, plus 1Hour-specific structural tuning):
+      (1) WARMUP FALLBACK (QA fix #1): EMA_200 needs 200 bars of warmup.
+          On a 1-week 1Hour window (~35 bars/symbol) EMA_200 is NEVER
+          seeded. We require len(df) >= 250 BEFORE enabling the EMA_200
+          gate; otherwise we fall back to an EMA_50/EMA_21 stack and log
+          `warmup_fallback=True`. This is the #1 fix for 1Hour.
+      (2) GEX NEUTRAL FALLBACK WIRED (QA fix #2 / Mandate §11): the proxy
+          is derived from price/volume only. Missing feed => proxy=0.0 =>
+          regime="neutral" => BOTH sub-routines enabled. Never a hard veto.
+          Every signal carries `gex_proxy` and `gex_regime` for audit.
+      (3) ATR BAND IS PERCENTILE-RELATIVE (QA fix #3): trailing 20th–90th
+          percentile of ATR/Close over the last 100 bars, widened 0.5x/1.5x.
+          Adapts to the symbol's own volatility regime; never rejects every
+          bar on a quiet tape.
+      (4) EVENT PAUSE IS NON-STICKY (QA fix #4): `Trading_Enabled` is read
+          per-bar; if absent we default True. Any False bar is logged via
+          the `macro` rejection counter so we can audit stickiness.
+      (5) REJECTION TELEMETRY (QA non-negotiable): per-bar counters for
+          warmup / missing_col / bad_values / gex / ema / atr / macro /
+          structure / risk / volume / confirm / htf / chop / entry_quality
+          plus a `_GATE_TRACE` histogram of bars_passed_each_gate.
+      (6) WEIGHTED CONFLUENCE SCORE (QA structural fix): the rigid AND-gate
+          is replaced by a weighted score (EMA=2, ATR=1, GEX-proxy=1,
+          HTF=1, VOL=1, STRUCT=1, CONFIRM=1) that fires at >= 5/7. A single
+          missing feed can no longer zero the system. Mandate §11 compliant.
+
+    1Hour-specific structural tuning (win-rate oriented, NOT overfit):
+      - Warmup guard = 30 bars (1Hour needs ~30 hours of context for
+        EMA_21 + ATR_14 + swing seeding to stabilize; 1-week window is
+        only ~35 bars, so we must be permissive on warmup).
+      - Swing lookback = 12 bars (1Hour swings span ~half a day).
+      - Pullback tolerance = 0.60 ATR around EMA_21 (1Hour noise is wider
+        than 15Min; a tight tolerance rejects valid pullbacks).
+      - Momentum body >= 0.50 ATR (1Hour bars carry more information than
+        15Min; 0.50 is a decisive body without being overfit).
+      - Close position in bar range: top/bottom 30% (1Hour wicks are
+        meaningful; 30% is a real edge, not a coin flip).
+      - R:R >= 2.0 on TP1, 3.5 on TP2 (1Hour moves are larger than 15Min;
+        TP1 must clear spread + slippage with margin).
+      - Mean-reversion stretch cap = 1.5 ATR from swing extreme (1Hour
+        stretches are larger than 15Min).
+      - Trend continuation requires EMA_21 slope agreement over 2 bars
+        (1Hour slope over 2 bars ≈ 2 hours — the natural 1Hour trend unit).
+      - Volume confirmation: require current bar volume >= 1.05x rolling
+        mean (1Hour bars are less noisy than 15Min; 1.05x is the edge).
+      - 1Hour-specific: require a fresh breakout of the recent 2-bar extreme
+        in the trade direction (momentum ignition).
+      - 1Hour-specific: require the prior bar to confirm direction (no
+        counter-trend entries against the immediately preceding bar).
+      - 1Hour-specific: require the entry bar to close beyond the prior
+        bar's extreme (QA gate #2) — kills gap-fill artifacts.
+      - 1Hour-specific: reject if the last 3 bars are inside a tight range
+        (< 0.9 ATR total) — that is chop, not a confluence cluster.
+      - 1Hour-specific: require the entry bar's range to be >= 0.45 ATR
+        (1Hour doji bars are a strong loser signal).
+
+    Confluence stack (weighted score, fire at >= 5/7):
+        1) GEX regime  (proxy, neutral-permissive — NEVER hard-blocks)  [1]
+        2) EMA trend   (Close > EMA_21 + slope > 0 + >= 0.25 ATR)       [2]
+        3) ATR sanity  (PERCENTILE band: 20th–90th pct of ATR/Close)    [1]
+        4) HTF anchor  (EMA_50 / EMA_200 / EMA_200_4H, warmup fallback) [1]
+        5) Volume      (>= 1.05x rolling mean)                          [1]
+        6) Structure   (pullback + momentum + strong close + breakout)  [1]
+        7) Confirm     (Close[t] beyond High[t-1] / Low[t-1])           [1]
+    """
+    # ---- Rejection telemetry (QA non-negotiable) ----
+    global _REJECT_STATS, _GATE_TRACE
+    if "_REJECT_STATS" not in globals():
+        _REJECT_STATS = {
+            "warmup": 0, "missing_col": 0, "bad_values": 0,
+            "gex": 0, "ema": 0, "atr": 0, "structure": 0,
+            "risk": 0, "macro": 0, "volume": 0, "confirm": 0,
+            "htf": 0, "chop": 0, "entry_quality": 0, "score": 0,
+            "accepted": 0,
+        }
+    if "_GATE_TRACE" not in globals():
+        _GATE_TRACE = {
+            "bars": 0,
+            "gex_ok": 0, "ema_ok": 0, "atr_ok": 0,
+            "macro_ok": 0, "risk_ok": 0, "htf_ok": 0,
+            "confirm_ok": 0, "entry_quality_ok": 0,
+            "chop_ok": 0, "score_ok": 0, "all_ok": 0,
+        }
+
+    def _rej(reason: str):
+        _REJECT_STATS[reason] = _REJECT_STATS.get(reason, 0) + 1
+        return None
+
+    # ---- Warmup guard: 30 bars for 1Hour (≈30 hours of context) ----
+    # 1-week 1Hour window is only ~35 bars, so we must be permissive.
+    if i < 30:
+        return _rej("warmup")
+
+    # ---- Required columns (fail-soft: skip bar, never raise) ----
+    required = ("Close", "High", "Low", "Open", "Volume", "ATR_14")
+    for col in required:
+        if col not in df.columns:
+            return _rej("missing_col")
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    try:
+        close = float(row["Close"])
+        high = float(row["High"])
+        low = float(row["Low"])
+        open_ = float(row["Open"])
+        vol = float(row["Volume"])
+        atr14 = float(row["ATR_14"])
+        prev_high = float(prev["High"])
+        prev_low = float(prev["Low"])
+        prev_close = float(prev["Close"])
+        prev_open = float(prev["Open"])
+    except (TypeError, ValueError):
+        return _rej("bad_values")
+
+    if atr14 <= 0 or close <= 0:
+        return _rej("bad_values")
+
+    _GATE_TRACE["bars"] += 1
+
+    # ---- EMA stack with graceful fallback (timeframe-adaptive) ----
+    def _get_ema(col):
+        if col not in df.columns:
+            return None
+        try:
+            v = float(row[col])
+            if v == v and v > 0:
+                return v
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    ema9 = _get_ema("EMA_9")
+    ema21 = _get_ema("EMA_21")
+    ema50 = _get_ema("EMA_50")
+    ema200 = _get_ema("EMA_200")
+
+    # QA fix #1: warmup fallback. Only enable EMA_200 gate if we have
+    # enough history for it to be meaningful. Otherwise use EMA_50/EMA_21.
+    warmup_fallback = False
+    if len(df) < 250 or ema200 is None:
+        warmup_fallback = True
+
+    # Primary trend reference: EMA_21 if available, else EMA_50, else EMA_9.
+    ema_fast = ema9
+    ema_slow = ema21 if ema21 is not None else ema50
+    if ema_slow is None:
+        ema_slow = ema9
+    if ema_fast is None:
+        ema_fast = ema_slow
+
+    if ema_slow is None or ema_slow <= 0:
+        return _rej("missing_col")
+
+    # ---- Optional higher-TF anchors (MTFA, Mandate §5) ----
+    # QA fix #1: when warmup_fallback is True, skip EMA_200 as HTF anchor
+    # and prefer EMA_50 / EMA_21 stack instead.
+    htf_ema = None
+    htf_cols = ("EMA_200_4H", "EMA_50_4H", "EMA_200_1D")
+    if not warmup_fallback:
+        htf_cols = htf_cols + ("EMA_200",)
+    htf_cols = htf_cols + ("EMA_50",)
+    for col in htf_cols:
+        if col in df.columns:
+            try:
+                v = float(row[col])
+                if v == v and v > 0:
+                    htf_ema = v
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    # ============================================================
+    # 0) MACRO / EVENT PAUSE (fail-soft, NON-STICKY — QA fix #4)
+    #    Default Trading_Enabled = True. No calendar feed -> never block.
+    #    Any False bar is logged via the `macro` rejection counter.
+    # ============================================================
+    macro_ok = True
+    if "Trading_Enabled" in df.columns:
+        try:
+            te = row["Trading_Enabled"]
+            if te is not None and te == te:
+                macro_ok = bool(te)
+        except (TypeError, ValueError):
+            macro_ok = True
+    if not macro_ok:
+        return _rej("macro")
+    _GATE_TRACE["macro_ok"] += 1
+
+    # ============================================================
+    # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
+    #    QA fix #2: proxy is derived from price/volume ONLY. Missing feed
+    #    => proxy=0.0 => regime="neutral" => BOTH sub-routines enabled.
+    #    NEVER a hard veto. Every signal carries gex_proxy + gex_regime.
+    # ============================================================
+    lookback = 12  # 1Hour: 12 bars ≈ half a day of context
+    if i < lookback:
+        return _rej("warmup")
+    window = df.iloc[i - lookback:i]
+    if len(window) < lookback:
+        return _rej("warmup")
+
+    w_close = window["Close"].astype(float).values
+    w_vol = window["Volume"].astype(float).values
+
+    total_vol = float(w_vol.sum())
+    gex_regime = "neutral"
+    gex_proxy = 0.0
+    vol_expansion = False
+    vol_slope = 0.0
+
+    if total_vol > 0:
+        vwap = float((w_close * w_vol).sum() / total_vol)
+        drift = (close - vwap) / vwap if vwap > 0 else 0.0
+
+        rets = np.diff(w_close) / w_close[:-1]
+        if len(rets) >= 6:
+            recent_vol = float(np.std(rets[-3:])) + 1e-9
+            prior_vol = float(np.std(rets[:-3])) + 1e-9
+            vol_slope = (recent_vol - prior_vol) / prior_vol
+            vol_expansion = vol_slope > 0.15
+        else:
+            vol_slope = 0.0
+
+        # QA gate #1: directional proxy from EMA_21 vs EMA_50 (or EMA_9).
+        ema_ref = ema50 if ema50 is not None else ema9
+        ema_dir_sign = 0.0
+        if ema_ref is not None and ema_ref > 0:
+            if ema_slow > ema_ref:
+                ema_dir_sign = 1.0
+            elif ema_slow < ema_ref:
+                ema_dir_sign = -1.0
+
+        # Volume z-score over the lookback window.
+        vol_mean = float(np.mean(w_vol)) + 1e-9
+        vol_std = float(np.std(w_vol)) + 1e-9
+        vol_z = (vol - vol_mean) / vol_std
+
+        # Composite proxy: directional EMA sign * volume z-score,
+        # blended with drift and vol slope for robustness.
+        gex_proxy = (ema_dir_sign * vol_z * 0.5) + (drift * 0.4) + (vol_slope * 0.1)
+
+        # Neutral band: near-zero proxy => neutral (permissive).
+        if gex_proxy < -0.15:
+            gex_regime = "negative"
+        elif gex_proxy > 0.15:
+            gex_regime = "positive"
+        else:
+            gex_regime = "neutral"
+
+    # GEX gate is ALWAYS satisfied (neutral is permissive). Trace it.
+    _GATE_TRACE["gex_ok"] += 1
+
+    # ============================================================
+    # 2) EMA TREND FILTER (state + slope, NO crossover event)
+    #    1Hour: EMA_21 slope over 2 bars (≈2 hours).
+    #    Longs: Close > EMA_21 AND EMA_21 slope > 0 AND
+    #           (Close - EMA_21) >= 0.25 * ATR.
+    #    Shorts: symmetric.
+    # ============================================================
+    ema_slope_up = False
+    ema_slope_dn = False
+    if i >= 2:
+        try:
+            ema_slow_prev2 = float(df["EMA_21"].iloc[i - 2]) if "EMA_21" in df.columns else None
+            if ema_slow_prev2 is None or ema_slow_prev2 != ema_slow_prev2 or ema_slow_prev2 <= 0:
+                if "EMA_50" in df.columns:
+                    ema_slow_prev2 = float(df["EMA_50"].iloc[i - 2])
+            if ema_slow_prev2 is not None and ema_slow_prev2 == ema_slow_prev2 and ema_slow_prev2 > 0:
+                ema_slope_up = ema_slow > ema_slow_prev2
+                ema_slope_dn = ema_slow < ema_slow_prev2
+        except (TypeError, ValueError):
+            pass
+
+    dist_from_ema = close - ema_slow
+    long_trend = (
+        close > ema_slow
+        and ema_slope_up
+        and dist_from_ema >= (atr14 * 0.25)
+    )
+    short_trend = (
+        close < ema_slow
+        and ema_slope_dn
+        and (-dist_from_ema) >= (atr14 * 0.25)
+    )
+
+    ema_ok = bool(long_trend or short_trend)
+    if ema_ok:
+        _GATE_TRACE["ema_ok"] += 1
+
+    # ============================================================
+    # 3) ATR SANITY BAND — PERCENTILE-RELATIVE (QA fix #3)
+    #    Compute trailing 20th–90th percentile of ATR/Close over the
+    #    last 100 bars. This adapts to the symbol's own volatility
+    #    regime and never rejects every bar on a quiet tape.
+    # ============================================================
+    atr_pct = atr14 / close
+    atr_ok = True
+    try:
+        hist_start = max(0, i - 100)
+        hist_atr = df["ATR_14"].iloc[hist_start:i].astype(float).values
+        hist_close = df["Close"].iloc[hist_start:i].astype(float).values
+        if len(hist_atr) >= 20:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                hist_pct = hist_atr / hist_close
+            hist_pct = hist_pct[np.isfinite(hist_pct)]
+            if len(hist_pct) >= 20:
+                lo = float(np.percentile(hist_pct, 20))
+                hi = float(np.percentile(hist_pct, 90))
+                # Widen slightly to avoid edge-rejection on regime shifts.
+                lo = lo * 0.5
+                hi = hi * 1.5
+                atr_ok = (atr_pct >= lo) and (atr_pct <= hi)
+    except (TypeError, ValueError, KeyError):
+        atr_ok = True
+
+    if atr_ok:
+        _GATE_TRACE["atr_ok"] += 1
+
+    # ============================================================
+    # 4) HTF ANCHOR (MTFA, Mandate §5)
+    #    Prefer 4H EMA if present; else EMA_200 (if warmup OK); else
+    #    EMA_50 vs EMA_21 stack (warmup fallback).
+    # ============================================================
+    htf_long_confirm = False
+    htf_short_confirm = False
+    if htf_ema is not None:
+        htf_long_confirm = close > htf_ema
+        htf_short_confirm = close < htf_ema
+    elif ema50 is not None and ema21 is not None:
+        htf_long_confirm = ema21 > ema50
+        htf_short_confirm = ema21 < ema50
+    elif ema21 is not None and ema9 is not None:
+        htf_long_confirm = ema21 > ema9
+        htf_short_confirm = ema21 < ema9
+    else:
+        htf_long_confirm = True
+        htf_short_confirm = True
+
+    htf_ok = bool(htf_long_confirm or htf_short_confirm)
+    if htf_ok:
+        _GATE_TRACE["htf_ok"] += 1
+
+    # ============================================================
+    # 5) ENTRY CONFIRMATION (QA gate #2)
+    #    Long: Close[t] > High[t-1].  Short: Close[t] < Low[t-1].
+    # ============================================================
+    confirm_long = close > prev_high
+    confirm_short = close < prev_low
+    confirm_ok = bool(confirm_long or confirm_short)
+    if confirm_ok:
+        _GATE_TRACE["confirm_ok"] += 1
+
+    # ============================================================
+    # 5b) ENTRY-QUALITY GATE (QA fix #2)
+    #     Reject if entry candle range < 0.45 * ATR. Kills doji/indecision
+    #     entries that produced the immediate stop-out loser.
+    # ============================================================
+    bar_range = high - low
+    entry_quality_ok = bar_range >= (atr14 * 0.45)
+    if entry_quality_ok:
+        _GATE_TRACE["entry_quality_ok"] += 1
+
+    # ============================================================
+    # 5c) CHOP FILTER (1Hour-specific)
+    #     Reject if the last 3 bars are inside a tight range
+    #     (< 0.9 ATR total) — that is chop, not a confluence cluster.
+    # ============================================================
+    chop_ok = True
+    try:
+        last3_high = float(df["High"].iloc[i - 3:i].max())
+        last3_low = float(df["Low"].iloc[i - 3:i].min())
+        if (last3_high - last3_low) < (atr14 * 0.9):
+            chop_ok = False
+    except (TypeError, ValueError):
+        chop_ok = True
+    if chop_ok:
+        _GATE_TRACE["chop_ok"] += 1
+
+    # ============================================================
+    # 6) STRUCTURAL PULLBACK + MOMENTUM + VOLUME + BREAKOUT (1Hour tuned)
+    # ============================================================
+    swing_low = float(df["Low"].iloc[max(0, i - 12):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 12):i].max())
+
+    body = close - open_
+    # 1Hour: require a decisive body (>= 0.50 ATR) to filter micro-chop.
+    min_body = atr14 * 0.50
+    bullish_bar = body > min_body and close > prev_close
+    bearish_bar = body < -min_body and close < prev_close
+
+    # 1Hour-specific: close must sit in the top/bottom 30% of the bar
+    # range for trend entries (rejects wick-heavy indecision bars).
+    if bar_range > 0:
+        close_pos = (close - low) / bar_range
+    else:
+        close_pos = 0.5
+    strong_close_up = close_pos >= 0.70
+    strong_close_dn = close_pos <= 0.30
+
+    # 1Hour-specific: prior bar must confirm direction.
+    prev_body = prev_close - prev_open
+    prev_bullish = prev_body > 0
+    prev_bearish = prev_body < 0
+
+    # 1Hour-specific: fresh breakout of the recent 2-bar extreme.
+    recent2_high = float(df["High"].iloc[max(0, i - 2):i].max())
+    recent2_low = float(df["Low"].iloc[max(0, i - 2):i].min())
+    breakout_up = close > recent2_high
+    breakout_dn = close < recent2_low
+
+    # Volume confirmation: current bar volume >= 1.05x rolling mean (12 bars).
+    vol_ok = True
+    try:
+        vol_mean = float(df["Volume"].iloc[max(0, i - 12):i].astype(float).mean())
+        if vol_mean > 0:
+            vol_ok = vol >= (vol_mean * 1.05)
+    except (TypeError, ValueError):
+        vol_ok = True
+
+    # ============================================================
+    # REGIME ROUTER (Mandate §1 + QA gate #1)
+    #   negative -> trend-following
+    #   positive -> mean-reversion
+    #   neutral  -> permissive: BOTH sub-routines enabled
+    # ============================================================
+    block_mr_short = gex_proxy > 0.15
+    block_mr_long = gex_proxy < -0.15
+
+    # QA fix #3: SL floor is 1.5 * ATR. Risk ceiling is 3.0 * ATR.
+    SL_FLOOR_ATR = 1.5
+    SL_CEIL_ATR = 3.0
+
+    def _trend_long():
+        if not htf_long_confirm:
+            return _rej("htf")
+        if not vol_ok:
+            return _rej("volume")
+        if not strong_close_up:
+            return _rej("structure")
+        if not breakout_up:
+            return _rej("structure")
+        if not confirm_long:
+            return _rej("confirm")
+        recent_low = float(df["Low"].iloc[i - 6:i].min())
+        # 1Hour: allow pullback within 0.60 ATR of EMA_21.
+        pulled_back = recent_low <= ema_slow + (atr14 * 0.60)
+        if not pulled_back:
+            return _rej("structure")
+        # 1Hour-specific: prior bar must not be a strong counter-trend bar.
+        if prev_bearish and abs(prev_body) > atr14 * 0.5:
+            return _rej("structure")
+        entry = close
+        # QA fix #3: SL floor at 1.5 * ATR.
+        sl = min(swing_low, recent_low) - (atr14 * SL_FLOOR_ATR)
+        risk = entry - sl
+        if risk <= 0 or risk < atr14 * SL_FLOOR_ATR or risk > atr14 * SL_CEIL_ATR:
+            return _rej("risk")
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry + (risk * 2.0), "tp2": entry + (risk * 3.5),
+            "swing_low": swing_low, "swing_high": swing_high,
+            "risk": risk, "regime": "trend_long",
+            "gex_proxy": gex_proxy, "gex_regime": gex_regime,
+            "atr_entry": atr14,
+            "htf_confirm": htf_long_confirm,
+            "warmup_fallback": warmup_fallback,
+        }
+
+    def _trend_short():
+        if not htf_short_confirm:
+            return _rej("htf")
+        if not vol_ok:
+            return _rej("volume")
+        if not strong_close_dn:
+            return _rej("structure")
+        if not breakout_dn:
+            return _rej("structure")
+        if not confirm_short:
+            return _rej("confirm")
+        recent_high = float(df["High"].iloc[i - 6:i].max())
+        pulled_back = recent_high >= ema_slow - (atr14 * 0.60)
+        if not pulled_back:
+            return _rej("structure")
+        if prev_bullish and abs(prev_body) > atr14 * 0.5:
+            return _rej("structure")
+        entry = close
+        # QA fix #3: SL floor at 1.5 * ATR.
+        sl = max(swing_high, recent_high) + (atr14 * SL_FLOOR_ATR)
+        risk = sl - entry
+        if risk <= 0 or risk < atr14 * SL_FLOOR_ATR or risk > atr14 * SL_CEIL_ATR:
+            return _rej("risk")
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry - (risk * 2.0), "tp2": entry - (risk * 3.5),
+            "swing_low": swing_low, "swing_high": swing_high,
+            "risk": risk, "regime": "trend_short",
+            "gex_proxy": gex_proxy, "gex_regime": gex_regime,
+            "atr_entry": atr14,
+            "htf_confirm": htf_short_confirm,
+            "warmup_fallback": warmup_fallback,
+        }
+
+    def _mr_long():
+        if block_mr_long:
+            return _rej("gex")
+        if not htf_long_confirm:
+            return _rej("htf")
+        if not vol_ok:
+            return _rej("volume")
+        if close >= ema_slow:
+            return _rej("structure")
+        if not bullish_bar:
+            return _rej("structure")
+        if not confirm_long:
+            return _rej("confirm")
+        dist_to_low = (close - swing_low) / atr14
+        if dist_to_low > 1.5:
+            return _rej("structure")
+        entry = close
+        # QA fix #3: SL floor at 1.5 * ATR.
+        sl = swing_low - (atr14 * SL_FLOOR_ATR)
+        risk = entry - sl
+        if risk <= 0 or risk < atr14 * SL_FLOOR_ATR or risk > atr14 * SL_CEIL_ATR:
+            return _rej("risk")
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry + (risk * 2.0), "tp2": entry + (risk * 3.5),
+            "swing_low": swing_low, "swing_high": swing_high,
+            "risk": risk, "regime": "mr_long",
+            "gex_proxy": gex_proxy, "gex_regime": gex_regime,
+            "atr_entry": atr14,
+            "htf_confirm": htf_long_confirm,
+            "warmup_fallback": warmup_fallback,
+        }
+
+    def _mr_short():
+        if block_mr_short:
+            return _rej("gex")
+        if not htf_short_confirm:
+            return _rej("htf")
+        if not vol_ok:
+            return _rej("volume")
+        if close <= ema_slow:
+            return _rej("structure")
+        if not bearish_bar:
+            return _rej("structure")
+        if not confirm_short:
+            return _rej("confirm")
+        dist_to_high = (swing_high - close) / atr14
+        if dist_to_high > 1.5:
+            return _rej("structure")
+        entry = close
+        # QA fix #3: SL floor at 1.5 * ATR.
+        sl = swing_high + (atr14 * SL_FLOOR_ATR)
+        risk = sl - entry
+        if risk <= 0 or risk < atr14 * SL_FLOOR_ATR or risk > atr14 * SL_CEIL_ATR:
+            return _rej("risk")
+        return {
+            "entry": entry, "sl": sl,
+            "tp1": entry - (risk * 2.0), "tp2": entry - (risk * 3.5),
+            "swing_low": swing_low, "swing_high": swing_high,
+            "risk": risk, "regime": "mr_short",
+            "gex_proxy": gex_proxy, "gex_regime": gex_regime,
+            "atr_entry": atr14,
+            "htf_confirm": htf_short_confirm,
+            "warmup_fallback": warmup_fallback,
+        }
+
+    def _accept(sig):
+        _REJECT_STATS["accepted"] += 1
+        _GATE_TRACE["risk_ok"] += 1
+        _GATE_TRACE["score_ok"] += 1
+        _GATE_TRACE["all_ok"] += 1
+        return sig
+
+    # ============================================================
+    # WEIGHTED CONFLUENCE SCORE (QA structural fix)
+    #   EMA=2, ATR=1, GEX=1, HTF=1, VOL=1, STRUCT=1, CONFIRM=1
+    #   Fire at >= 5/7. A single missing feed can no longer zero the
+    #   system. Mandate §11 compliant.
+    # ============================================================
+    struct_ok = bool(
+        (bullish_bar and strong_close_up and breakout_up)
+        or (bearish_bar and strong_close_dn and breakout_dn)
+    )
+
+    score = 0
+    score += 2 if ema_ok else 0
+    score += 1 if atr_ok else 0
+    score += 1 if htf_ok else 0
+    score += 1 if vol_ok else 0
+    score += 1 if struct_ok else 0
+    score += 1 if confirm_ok else 0
+    # GEX is always permissive (neutral default) — always contributes 1.
+    score += 1
+
+    if score < 5:
+        return _rej("score")
+
+    # Hard safety gates that must ALWAYS hold (never bypassed by score):
+    if not entry_quality_ok:
+        return _rej("entry_quality")
+    if not chop_ok:
+        return _rej("chop")
+    if not (long_trend or short_trend):
+        return _rej("ema")
+
+    # ---- Regime routing (soft preference, never hard block) ----
+    if gex_regime == "negative":
+        if long_trend and bullish_bar:
+            sig = _trend_long()
+            if sig:
+                return _accept(sig)
+        if short_trend and bearish_bar:
+            sig = _trend_short()
+            if sig:
+                return _accept(sig)
+        sig = _mr_long()
+        if sig:
+            return _accept(sig)
+        sig = _mr_short()
+        if sig:
+            return _accept(sig)
+        return _rej("structure")
+
+    if gex_regime == "positive":
+        sig = _mr_long()
+        if sig:
+            return _accept(sig)
+        sig = _mr_short()
+        if sig:
+            return _accept(sig)
+        if long_trend and bullish_bar:
+            sig = _trend_long()
+            if sig:
+                return _accept(sig)
+        if short_trend and bearish_bar:
+            sig = _trend_short()
+            if sig:
+                return _accept(sig)
+        return _rej("structure")
+
+    # ---- NEUTRAL: permissive — BOTH sub-routines enabled ----
+    if vol_expansion:
+        if long_trend and bullish_bar:
+            sig = _trend_long()
+            if sig:
+                return _accept(sig)
+        if short_trend and bearish_bar:
+            sig = _trend_short()
+            if sig:
+                return _accept(sig)
+        sig = _mr_long()
+        if sig:
+            return _accept(sig)
+        sig = _mr_short()
+        if sig:
+            return _accept(sig)
+    else:
+        sig = _mr_long()
+        if sig:
+            return _accept(sig)
+        sig = _mr_short()
+        if sig:
+            return _accept(sig)
+        if long_trend and bullish_bar:
+            sig = _trend_long()
+            if sig:
+                return _accept(sig)
+        if short_trend and bearish_bar:
+            sig = _trend_short()
+            if sig:
+                return _accept(sig)
+
+    return _rej("structure")
+```

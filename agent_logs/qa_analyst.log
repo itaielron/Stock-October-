@@ -9857,3 +9857,36 @@ Zero trades means the entry gate never evaluated `True`. Given the mandate's hie
 A 0-trade week is **not** a "no-setup" market — it is a **logic bug**. Per Mandate #6, we cannot learn from losers if we never enter. Fix the gate, add telemetry, re-run. Do **not** proceed to multi-timeframe rotation until at least one timeframe produces trades.
 
 **Next action:** Coder patches GEX fallback + gate telemetry → re-run SPY/QQQ 5m → return for QA.
+
+--- Sat Oct 10 02:59:09 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:59:02Z -> 2026-10-09T23:59:02Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=756.27 sl=758.06 tp1=752.69 tp2=750.01 exit=756.29 (GAP_STOP) R=+0.01 bars=1
+[trade] QQQ WINNER entry=750.59 sl=751.36 tp1=749.04 tp2=747.8...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (statistically void)**
+
+### Why this is not a PASS
+100% win rate on **2 trades** is noise, not edge. Both "winners" exited via `GAP_STOP` at **R=+0.01 and +0.03** — these are not wins, they are **scratch exits** caused by the stop being placed *inside* the entry bar's range. The engine is booking microscopic positive R as "WINNER," which corrupts the win-rate metric and would falsely trigger the Smart Sleep Protocol (Mandate #9). Do not halt optimization on this.
+
+### Structural failure diagnosis (Mandate #6)
+1. **Stop placement is inverted.** For a short: `entry=756.27, sl=758.06` → SL is only 1.79 above entry, but `tp1=752.69` is 3.58 below. That's a ~2:1 R:R *intended*, yet the trade closed at 756.29 (≈entry) in **1 bar**. The SL is being hit by normal bar noise, not by adverse trend. ATR×1.5 is not being applied — the SL distance looks like a fixed tick offset.
+2. **GAP_STOP on bar 1 = entry-bar whipsaw.** Both trades died on the entry bar. This means the signal fires *after* the move, and the next tick reverses through the stop. Classic late-entry / no-pullback-entry bug.
+3. **Only 2 trades across 297+372 bars.** The gating stack (GEX regime + EMA50/200 + ATR band + macro score + event pause) is over-constrained. With GEX unavailable (Mandate #11), the neutral-GEX branch is likely rejecting nearly everything, or the EMA50>EMA200 filter is misaligned on the 1m/3m feeds.
+
+### Required fixes before next cycle
+- **Reject scratch exits:** any `|R| < 0.5` must be logged as `FLAT`, not `WINNER`. Recompute win_rate excluding flats.
+- **Enforce ATR stop:** `SL = entry ± ATR14×1.5`. Log the ATR value per trade to prove it's applied.
+- **Entry-bar guard:** forbid SL/TP evaluation on the signal bar itself; start from bar+1.
+- **Loosen gates:** with GEX neutral, require only EMA alignment + ATR band. Log a rejection counter per gate so we can see which filter is starving the system.
+- **Minimum sample:** do not grade any run with `trades < 30`. Mark as `INSUFFICIENT_SAMPLE`.
+
+### Verdict
+**Do NOT enter standby.** Push fixes to GitHub (Mandate #8), rerun, and report per-gate rejection counts plus ATR values. Current output proves the pipeline runs but the execution layer is broken — not that a strategy exists.
