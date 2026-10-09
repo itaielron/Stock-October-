@@ -434,41 +434,88 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Cluster:
-      1. Fresh EMA9/EMA21 bullish crossover.
-      2. Price within DISTANCE_GATE_ATR * ATR of EMA9.
-      3. Structure: breakout above swing high OR bounce off swing low.
-      4. ATR regime filter.
-      5. Minimum risk gate.
+    Hardened cluster (v2):
+      1. EMA trend alignment (EMA9 > EMA21) AND fresh crossover OR
+         pullback continuation (close > EMA50 regime filter).
+      2. Price within DISTANCE_GATE_ATR * ATR of EMA9 (not extended).
+      3. Structure: breakout above swing high OR bounce off swing low,
+         with momentum confirmation (close > prior close).
+      4. ATR regime filter (avoid dead / chaotic vol).
+      5. Minimum risk gate + max risk gate (avoid runaway stops).
+      6. Reject if price is already overextended from EMA21 (chase filter).
     """
+    if i < 2 or i >= len(df):
+        return None
+
     row = df.iloc[i]
     prev = df.iloc[i - 1]
+    prev2 = df.iloc[i - 2]
 
-    # --- 1. fresh bullish crossover --------------------------------------
-    crossover = (float(row["EMA9"]) > float(row["EMA21"]))
-    if not crossover:
+    # --- required columns -------------------------------------------------
+    for col in ("EMA9", "EMA21", "Close", "High", "Low"):
+        if col not in df.columns:
+            return None
+
+    ema9 = float(row["EMA9"])
+    ema21 = float(row["EMA21"])
+    close = float(row["Close"])
+    prev_close = float(prev["Close"])
+
+    if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
+        return None
+    if atr <= 0 or not np.isfinite(atr):
+        return None
+
+    # --- 1. trend alignment + freshness ----------------------------------
+    # Base trend must be bullish.
+    if not (ema9 > ema21):
+        return None
+
+    # Fresh crossover OR healthy pullback continuation.
+    fresh_cross = (float(prev["EMA9"]) <= float(prev["EMA21"]))
+    # Continuation: EMA9 was already above EMA21 for a few bars, but price
+    # is pulling back toward EMA9 without breaking trend.
+    continuation = (
+        float(prev2["EMA9"]) > float(prev2["EMA21"])
+        and close > ema21
+        and prev_close <= float(prev["EMA9"]) + 0.25 * atr  # was near/under EMA9
+    )
+    if not (fresh_cross or continuation):
         return None
 
     # --- 4. ATR regime filter --------------------------------------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
-        if atr < ATR_REGIME_MIN_RATIO * atr_mean:
+        ratio = atr / atr_mean
+        if ratio < ATR_REGIME_MIN_RATIO:
+            return None
+        # Reject chaotic vol spikes (whipsaw risk).
+        if ratio > 2.5:
             return None
 
-    # --- 2. distance gate ------------------------------------------------
-    cur_ema9 = float(row["EMA9"])
-    close = float(row["Close"])
-    if abs(close - cur_ema9) > DISTANCE_GATE_ATR * atr:
+    # --- 2. distance gate (don't chase) ----------------------------------
+    if abs(close - ema9) > DISTANCE_GATE_ATR * atr:
+        return None
+    # Extra chase filter: price must not be too far above EMA21 either.
+    if (close - ema21) > 2.0 * atr:
         return None
 
     # --- 3. structure: swing levels --------------------------------------
     win_lo = max(0, i - LOOKBACK)
+    if i - win_lo < 5:
+        return None
     recent_swing_low = float(df["Low"].iloc[win_lo:i].min())
     recent_swing_high = float(df["High"].iloc[win_lo:i].max())
 
     breakout = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
     if not (breakout or at_support):
+        return None
+
+    # Momentum confirmation: bar must be green and above prior close.
+    if close <= prev_close:
+        return None
+    if close <= float(row["Open"]) if "Open" in df.columns else False:
         return None
 
     # --- structural stop --------------------------------------------------
@@ -478,8 +525,11 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     risk = close - sl
 
-    # --- 5. minimum risk gate --------------------------------------------
+    # --- 5. risk gates ----------------------------------------------------
     if risk < MIN_RISK_ATR * atr:
+        return None
+    # Cap risk so a single trade can't blow the account.
+    if risk > 3.0 * atr:
         return None
 
     # --- structural targets ----------------------------------------------
@@ -489,6 +539,10 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         tp2 = min(tp2_struct, recent_swing_high)
     else:
         tp2 = tp2_struct
+
+    # Ensure TP1 has at least 1R of room (sanity).
+    if tp1 <= close:
+        return None
 
     return {
         "entry": close,
@@ -500,14 +554,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "risk": risk,
         "breakout": breakout,
         "at_support": at_support,
-    }
-
-
-# ---------------------------------------------------------------------------
-# BACKTEST
-# ---------------------------------------------------------------------------
-
-def run_backtest(start: str | None = None,
+        "fresh_cross": fresh_cross,
+        "continuation": continuation,
+    }def run_backtest(start: str | None = None,
                  end: str | None = None,
                  symbols: list[str] | None = None):
     """
