@@ -8560,3 +8560,32 @@ This isolates which gate is killing 100% of signals. Without it, we are guessing
 
 **Grade: BLOCKED — resubmit with populated output + gate trace.**
 **Orchestrator: do NOT rotate timeframe; fix instrumentation first.**
+
+--- Sat Oct 10 02:44:06 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate. If trades=0, explain why....
+RESPONSE:
+**QA Evaluation — No Backtest Output Received**
+
+I cannot evaluate this cycle. The "Backtest Output" field is empty — no trade log, no metrics, no chart artifacts were passed to me. Per mandate #4 and #6, I cannot grade or deduce structural win/loss reasons without data.
+
+**If trades = 0, the likely causes (in priority order):**
+
+1. **GEX regime gate never matched.** If the GEX feed returned `NaN`/`0` or was unavailable for the test window, the regime filter (`GEX < 0` → trend, `GEX > 0` → mean-reversion) would fail closed and suppress every signal. This is the #1 silent killer in this stack.
+2. **EMA stack too strict.** Requiring `Close > EMA_50 AND EMA_50 > EMA_200` on 1m/3m data over a single week often yields zero qualifying bars in chop. On 1m, EMA_200 ≈ 3.3 hours of history — the stack rarely aligns cleanly.
+3. **ATR band filter.** If `ATR_14` was clamped to a narrow min/max window, low-volatility sessions (Asian range) get filtered out entirely.
+4. **Macro/event pause.** If the economic calendar parser defaulted to `Trading_Enabled = False` (e.g., missing calendar file → fail-safe off), all signals drop.
+5. **Screener pre-filter.** `Volume > 1M AND Price > SMA_200` on a low-liquidity ticker or off-hours window returns an empty universe before signal generation even runs.
+6. **Risk layer veto.** `Current_Drawdown >= Max_Allowed` or `Daily_Exposure >= Account_Limit` initialized to zero/None → every signal dropped.
+
+**Required to proceed — please resubmit with:**
+- Trade count per timeframe (1m, 3m, 5m, 15m, 1h, 4h)
+- Signal-funnel counts: `raw_signals → after_GEX → after_EMA → after_ATR → after_macro → after_risk → executed`
+- GEX data source status (rows loaded, null %)
+- Chart PNGs with entry arrows + TP1/SL markers (mandate #4)
+
+**Grade: INCOMPLETE — cannot PASS.** No code rewrite authorized (mandate #9) until I see the funnel. Once submitted, I will identify the exact gate zeroing the pipeline and recommend the minimal unblocking change — not a rewrite.
+
+**Standby status:** Optimization engine should NOT rotate timeframes yet; we have no proven strategy to log.

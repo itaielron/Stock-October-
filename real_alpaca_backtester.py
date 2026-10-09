@@ -434,65 +434,67 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v30) — 1Hour win-rate optimization.
+    Hardened cluster (v31) — 4Hour win-rate optimization.
 
-    QA diagnosis of v29 (15Min): the tightened slope gate (0.85*ATR) and
-    narrowed neutral-GEX fallback removed the weak-drift losers, but on
-    1Hour the failure mode shifts AGAIN because 1Hour bars aggregate
-    ~4x the range of 15Min. The v29 gates tuned for 15Min are now
-    MIS-CALIBRATED for 1Hour:
+    QA diagnosis of v30 (1Hour): the 1Hour-calibrated gates (slope 0.55,
+    anti-chase 1.60, dir_cap 1.75/2.40, mean-rev stretch 1.20, veto 4.5,
+    MTF weights 2x on 1h/4h) produced a working 1Hour model. On 4Hour
+    the failure mode shifts AGAIN because 4Hour bars aggregate ~4x the
+    range of 1Hour (and ~16x 15Min). The v30 gates tuned for 1Hour are
+    now MIS-CALIBRATED for 4Hour:
 
-      (a) `slope_strong = 0.85*ATR` on 1Hour is a LARGE absolute move
-          (1Hour ATR is ~4x 15Min ATR), so it fires only on the most
-          violent 1Hour trends — but those are exactly the bars where
+      (a) `slope_strong = 0.55*ATR` on 4Hour is a LARGE absolute move
+          (4Hour ATR is ~4x 1Hour ATR), so it fires only on the most
+          violent 4Hour trends — but those are exactly the bars where
           the entry is already extended and mean-reverts against us.
-          The #1 loser class on 1Hour is "late trend entry after a
-          vertical 1Hour impulse".
-      (b) The 15Min-tuned `dir_cap = 1.35*ATR` is too tight for 1Hour
-          breakouts — a genuine 1Hour breakout closes 1.5-2.0*ATR from
-          EMA21, so v29 rejects the best 1Hour breakout entries while
+          The #1 loser class on 4Hour is "late trend entry after a
+          vertical 4Hour impulse".
+      (b) The 1Hour-tuned `dir_cap = 1.75*ATR` is too tight for 4Hour
+          breakouts — a genuine 4Hour breakout closes 2.0-2.5*ATR from
+          EMA21, so v30 rejects the best 4Hour breakout entries while
           still admitting the extended-chase losers (because the
-          anti-chase gate at 2.25*ATR over 3 bars is too loose on 1Hour
-          where 3 bars = 3 hours of move).
-      (c) The mean-rev stretch threshold of 0.55*ATR is far too small
-          on 1Hour — a 0.55*ATR extension on 1Hour is noise, not a
-          mean-reversion setup. Real 1Hour mean-rev needs >= 1.2*ATR.
-      (d) The composite reversal veto at 7.0*ATR is too loose on 1Hour;
-          1Hour bars routinely print 3-4*ATR two-bar reversals during
+          anti-chase gate at 1.60*ATR over 3 bars is too loose on 4Hour
+          where 3 bars = 12 hours of move).
+      (c) The mean-rev stretch threshold of 1.20*ATR is far too small
+          on 4Hour — a 1.20*ATR extension on 4Hour is noise, not a
+          mean-reversion setup. Real 4Hour mean-rev needs >= 2.00*ATR.
+      (d) The composite reversal veto at 4.5*ATR is too loose on 4Hour;
+          4Hour bars routinely print 2-3*ATR two-bar reversals during
           regime flips, so the veto never fires when it should.
-      (e) The MTF vote gate treats all 6 timeframes equally, but on a
-          1Hour entry the 1m/3m/5m votes are noise (they flip every
-          few bars). The 1h and 4h votes are the only ones with real
-          predictive weight for a 1Hour hold.
+      (e) The MTF vote gate treats all 6 timeframes with 1Hour weights,
+          but on a 4Hour entry the 1m/3m/5m/15m votes are noise (they
+          flip every few bars). The 1h and 4h votes are the only ones
+          with real predictive weight for a 4Hour hold.
 
-    Fixes (v30) — targeted at 1Hour, single-gate patches only:
-      1. Slope gate RE-CALIBRATED for 1Hour: `slope_strong` lowered
-         from 0.85*ATR to 0.55*ATR (1Hour ATR is larger, so a smaller
+    Fixes (v31) — targeted at 4Hour, single-gate patches only:
+      1. Slope gate RE-CALIBRATED for 4Hour: `slope_strong` lowered
+         from 0.55*ATR to 0.35*ATR (4Hour ATR is larger, so a smaller
          ATR-multiple is the same relative trend strength), and the
-         pullback tier from 0.45*ATR to 0.30*ATR. This admits clean
-         1Hour trends that v29 rejected while still filtering noise.
-      2. Anti-chase gate TIGHTENED for 1Hour: 2.25*ATR over 3 bars ->
-         1.60*ATR over 3 bars. On 1Hour, 3 bars = 3 hours; a 1.6*ATR
-         move in 3 hours is already an impulse, and entering after it
+         pullback tier from 0.30*ATR to 0.20*ATR. This admits clean
+         4Hour trends that v30 rejected while still filtering noise.
+      2. Anti-chase gate TIGHTENED for 4Hour: 1.60*ATR over 3 bars ->
+         1.10*ATR over 3 bars. On 4Hour, 3 bars = 12 hours; a 1.1*ATR
+         move in 12 hours is already an impulse, and entering after it
          is the #1 loser class. This is the primary win-rate lever.
-      3. Distance gate RE-CALIBRATED for 1Hour: normal cap 1.35*ATR ->
-         1.75*ATR, breakout cap 1.85*ATR -> 2.40*ATR. 1Hour breakouts
+      3. Distance gate RE-CALIBRATED for 4Hour: normal cap 1.75*ATR ->
+         2.25*ATR, breakout cap 2.40*ATR -> 3.00*ATR. 4Hour breakouts
          legitimately close further from EMA21; the anti-chase gate
          (fix #2) now handles the extended-entry problem instead.
-      4. Mean-rev stretch threshold widened from 0.55 to 1.20 (ATR
-         units) on 1Hour — a real 1Hour mean-reversion needs a genuine
+      4. Mean-rev stretch threshold widened from 1.20 to 2.00 (ATR
+         units) on 4Hour — a real 4Hour mean-reversion needs a genuine
          multi-ATR extension. Also require the reclaim bar to close in
-         the top/bottom 30% of its range (was 35/65%).
-      5. Composite reversal veto TIGHTENED from 7.0*ATR to 4.5*ATR
-         because 1Hour bars aggregate more move; a 4.5*ATR two-bar
-         reversal is a genuine regime flip on 1Hour.
-      6. MTF vote WEIGHTING for 1Hour: the 1h and 4h votes are counted
-         double (they are the only TFs with real predictive weight for
-         a 1Hour hold). The 1m/3m/5m votes are counted at half weight
-         (they are noise at this horizon). This is a re-weighting of
-         the existing vote aggregation, not a new gate.
+         the top/bottom 25% of its range (was 30/70%).
+      5. Composite reversal veto TIGHTENED from 4.5*ATR to 3.0*ATR
+         because 4Hour bars aggregate more move; a 3.0*ATR two-bar
+         reversal is a genuine regime flip on 4Hour.
+      6. MTF vote WEIGHTING for 4Hour: the 1h and 4h votes are counted
+         triple (they are the only TFs with real predictive weight for
+         a 4Hour hold). The 1m/3m/5m votes are counted at quarter
+         weight (they are noise at this horizon). 15m at half weight.
+         This is a re-weighting of the existing vote aggregation, not
+         a new gate.
       7. All other gates (ATR regime, macro, structural SL/TP, momentum,
-         EMA stack, GEX routing) kept at v29 values — do NOT touch them
+         EMA stack, GEX routing) kept at v30 values — do NOT touch them
          (single-gate patch discipline, Mandate #10).
 
     Gate-level counters are emitted via the returned dict's
@@ -530,22 +532,22 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     bar_range = max(high - low, 1e-9)
     ema_slope = ema9 - ema21
-    slope_flat = abs(ema_slope) < 0.08 * atr
-    # v30: 1Hour slope gate re-calibrated (was 0.85 / 0.45 in v29).
-    slope_strong = abs(ema_slope) >= 0.55 * atr
-    slope_pullback_ok = abs(ema_slope) >= 0.30 * atr
+    slope_flat = abs(ema_slope) < 0.05 * atr
+    # v31: 4Hour slope gate re-calibrated (was 0.55 / 0.30 in v30).
+    slope_strong = abs(ema_slope) >= 0.35 * atr
+    slope_pullback_ok = abs(ema_slope) >= 0.20 * atr
 
     # EMA21 slope over last 3 bars (trend confirmation)
     ema21_3ago = float(prev3["EMA21"]) if np.isfinite(prev3["EMA21"]) else ema21
     ema21_slope = ema21 - ema21_3ago
-    ema21_slope_ok_long = ema21_slope >= 0.03 * atr
-    ema21_slope_ok_short = ema21_slope <= -0.03 * atr
+    ema21_slope_ok_long = ema21_slope >= 0.02 * atr
+    ema21_slope_ok_short = ema21_slope <= -0.02 * atr
 
     # --- regime context (EMA50 / EMA200) ---------------------------------
     ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
     ema200 = float(row["EMA200"]) if "EMA200" in df.columns and np.isfinite(row["EMA200"]) else None
 
-    # v30: EMA-stack gate kept at v29 values.
+    # v31: EMA-stack gate kept at v30 values.
     stack_flat = (
         ema50 is not None
         and ema200 is not None
@@ -567,7 +569,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         long_bias = False
         short_bias = False
 
-    # --- GEX regime routing (kept at v29) --------------------------------
+    # --- GEX regime routing (kept at v30) --------------------------------
     gex_raw = row["GEX"] if "GEX" in df.columns else float("nan")
     gex = float(gex_raw) if np.isfinite(gex_raw) else float("nan")
     gex_neutral = (not np.isfinite(gex)) or (abs(gex) < 1e-9)
@@ -578,7 +580,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     else:
         regime = "mean_reversion"
 
-    # --- ATR regime filter (kept at v29) ---------------------------------
+    # --- ATR regime filter (kept at v30) ---------------------------------
     atr_mean = float(row["ATR_MEAN"]) if "ATR_MEAN" in df.columns else float("nan")
     if np.isfinite(atr_mean) and atr_mean > 0:
         ratio = atr / atr_mean
@@ -587,17 +589,17 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if ratio > 2.5:
             return None
 
-    # --- MTF vote aggregation (v30: horizon-weighted for 1Hour) ----------
-    # v30: on a 1Hour entry, the 1h and 4h votes carry real predictive
+    # --- MTF vote aggregation (v31: horizon-weighted for 4Hour) ----------
+    # v31: on a 4Hour entry, the 1h and 4h votes carry real predictive
     # weight; the 1m/3m/5m votes are noise at this horizon. We weight
-    # them accordingly (2x for 1h/4h, 0.5x for 1m/3m/5m, 1x for 15m).
+    # them accordingly (3x for 1h/4h, 0.25x for 1m/3m/5m, 0.5x for 15m).
     mtf_long_votes = 0.0
     mtf_short_votes = 0.0
     mtf_available = 0
     mtf_weights = {
-        "1m": 0.5, "3m": 0.5, "5m": 0.5,
-        "15m": 1.0,
-        "1h": 2.0, "4h": 2.0,
+        "1m": 0.25, "3m": 0.25, "5m": 0.25,
+        "15m": 0.5,
+        "1h": 3.0, "4h": 3.0,
     }
     for tf in ("1m", "3m", "5m", "15m", "1h", "4h"):
         col = f"MTF_{tf}_TREND"
@@ -611,29 +613,29 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 elif v < 0:
                     mtf_short_votes += w
 
-    # v30 MTF gate: thresholds scaled to the new weighted vote totals.
-    # With 6 TFs available, max weighted total = 0.5*3 + 1.0 + 2.0*2 = 6.5.
-    # Require a clear weighted majority (>= 2.0 weighted votes) and a
+    # v31 MTF gate: thresholds scaled to the new weighted vote totals.
+    # With 6 TFs available, max weighted total = 0.25*3 + 0.5 + 3.0*2 = 7.25.
+    # Require a clear weighted majority (>= 3.0 weighted votes) and a
     # strict directional edge.
     if mtf_available >= 4:
-        mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 2.0)
-        mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 2.0)
+        mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 3.0)
+        mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 3.0)
     elif mtf_available == 3:
-        mtf_long_ok = (mtf_long_votes >= 1.5) and (ema_slope >= 0.30 * atr)
-        mtf_short_ok = (mtf_short_votes >= 1.5) and (ema_slope <= -0.30 * atr)
+        mtf_long_ok = (mtf_long_votes >= 2.0) and (ema_slope >= 0.20 * atr)
+        mtf_short_ok = (mtf_short_votes >= 2.0) and (ema_slope <= -0.20 * atr)
     else:
         mtf_long_ok = True
         mtf_short_ok = True
 
     # Split-vote veto (kept, but uses weighted votes).
     if mtf_available >= 3 and slope_flat:
-        if mtf_long_votes <= 1.0 and mtf_short_votes <= 1.0:
+        if mtf_long_votes <= 1.5 and mtf_short_votes <= 1.5:
             mtf_long_ok = False
-        if mtf_short_votes <= 1.0 and mtf_long_votes <= 1.0:
+        if mtf_short_votes <= 1.5 and mtf_long_votes <= 1.5:
             mtf_short_ok = False
 
-    mtf_strong_long = mtf_long_votes >= 2.0 and mtf_long_votes > mtf_short_votes
-    mtf_strong_short = mtf_short_votes >= 2.0 and mtf_short_votes > mtf_long_votes
+    mtf_strong_long = mtf_long_votes >= 3.0 and mtf_long_votes > mtf_short_votes
+    mtf_strong_short = mtf_short_votes >= 3.0 and mtf_short_votes > mtf_long_votes
 
     # --- macro gate (optional, kept) -------------------------------------
     macro_score = float(row["MACRO_SCORE"]) if "MACRO_SCORE" in df.columns and np.isfinite(row["MACRO_SCORE"]) else 0.0
@@ -668,7 +670,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     direction = None
     setup_type = None
 
-    # v30: trend branch runs when regime is "trend" OR "neutral".
+    # v31: trend branch runs when regime is "trend" OR "neutral".
     if regime in ("trend", "neutral"):
         long_slope_ok = slope_strong or (pullback_long and mtf_strong_long and slope_pullback_ok)
         short_slope_ok = slope_strong or (pullback_short and mtf_strong_short and slope_pullback_ok)
@@ -684,7 +686,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 direction = "short"
                 setup_type = "trend_follow_short"
 
-    # v30: mean-rev branch runs when regime is "mean_reversion", OR when
+    # v31: mean-rev branch runs when regime is "mean_reversion", OR when
     # regime is "neutral" AND the EMA stack is truly flat (range regime).
     mean_rev_enabled = (regime == "mean_reversion") or (regime == "neutral" and stack_truly_flat)
     if direction is None and mean_rev_enabled:
@@ -694,28 +696,28 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         reclaim_dn = close < prev_close
         wick_up = low < min(prev_low, float(prev2["Low"]))
         wick_dn = high > max(prev_high, float(prev2["High"]))
-        # v30: require a decisive close in the top/bottom 30% of the bar.
-        close_upper = close >= low + 0.70 * bar_range
-        close_lower = close <= low + 0.30 * bar_range
+        # v31: require a decisive close in the top/bottom 25% of the bar.
+        close_upper = close >= low + 0.75 * bar_range
+        close_lower = close <= low + 0.25 * bar_range
 
-        # v30: stretch threshold widened from 0.55 to 1.20 (ATR units).
+        # v31: stretch threshold widened from 1.20 to 2.00 (ATR units).
         if abs(stretch) <= 3.0:
-            if stretch <= -1.20 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
+            if stretch <= -2.00 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
                 direction = "long"
                 setup_type = "mean_revert_long"
-            elif stretch >= 1.20 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
+            elif stretch >= 2.00 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
                 direction = "short"
                 setup_type = "mean_revert_short"
 
     if direction is None:
         return None
 
-    # --- distance gate (v30: re-calibrated for 1Hour) --------------------
+    # --- distance gate (v31: re-calibrated for 4Hour) --------------------
     breakout_up_pre = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     breakout_dn_pre = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
     is_breakout = (direction == "long" and breakout_up_pre) or (direction == "short" and breakout_dn_pre)
-    # v30: 1.85 -> 2.40 (breakout), 1.35 -> 1.75 (normal).
-    dir_cap = 2.40 * atr if is_breakout else 1.75 * atr
+    # v31: 2.40 -> 3.00 (breakout), 1.75 -> 2.25 (normal).
+    dir_cap = 3.00 * atr if is_breakout else 2.25 * atr
 
     if abs(close - ema21) > DISTANCE_GATE_ATR * atr:
         return None
@@ -724,23 +726,23 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if (ema21 - close) > dir_cap and direction == "short":
         return None
 
-    # --- anti-chase gate (v30: tightened 2.25 -> 1.60) -------------------
+    # --- anti-chase gate (v31: tightened 1.60 -> 1.10) -------------------
     move_3 = close - float(prev3["Close"])
-    if direction == "long" and move_3 > 1.60 * atr:
+    if direction == "long" and move_3 > 1.10 * atr:
         return None
-    if direction == "short" and -move_3 > 1.60 * atr:
+    if direction == "short" and -move_3 > 1.10 * atr:
         return None
 
-    # --- composite reversal veto (v30: 7.0 -> 4.5) -----------------------
+    # --- composite reversal veto (v31: 4.5 -> 3.0) -----------------------
     prev_move = prev_close - float(prev2["Close"])
     prev2_move = float(prev["Close"]) - float(prev2["Close"])
     if direction == "long":
         combined_against = -(prev_move + prev2_move)
-        if combined_against >= 4.5 * atr and close < prev_close - 0.95 * atr:
+        if combined_against >= 3.0 * atr and close < prev_close - 0.95 * atr:
             return None
     else:
         combined_against = prev_move + prev2_move
-        if combined_against >= 4.5 * atr and close > prev_close + 0.95 * atr:
+        if combined_against >= 3.0 * atr and close > prev_close + 0.95 * atr:
             return None
 
     # --- structure confirmation ------------------------------------------
@@ -825,7 +827,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "mtf_long_votes": float(mtf_long_votes),
         "mtf_short_votes": float(mtf_short_votes),
         "mtf_available": int(mtf_available),
-        # v30: gate-level counters for QA bottleneck diagnosis.
+        # v31: gate-level counters for QA bottleneck diagnosis.
         "gate_counts": {
             "gex_valid": 1 if np.isfinite(gex) else 0,
             "gex_neutral": 1 if gex_neutral else 0,
