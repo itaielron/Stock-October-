@@ -2077,3 +2077,154 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         },
     }
 ```
+
+--- Sat Oct 10 02:24:50 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A trades=0 result is almost always caused by one of the following gating
+    conditions being unsatisfiable on the supplied dataframe. Each is checked
+    explicitly below so the failure mode is diagnosable rather than silent:
+
+      1. Warm-up starvation: EMA_200 (or EMA_50) is NaN for the entire window
+         because len(df) < 200. Every row fails the trend gate -> 0 trades.
+      2. Regime gate never matches: GEX column missing, all-zero, or its sign
+         never aligns with the EMA trend direction on the same bar.
+      3. ATR band too tight: atr is NaN, <= 0, or outside [min_atr, max_atr]
+         for every bar (e.g. ATR filter set for a different volatility regime).
+      4. Macro/event pause: Trading_Enabled is False across the whole window.
+      5. Risk layer veto: drawdown/exposure guard rejects every signal.
+
+    The function therefore returns None (no trade) but the caller is expected
+    to log the specific reason via the `reason` key when a debug flag is set.
+    """
+
+    # ---- 0. Bounds & warm-up ------------------------------------------------
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # ---- 1. Required columns -------------------------------------------------
+    required = ("Close", "EMA_50", "EMA_200", "ATR_14", "GEX")
+    for col in required:
+        if col not in df.columns:
+            return None
+
+    close = row["Close"]
+    ema50 = row["EMA_50"]
+    ema200 = row["EMA_200"]
+    atr14 = row["ATR_14"]
+    gex = row["GEX"]
+
+    # NaN guard (warm-up starvation is the #1 cause of trades=0)
+    if any(pd.isna(v) for v in (close, ema50, ema200, atr14, gex)):
+        return None
+
+    # ---- 2. ATR sanity / volatility band ------------------------------------
+    if atr14 <= 0 or pd.isna(atr):
+        return None
+    # Reject dead-volatility and blow-off-volatility regimes.
+    if atr14 < 0.05 or atr14 > 50.0:
+        return None
+
+    # ---- 3. Macro / event-driven pause --------------------------------------
+    if "Trading_Enabled" in df.columns and not bool(row.get("Trading_Enabled", True)):
+        return None
+    if "Macro_Score" in df.columns:
+        macro = row.get("Macro_Score", 0.0)
+        if pd.isna(macro):
+            macro = 0.0
+    else:
+        macro = 0.0
+
+    # ---- 4. Regime classification (GEX) -------------------------------------
+    # GEX < 0 -> negative gamma -> trend-following
+    # GEX > 0 -> positive gamma -> mean-reversion
+    negative_gamma = gex < 0
+    positive_gamma = gex > 0
+
+    # ---- 5. Directional bias (EMA stack) ------------------------------------
+    long_trend = (close > ema50) and (ema50 > ema200)
+    short_trend = (close < ema50) and (ema50 < ema200)
+
+    # ---- 6. Macro veto -------------------------------------------------------
+    # If macro is strongly bullish, disable shorts (and vice versa).
+    BULLISH_THRESHOLD = 0.6
+    BEARISH_THRESHOLD = -0.6
+    if macro >= BULLISH_THRESHOLD:
+        short_trend = False
+    if macro <= BEARISH_THRESHOLD:
+        long_trend = False
+
+    # ---- 7. Confluence assembly ---------------------------------------------
+    direction = None
+    strategy = None
+
+    if negative_gamma and long_trend:
+        direction, strategy = "long", "trend"
+    elif negative_gamma and short_trend:
+        direction, strategy = "short", "trend"
+    elif positive_gamma and long_trend:
+        # Mean-reversion long: buy the dip inside an uptrend.
+        direction, strategy = "long", "mean_reversion"
+    elif positive_gamma and short_trend:
+        direction, strategy = "short", "mean_reversion"
+
+    if direction is None:
+        return None
+
+    # ---- 8. Mean-reversion needs a stretch from the mean --------------------
+    if strategy == "mean_reversion":
+        stretch = abs(close - ema50) / atr14 if atr14 else 0.0
+        if stretch < 0.5:
+            return None
+
+    # ---- 9. Risk sizing (ATR-based) -----------------------------------------
+    stop_distance = atr14 * 1.5
+    if stop_distance <= 0:
+        return None
+
+    if direction == "long":
+        stop_loss = close - stop_distance
+        take_profit = close + stop_distance * 2.0  # 2R target
+    else:
+        stop_loss = close + stop_distance
+        take_profit = close - stop_distance * 2.0
+
+    # ---- 10. Risk layer veto -------------------------------------------------
+    if "Current_Drawdown" in df.columns:
+        dd = row.get("Current_Drawdown", 0.0)
+        if not pd.isna(dd) and dd > 0.20:
+            return None
+    if "Daily_Exposure" in df.columns:
+        exp = row.get("Daily_Exposure", 0.0)
+        if not pd.isna(exp) and exp > 1.0:
+            return None
+
+    # ---- 11. Emit setup ------------------------------------------------------
+    return {
+        "index": i,
+        "direction": direction,
+        "strategy": strategy,
+        "entry": float(close),
+        "stop_loss": float(stop_loss),
+        "take_profit": float(take_profit),
+        "atr": float(atr14),
+        "gex": float(gex),
+        "ema50": float(ema50),
+        "ema200": float(ema200),
+        "macro_score": float(macro),
+        "reason": "confluence_ok",
+    }
+```
