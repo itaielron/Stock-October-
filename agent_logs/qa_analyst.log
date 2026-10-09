@@ -9644,3 +9644,45 @@ No evidence of 1m/3m/15m/1h/4h confluence evaluation in the log. Entry logic app
 Do NOT append to `proven_strategies.md` — 75% with 3/6 wins being sub-0.1R noise is not a proven cluster. Rotate to 15Min, apply gates 1–4, re-run. Push to GitHub per mandate #8.
 
 **Verdict: FAIL — rewrite gating, re-test.**
+
+--- Sat Oct 10 02:56:18 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:56:13Z -> 2026-10-09T23:56:13Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generation)**
+
+### Why trades = 0
+Zero trades across 297 SPY + 372 QQQ bars is not a market condition — it's a **logic deadlock**. The gating stack is over-constrained. Diagnose in this order:
+
+1. **GEX gate (Mandate #11 violation risk).** If the code still requires a GEX value and defaults to `None`/`0`, the regime branch likely never resolves to `True`. Per Mandate #11, GEX must be **assumed neutral** and the strategy must fall through to EMA+ATR confluence — not silently block. Verify no `if gex is None: return False` path exists.
+
+2. **EMA stack impossible on 1m/3m.** `Close > EMA_50 AND EMA_50 > EMA_200` requires 200 bars of history. SPY has 297 bars total — after warmup (~200), only ~97 bars remain, and on a 1-week window the 50/200 stack is rarely cleanly aligned. **This alone can zero out signals.** Fix: on sub-15m timeframes, substitute EMA_9/EMA_21 or EMA_20/EMA_50, and reserve 50/200 for 1h/4h.
+
+3. **ATR "within limits" band.** If the ATR filter has both a floor and ceiling (e.g., `0.5 < ATR < 2.0`), a low-vol week (which this appears to be — flat total_R) will reject every bar. Log the ATR distribution; if median ATR sits outside the band, the band is wrong, not the market.
+
+4. **Macro/event pause.** Confirm `Trading_Enabled` wasn't stuck `False` from a parsed event window that never closed.
+
+### Required instrumentation before next run
+Add per-bar counters: `bars_passed_gex`, `bars_passed_ema`, `bars_passed_atr`, `bars_passed_macro`. Without these, you cannot distinguish "no setup" from "bug." This is the #1 repeated mistake — **zero-trade runs must self-diagnose.**
+
+### Structural verdict
+No winners, no losers → **no learning signal**. Mandate #6 (genetic learning) cannot execute. Do not rotate timeframes yet (Mandate #10) — there is nothing proven to rotate from.
+
+### Action
+1. Patch GEX to neutral-fallback (never block).
+2. Make EMA periods timeframe-adaptive.
+3. Log ATR percentiles; widen or remove the ceiling.
+4. Re-run same window. Target: ≥5 trades to establish a baseline before any optimization.
+
+**Do not proceed to optimization until trades > 0.**
