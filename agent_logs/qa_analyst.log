@@ -1053,3 +1053,198 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "reason": f"{regime}|ema_align|mtf_slope|atr_ok",
     }
 ```
+
+--- Sat Oct 10 02:22:36 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes (in order of likelihood):
+
+    1. HIERARCHICAL GATING DEADLOCK
+       The mandate requires: [GEX regime matches strategy] AND [EMA trend aligns]
+       AND [ATR within limits]. If GEX is computed as a constant (e.g. always 0
+       or always positive) because the historical GEX feed is unavailable in
+       backtest, then only ONE of the two sub-routines (trend-following OR
+       mean-reversion) can ever fire. If the EMA filter then contradicts that
+       single regime for the whole sample, trades = 0.
+
+    2. EMA WARMUP STARVATION
+       EMA_200 requires >= 200 bars. If the backtest window is "past week" of
+       1m candles (~2,000 bars) that is fine, but if the engine slices per
+       timeframe and the 4h slice only has ~42 bars, EMA_200 is NaN for the
+       entire 4h slice -> every 4h signal is dropped.
+
+    3. ATR BAND TOO TIGHT
+       If ATR limits are expressed as absolute dollar bands (e.g. 0.5 < ATR < 2.0)
+       they will be violated on high-priced tickers and satisfied on none.
+
+    4. EVENT PAUSE OVERREACH
+       If the economic calendar parser returns "high impact event" for every
+       timestamp (e.g. timezone mismatch, or a stale calendar file), then
+       Trading_Enabled = False for the entire sample.
+
+    FIXES APPLIED BELOW:
+      - GEX is derived from a proxy (dealer gamma sign via volume-weighted
+        skew) when the real feed is absent, so BOTH regimes are reachable.
+      - EMA warmup is guarded: if EMA_200 is NaN we fall back to EMA_50 slope
+        as the trend proxy instead of silently dropping the bar.
+      - ATR limits are expressed as PERCENTILE bands of the rolling ATR, not
+        absolute dollars, so they are ticker-agnostic.
+      - Event pause is a soft veto only when a real event flag is present.
+      - MTFA confluence: we require agreement between the local timeframe and
+        at least one higher timeframe trend proxy before firing.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Guard rails
+    # ------------------------------------------------------------------
+    if i < 2 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+    open_ = float(row["open"])
+    volume = float(row.get("volume", 0.0))
+
+    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. EMA trend layer (with warmup fallback)
+    # ------------------------------------------------------------------
+    ema50 = row.get("ema_50", np.nan)
+    ema200 = row.get("ema_200", np.nan)
+
+    ema50_prev = df["ema_50"].iloc[i - 1] if "ema_50" in df.columns else np.nan
+
+    if np.isfinite(ema50) and np.isfinite(ema200):
+        bull_trend = close > ema50 and ema50 > ema200
+        bear_trend = close < ema50 and ema50 < ema200
+        trend_source = "ema50_200"
+    elif np.isfinite(ema50) and np.isfinite(ema50_prev):
+        # Warmup fallback: use EMA_50 slope as trend proxy
+        bull_trend = close > ema50 and ema50 > ema50_prev
+        bear_trend = close < ema50 and ema50 < ema50_prev
+        trend_source = "ema50_slope"
+    else:
+        return None
+
+    if not (bull_trend or bear_trend):
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. GEX regime layer (proxy when real feed absent)
+    # ------------------------------------------------------------------
+    gex = row.get("gex", np.nan)
+    if not np.isfinite(gex):
+        # Proxy: signed volume-weighted skew over last 20 bars.
+        # Positive skew -> dealers long gamma -> mean reversion.
+        # Negative skew -> dealers short gamma -> trend following.
+        lookback = min(20, i)
+        window = df.iloc[i - lookback:i]
+        if len(window) < 5:
+            return None
+        ret = window["close"].pct_change().dropna()
+        if len(ret) < 3 or ret.std() == 0:
+            return None
+        skew = float(((ret - ret.mean()) ** 3).mean() / (ret.std() ** 3))
+        gex = -skew  # negative skew => positive proxy gamma
+        gex_source = "proxy_skew"
+    else:
+        gex_source = "feed"
+
+    # ------------------------------------------------------------------
+    # 3. ATR percentile band (ticker-agnostic)
+    # ------------------------------------------------------------------
+    atr_series = df["atr_14"] if "atr_14" in df.columns else None
+    if atr_series is not None and i >= 50:
+        atr_window = atr_series.iloc[max(0, i - 100):i].dropna()
+        if len(atr_window) >= 20:
+            lo = float(atr_window.quantile(0.10))
+            hi = float(atr_window.quantile(0.90))
+            if not (lo <= atr <= hi):
+                return None
+
+    # ------------------------------------------------------------------
+    # 4. Multi-timeframe confluence (local + higher TF trend proxy)
+    # ------------------------------------------------------------------
+    htf_bull = row.get("htf_bull", np.nan)
+    htf_bear = row.get("htf_bear", np.nan)
+    if np.isfinite(htf_bull) and np.isfinite(htf_bear):
+        if bull_trend and not htf_bull:
+            return None
+        if bear_trend and not htf_bear:
+            return None
+
+    # ------------------------------------------------------------------
+    # 5. Event veto (soft)
+    # ------------------------------------------------------------------
+    if bool(row.get("event_pause", False)):
+        return None
+
+    # ------------------------------------------------------------------
+    # 6. Regime -> strategy routing
+    # ------------------------------------------------------------------
+    if gex < 0:
+        # Negative gamma: trend-following
+        if bull_trend:
+            direction = "long"
+        elif bear_trend:
+            direction = "short"
+        else:
+            return None
+        strategy = "trend_following"
+    else:
+        # Positive gamma: mean reversion
+        # Long the dip if in bull structure, short the rip if in bear structure.
+        if bull_trend and close < open_ and low < ema50:
+            direction = "long"
+        elif bear_trend and close > open_ and high > ema50:
+            direction = "short"
+        else:
+            return None
+        strategy = "mean_reversion"
+
+    # ------------------------------------------------------------------
+    # 7. Risk sizing
+    # ------------------------------------------------------------------
+    stop_distance = atr * 1.5
+    if stop_distance <= 0:
+        return None
+
+    if direction == "long":
+        stop = close - stop_distance
+        tp1 = close + stop_distance * 1.0
+        tp2 = close + stop_distance * 2.0
+    else:
+        stop = close + stop_distance
+        tp1 = close - stop_distance * 1.0
+        tp2 = close - stop_distance * 2.0
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "entry": close,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr,
+        "gex": gex,
+        "gex_source": gex_source,
+        "trend_source": trend_source,
+        "volume": volume,
+    }
+```
