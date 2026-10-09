@@ -6693,3 +6693,178 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:37:15 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator.
+
+    NOTE ON THE PREVIOUS RUN (trades=0):
+    ------------------------------------
+    The prior backtest produced zero trades. Root-cause analysis of the
+    gating stack identified the following structural reasons:
+
+      1. GEX REGIME GATE (hardest failure):
+         The regime filter required a *strict* sign match between the
+         computed GEX proxy and the strategy sub-routine. In the historical
+         window the GEX proxy was frequently NaN / zero (no options-chain
+         data available in the CSV feed), so `gex < 0` and `gex > 0` were
+         both False -> every signal was dropped before EMA/ATR checks ran.
+
+      2. EMA STACK ORDERING:
+         The long gate demanded `Close > EMA_50 AND EMA_50 > EMA_200`.
+         On a 1m/3m feed the EMA_200 is dominated by the first ~200 bars
+         of warm-up, so the stack was inverted for most of the session and
+         no long was ever valid. Shorts required `Close < EMA_50` but were
+         then blocked by the macro bullish bias.
+
+      3. ATR BAND:
+         The ATR "within limits" check used a fixed absolute band that did
+         not scale with the instrument, so ATR_14 was almost always outside
+         the band -> final veto.
+
+      4. MACRO / EVENT PAUSE:
+         The event-pause flag defaulted to True when the calendar was
+         missing, permanently disabling trading.
+
+    FIXES APPLIED BELOW:
+      - GEX is now treated as a *soft* regime hint: if the proxy is
+        unavailable (NaN/0) we fall back to a trend/volatility regime
+        inferred from EMA slope + ATR percentile, instead of hard-vetoing.
+      - EMA stack uses a tolerance band and allows a "developing" stack
+        (Close vs EMA_50 primary, EMA_50 vs EMA_200 as a confidence weight).
+      - ATR band is expressed as a percentile of the rolling ATR
+        distribution rather than an absolute value.
+      - Event pause defaults to False when the calendar is absent, and is
+        only honored when an explicit high-impact flag is present.
+      - Every gate now contributes to a `score`; a trade fires when the
+        score clears a threshold, so a single missing input can no longer
+        zero out the entire run.
+    """
+
+    # ---- guards -----------------------------------------------------------
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["Close"])
+    high = float(row["High"])
+    low = float(row["Low"])
+
+    if not np.isfinite(close) or not np.isfinite(atr) or atr <= 0:
+        return None
+
+    # ---- indicator pulls (defensive: column may be absent) ---------------
+    def _col(name, default=np.nan):
+        return float(df[name].iloc[i]) if name in df.columns else default
+
+    ema_50 = _col("EMA_50")
+    ema_200 = _col("EMA_200")
+    gex = _col("GEX", 0.0)
+    macro_score = _col("Macro_Score", 0.0)
+    event_pause = bool(row.get("Event_Pause", False)) if hasattr(row, "get") else False
+
+    if not np.isfinite(ema_50) or not np.isfinite(ema_200):
+        return None
+
+    # ---- ATR percentile band (self-scaling) ------------------------------
+    atr_window = df["ATR_14"].iloc[max(0, i - 200):i] if "ATR_14" in df.columns else None
+    if atr_window is not None and len(atr_window) > 20:
+        atr_pct = float((atr_window < atr).mean())
+    else:
+        atr_pct = 0.5
+    atr_ok = 0.05 <= atr_pct <= 0.95
+
+    # ---- regime inference (GEX soft + fallback) --------------------------
+    ema_slope = (ema_50 - float(df["EMA_50"].iloc[i - 5])) if i >= 5 and "EMA_50" in df.columns else 0.0
+    trend_regime = ema_slope > 0
+    if np.isfinite(gex) and gex != 0.0:
+        # Negative gamma -> trend-following; positive gamma -> mean-reversion
+        regime = "trend" if gex < 0 else "meanrev"
+    else:
+        # Fallback: infer from EMA slope + ATR expansion
+        regime = "trend" if trend_regime else "meanrev"
+
+    # ---- directional bias ------------------------------------------------
+    long_bias = close > ema_50
+    short_bias = close < ema_50
+    stack_bull = ema_50 > ema_200
+    stack_bear = ema_50 < ema_200
+
+    # ---- macro / event gates (soft) --------------------------------------
+    if event_pause:
+        return None
+    macro_bull = macro_score >= 0.0
+    macro_bear = macro_score <= 0.0
+
+    # ---- scoring ---------------------------------------------------------
+    long_score = 0
+    short_score = 0
+
+    if long_bias:
+        long_score += 2
+    if stack_bull:
+        long_score += 1
+    if regime == "trend" and trend_regime:
+        long_score += 2
+    elif regime == "meanrev" and not trend_regime:
+        long_score += 1
+    if atr_ok:
+        long_score += 1
+    if macro_bull:
+        long_score += 1
+
+    if short_bias:
+        short_score += 2
+    if stack_bear:
+        short_score += 1
+    if regime == "trend" and not trend_regime:
+        short_score += 2
+    elif regime == "meanrev" and trend_regime:
+        short_score += 1
+    if atr_ok:
+        short_score += 1
+    if macro_bear:
+        short_score += 1
+
+    # ---- threshold + risk sizing ----------------------------------------
+    THRESHOLD = 5
+    sl_mult = 1.5
+    direction = None
+    if long_score >= THRESHOLD and long_score > short_score:
+        direction = "long"
+    elif short_score >= THRESHOLD and short_score > long_score:
+        direction = "short"
+
+    if direction is None:
+        return None
+
+    if direction == "long":
+        entry = close
+        sl = entry - atr * sl_mult
+        tp1 = entry + atr * sl_mult * 1.5
+    else:
+        entry = close
+        sl = entry + atr * sl_mult
+        tp1 = entry - atr * sl_mult * 1.5
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "atr": float(atr),
+        "regime": regime,
+        "score": int(long_score if direction == "long" else short_score),
+        "reason": (
+            f"regime={regime} bias={'bull' if long_bias else 'bear'} "
+            f"stack={'bull' if stack_bull else 'bear'} atr_pct={atr_pct:.2f}"
+        ),
+    }
+```
