@@ -1,0 +1,19 @@
+[main ece4ee0] Auto-Sync: Agent optimization cycle
+ 24 files changed, 696 insertions(+), 176 deletions(-)
+ create mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235414.png
+ create mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235415.png
+ create mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235437.png
+ create mode 100644 charts/LOSER_QQQ_STOP_20261009_235414.png
+ create mode 100644 charts/LOSER_QQQ_STOP_20261009_235415.png
+ create mode 100644 charts/LOSER_SPY_STOP_20261009_235436.png
+ create mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235415.png
+ create mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235437.png
+ create mode 100644 charts/WINNER_QQQ_GAP_TP2_20261009_235414.png
+ create mode 100644 charts/WINNER_QQQ_GAP_TP2_20261009_235415.png
+ create mode 100644 charts/WINNER_QQQ_STOP_20261009_235414.png
+ create mode 100644 charts/WINNER_QQQ_STOP_20261009_235415.png
+ create mode 100644 charts/WINNER_QQQ_TP2_20261009_235413.png
+ create mode 100644 charts/WINNER_QQQ_TP2_20261009_235414.png
+ create mode 100644 charts/WINNER_QQQ_TP2_20261009_235415.png
+To https://github.com/itaielron/Stock-October-.git
+   666dfff..ece4ee0  main -> main

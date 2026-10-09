@@ -9559,3 +9559,48 @@ All 4 QQQ winners are **GAP_STOP exits at 1 bar with R=+0.02 to +0.07**. These a
 **Do NOT append to `proven_strategies.md`.** No proven strategy exists. Coder must implement fixes 1–3, then re-run. Push to GitHub per mandate #8.
 
 **Grade: FAIL (66.7% is noise-inflated; true edge negative).**
+
+--- Sat Oct 10 02:55:14 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:55:08Z -> 2026-10-09T23:55:08Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (no signal generated)**
+
+### Why trades = 0
+Zero trades is a **gating failure**, not a market condition. With 297 SPY + 372 QQQ bars across a full week, a functioning confluence engine should fire *something*. The complete absence of signals points to one of these structural bugs:
+
+1. **GEX gate hard-blocking.** Per Mandate #11, GEX is unavailable on IEX. If the code still requires `GEX < 0` (trend) or `GEX > 0` (mean-revert) to be *explicitly true*, and the proxy returns `None`/`NaN`, the AND-chain collapses to False on every bar. **Fix:** default GEX proxy to `0` (neutral) and let EMA+ATR carry the decision, or derive a signed proxy from `sign(close - VWAP) * volume_zscore`.
+
+2. **EMA warm-up starvation.** `EMA_200` on 297 bars is fine, but if the engine requires `EMA_50 > EMA_200` *and* `Close > EMA_50` *and* a fresh crossover event (not just state), a 5-day window may contain zero crossover events. **Fix:** log gate pass/fail counts per bar to confirm.
+
+3. **ATR "within limits" band too tight.** If `ATR_14` bounds were hardcoded for a higher-vol regime, current ATR may sit outside the band every bar. **Fix:** print ATR min/max/median for the window.
+
+4. **Macro/event pause stuck True.** If the economic-calendar parser failed silently and left `Trading_Enabled = False`, all bars are skipped. **Fix:** assert `Trading_Enabled` flips at least once.
+
+### Required instrumentation before next run
+Add a per-bar diagnostic counter:
+```
+gates = {gex:0, ema:0, atr:0, macro:0, risk:0, fired:0}
+```
+Emit the tally in SUMMARY. Without this, we cannot distinguish "no setup" from "broken gate."
+
+### Structural verdict
+This is a **regression**, not a null result. The prior mandate explicitly forbids halting on missing GEX — the current output suggests that rule was violated or a new gate was introduced without a neutral fallback. **Do not rotate timeframes** (Mandate #10) until trades > 0 on the baseline. Rotation on a dead engine just multiplies zeros.
+
+### Next action
+1. Patch GEX to neutral-default; re-run same window.
+2. If still 0, dump gate tally and ATR/EMA distributions.
+3. Only after trades fire do we evaluate win-rate structure and push to GitHub (Mandate #8).
+
+**No PASS. Optimization loop continues — but fix the gate, don't tune parameters.**
