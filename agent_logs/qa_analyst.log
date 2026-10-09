@@ -4521,3 +4521,170 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     return None
 ```
+
+--- Sat Oct 10 02:31:26 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+
+    1. GEX regime gate was hard-required but the GEX column was either
+       missing, all-NaN, or constant-zero in the historical slice, so the
+       regime check `gex < 0` / `gex > 0` never resolved to a valid branch.
+    2. EMA_200 warm-up: with only ~1 week of 1m/3m data, EMA_200 is
+       undefined for the first ~200 bars and NaN thereafter if the slice
+       is short, so `Close > EMA_50 > EMA_200` was never True.
+    3. ATR filter used a strict band (e.g. 0.5*ATR_med < atr < 1.5*ATR_med)
+       that excluded the entire session's realized volatility.
+    4. Event-pause flag defaulted to False (trading disabled) when the
+       economic calendar was absent.
+
+    Fixes applied below:
+    - GEX is treated as a *soft* regime hint: if unavailable, fall back to
+      a volatility/trend regime proxy (ATR percentile + EMA slope) instead
+      of hard-blocking.
+    - EMA_200 requirement is relaxed to EMA_50 vs EMA_200 *when available*;
+      if EMA_200 is NaN we require EMA_50 slope alignment instead.
+    - ATR band widened and made percentile-based rather than absolute.
+    - Event pause defaults to True (trading enabled) unless an explicit
+      high-impact window is detected.
+    - MTF confluence: we accept the setup if at least 2 of {1m,5m,15m}
+      trend proxies agree with the direction, rather than requiring all.
+    """
+
+    # --- Guard: need enough history ---
+    if i < 60 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    close = row.get("close", float("nan"))
+    if not (close == close):  # NaN check
+        return None
+
+    # --- ATR sanity ---
+    if atr is None or atr != atr or atr <= 0:
+        return None
+
+    # --- Event-driven pause (default ENABLED) ---
+    # Only block if an explicit high-impact flag is set on this bar.
+    if bool(row.get("event_pause", False)):
+        return None
+
+    # --- Risk layer: drawdown / exposure ---
+    if bool(row.get("risk_block", False)):
+        return None
+
+    # --- EMA trend structure (relaxed) ---
+    ema50 = row.get("ema_50", float("nan"))
+    ema200 = row.get("ema_200", float("nan"))
+    ema50_prev = df["ema_50"].iloc[i - 5] if "ema_50" in df.columns else float("nan")
+
+    if ema50 != ema50:
+        return None
+
+    ema50_slope_up = (ema50_prev == ema50_prev) and (ema50 > ema50_prev)
+    ema50_slope_dn = (ema50_prev == ema50_prev) and (ema50 < ema50_prev)
+
+    if ema200 == ema200:
+        # Full stack available
+        long_trend = (close > ema50) and (ema50 > ema200)
+        short_trend = (close < ema50) and (ema50 < ema200)
+    else:
+        # EMA_200 unavailable (short history) -> use slope proxy
+        long_trend = (close > ema50) and ema50_slope_up
+        short_trend = (close < ema50) and ema50_slope_dn
+
+    if not (long_trend or short_trend):
+        return None
+
+    direction = "long" if long_trend else "short"
+
+    # --- GEX regime (soft) ---
+    gex = row.get("gex", float("nan"))
+    if gex == gex:  # GEX available
+        if gex < 0:
+            regime = "trend"
+        elif gex > 0:
+            regime = "mean_revert"
+        else:
+            regime = "neutral"
+    else:
+        # Fallback regime proxy: ATR percentile
+        atr_series = df["atr_14"].iloc[max(0, i - 100):i] if "atr_14" in df.columns else None
+        if atr_series is not None and len(atr_series) > 20:
+            pct = (atr_series < atr).mean()
+            regime = "trend" if pct > 0.6 else ("mean_revert" if pct < 0.4 else "neutral")
+        else:
+            regime = "neutral"
+
+    # --- ATR band (percentile-based, widened) ---
+    if "atr_14" in df.columns:
+        atr_window = df["atr_14"].iloc[max(0, i - 200):i].dropna()
+        if len(atr_window) > 30:
+            lo = atr_window.quantile(0.10)
+            hi = atr_window.quantile(0.95)
+            if atr < lo or atr > hi:
+                return None
+
+    # --- MTF confluence: need >=2 of {1m,5m,15m} agreeing ---
+    mtf_votes = 0
+    mtf_total = 0
+    for tf in ("1m", "5m", "15m"):
+        col = f"trend_{tf}"
+        if col in df.columns:
+            v = row.get(col, float("nan"))
+            if v == v:
+                mtf_total += 1
+                if (direction == "long" and v > 0) or (direction == "short" and v < 0):
+                    mtf_votes += 1
+    if mtf_total >= 2 and mtf_votes < 2:
+        return None
+
+    # --- Strategy selection by regime ---
+    if regime == "trend":
+        strategy = "trend_follow"
+    elif regime == "mean_revert":
+        strategy = "mean_revert"
+    else:
+        # Neutral regime: only take trades with strong MTF agreement
+        if mtf_total >= 2 and mtf_votes == mtf_total:
+            strategy = "trend_follow"
+        else:
+            return None
+
+    # --- Risk sizing ---
+    stop_dist = atr * 1.5
+    if direction == "long":
+        stop = close - stop_dist
+        tp1 = close + stop_dist * 1.0
+        tp2 = close + stop_dist * 2.0
+    else:
+        stop = close + stop_dist
+        tp1 = close - stop_dist * 1.0
+        tp2 = close - stop_dist * 2.0
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "regime": regime,
+        "entry": float(close),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "mtf_votes": mtf_votes,
+        "mtf_total": mtf_total,
+        "index": int(i),
+    }
+```

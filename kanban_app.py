@@ -35,7 +35,9 @@ if os.path.exists(chart_dir):
         chart_cols = st.columns(3)
         for i, chart in enumerate(charts[:9]): 
             with chart_cols[i % 3]:
-                st.image(os.path.join(chart_dir, chart), caption=chart, use_container_width=True)
+                with open(os.path.join(chart_dir, chart), "rb") as img_file:
+                    img_bytes = img_file.read()
+                st.image(img_bytes, caption=chart, use_container_width=True)
     else:
         st.info("No charts generated yet.")
 
