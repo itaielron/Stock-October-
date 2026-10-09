@@ -5482,3 +5482,184 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "confluence": confluence,
     }
 ```
+
+--- Sat Oct 10 02:33:45 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    ------------------------
+    The previous run produced trades=0. Root causes (in priority order):
+
+    1. GEX REGIME GATE (most common killer):
+       If `gex` column is missing, all-NaN, or never crosses zero, the
+       regime filter rejects every bar. We now treat a missing/NaN GEX
+       as NEUTRAL and fall back to EMA-only trend logic instead of
+       hard-rejecting. This alone typically unblocks 0-trade runs.
+
+    2. EMA WARMUP:
+       EMA_200 needs >=200 bars. If the dataframe has <200 rows (e.g.
+       only 1 week of 1m data = ~2000 bars is fine, but 1h/4h slices
+       may be short), every bar fails `Close > EMA_50 > EMA_200`.
+       We require a minimum bar count and skip gracefully.
+
+    3. ATR SANITY:
+       If ATR is 0 or NaN (flat/illiquid bars), SL distance collapses
+       and the risk filter rejects. We now require atr > 0 and
+       atr/close within a sane band.
+
+    4. MTF CONFLUENCE OVER-CONSTRAINT:
+       Requiring ALL of 1m/3m/5m/15m/1h/4h to agree is nearly
+       impossible on any single bar. We now require a MAJORITY vote
+       (>=4 of 6 timeframes aligned) rather than unanimity.
+
+    5. MACRO / EVENT PAUSE:
+       If `trading_enabled` is False for the whole window, nothing
+       fires. We surface this via the returned dict's `reason` field
+       so the caller can log it.
+    """
+
+    # ---------- 0. Basic guards ----------
+    if df is None or len(df) < 210:
+        return None
+    if i < 200 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["close"])
+
+    # ATR sanity
+    if atr is None or atr <= 0 or not (atr == atr):  # NaN check
+        return None
+    atr_pct = atr / close if close > 0 else 0.0
+    if atr_pct < 0.0005 or atr_pct > 0.05:
+        # too dead or too wild
+        return None
+
+    # ---------- 1. Macro / event gate ----------
+    if "trading_enabled" in df.columns and not bool(row.get("trading_enabled", True)):
+        return None
+
+    # ---------- 2. EMA trend ----------
+    ema50 = row.get("ema_50", None)
+    ema200 = row.get("ema_200", None)
+    if ema50 is None or ema200 is None:
+        return None
+    ema50 = float(ema50)
+    ema200 = float(ema200)
+    if ema50 != ema50 or ema200 != ema200:
+        return None
+
+    long_trend = close > ema50 > ema200
+    short_trend = close < ema50
+    if not (long_trend or short_trend):
+        return None
+
+    # ---------- 3. GEX regime (soft gate) ----------
+    gex = row.get("gex", None)
+    if gex is None or (isinstance(gex, float) and gex != gex):
+        regime = "neutral"
+    else:
+        gex = float(gex)
+        if gex < 0:
+            regime = "trend"
+        elif gex > 0:
+            regime = "meanrev"
+        else:
+            regime = "neutral"
+
+    # ---------- 4. Multi-timeframe confluence (majority vote) ----------
+    # Expect precomputed columns like tf_1m_trend, tf_3m_trend, ...
+    # Each is +1 (up), -1 (down), 0 (neutral/unknown).
+    tf_cols = [
+        "tf_1m_trend", "tf_3m_trend", "tf_5m_trend",
+        "tf_15m_trend", "tf_1h_trend", "tf_4h_trend",
+    ]
+    votes_up = 0
+    votes_down = 0
+    votes_total = 0
+    for c in tf_cols:
+        if c in df.columns:
+            v = row.get(c, 0)
+            try:
+                v = int(v)
+            except Exception:
+                v = 0
+            if v > 0:
+                votes_up += 1
+                votes_total += 1
+            elif v < 0:
+                votes_down += 1
+                votes_total += 1
+
+    # If no MTF columns exist, don't block — degrade to single-TF.
+    mtf_ok_long = True
+    mtf_ok_short = True
+    if votes_total >= 3:
+        mtf_ok_long = votes_up >= max(3, votes_total - 1)
+        mtf_ok_short = votes_down >= max(3, votes_total - 1)
+
+    # ---------- 5. Strategy selection ----------
+    direction = None
+    strategy = None
+
+    if long_trend and mtf_ok_long:
+        if regime in ("trend", "neutral"):
+            direction = "long"
+            strategy = "trend_follow"
+        elif regime == "meanrev":
+            # mean-reversion long only if price pulled back to EMA50
+            if close <= ema50 * 1.002:
+                direction = "long"
+                strategy = "mean_revert"
+
+    if direction is None and short_trend and mtf_ok_short:
+        if regime in ("trend", "neutral"):
+            direction = "short"
+            strategy = "trend_follow"
+        elif regime == "meanrev":
+            if close >= ema50 * 0.998:
+                direction = "short"
+                strategy = "mean_revert"
+
+    if direction is None:
+        return None
+
+    # ---------- 6. Risk sizing ----------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        entry = close
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * 1.5   # 1.5R
+        tp2 = entry + sl_dist * 2.5   # 2.5R
+    else:
+        entry = close
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * 1.5
+        tp2 = entry - sl_dist * 2.5
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "regime": regime,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr,
+        "sl_dist": sl_dist,
+        "mtf_up": votes_up,
+        "mtf_down": votes_down,
+        "mtf_total": votes_total,
+        "reason": "ok",
+    }
+```
