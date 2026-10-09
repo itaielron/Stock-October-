@@ -104,3 +104,8 @@ Log your findings so the Coder can fix it next round.
         )
         print("[5] QA Analyst logged findings.")
         time.sleep(5)
+
+        print("[6] Synchronizing Memory Banks and Scripts to GitHub...")
+        os.system("git add . && git commit -m 'Auto-Sync: Agent optimization cycle complete' && git push origin main")
+        print("[7] Cycle complete. Sleeping...")
+        time.sleep(5)

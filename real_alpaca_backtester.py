@@ -53,6 +53,8 @@ Requires: pandas, mplfinance, requests, numpy.
 from __future__ import annotations
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -323,7 +325,7 @@ def generate_chart(
         mpf.make_addplot(
             entry_marker,
             type="scatter",
-            marker="^",
+            marker="o",
             markersize=140,
             color="lime",
         )
@@ -369,6 +371,7 @@ def generate_chart(
         f"{symbol} {outcome} | entry={entry:.2f} sl={sl:.2f} "
         f"tp1={tp1:.2f} tp2={tp2:.2f}"
         + (f" | exit={exit_price:.2f} ({exit_reason})" if exit_price is not None else "")
+        + "\nLEGEND: Green Dashed = Target, Red Dashed = Stop Loss, o = Entry Circle, v/x = Exit"
     )
 
     plot_df = window[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -442,10 +445,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     prev = df.iloc[i - 1]
 
     # --- 1. fresh bullish crossover --------------------------------------
-    crossover = (
-        float(prev["EMA9"]) <= float(prev["EMA21"])
-        and float(row["EMA9"]) > float(row["EMA21"])
-    )
+    crossover = (float(row["EMA9"]) > float(row["EMA21"]))
     if not crossover:
         return None
 

@@ -9078,4 +9078,36 @@ SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 cha
 [01:49:55] [OBSERVE] Analyzing generated mock trades and updating Kanban board...
 [01:49:55] [EVALUATE] QA Agent checking if parameters require tuning based on latest hits...
 [01:49:55] [CORRECT] Engine aligned. No severe parameter drift detected.
-[01:49:55] [REPEAT] Sleeping for 5 minutes before next market scan...
+[01:49:55] [REPEAT] Sleeping for 5 minutes before next market scan...[2026-10-09T22:59:50.282864+00:00] ======================================================================
+[2026-10-09T22:59:50.282971+00:00] Confluence-cluster backtest 2026-10-02T22:59:50Z -> 2026-10-09T22:59:50Z symbols=['SPY', 'QQQ']
+[2026-10-09T22:59:50.715965+00:00] [error] SPY: HTTP 401 <html>
+<head><title>401 Authorization Required</title></head>
+<body>
+<center><h1>401 Authorization Required</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>
+
+[2026-10-09T22:59:50.716217+00:00] [warn] SPY: no bars returned.
+[2026-10-09T22:59:50.717599+00:00] [warn] SPY: no data, skipping.
+[2026-10-09T22:59:51.151778+00:00] [error] QQQ: HTTP 401 <html>
+<head><title>401 Authorization Required</title></head>
+<body>
+<center><h1>401 Authorization Required</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>
+
+[2026-10-09T22:59:51.152003+00:00] [warn] QQQ: no bars returned.
+[2026-10-09T22:59:51.153516+00:00] [warn] QQQ: no data, skipping.
+[2026-10-09T22:59:51.153662+00:00] ----------------------------------------------------------------------
+[2026-10-09T22:59:51.153764+00:00] SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+[2026-10-09T22:59:51.153842+00:00] ======================================================================
+[2026-10-09T23:00:27.171473+00:00] ======================================================================
+[2026-10-09T23:00:27.171811+00:00] Confluence-cluster backtest 2026-10-02T23:00:27Z -> 2026-10-09T23:00:27Z symbols=['SPY', 'QQQ']
+[2026-10-09T23:00:27.775527+00:00] [info] SPY: 297 bars, backtesting...
+[2026-10-09T23:00:28.175982+00:00] [trade] SPY LOSER entry=776.77 sl=773.51 tp1=781.66 tp2=786.56 exit=775.42 (TIME_STOP) R=-0.41 bars=79
+[2026-10-09T23:00:28.770097+00:00] [info] QQQ: 372 bars, backtesting...
+[2026-10-09T23:00:28.795072+00:00] ----------------------------------------------------------------------
+[2026-10-09T23:00:28.795297+00:00] SUMMARY trades=1 winners=0 losers=1 win_rate=0.0% total_R=-0.41 avg_R=-0.414 charts=charts/
+[2026-10-09T23:00:28.795388+00:00] ======================================================================

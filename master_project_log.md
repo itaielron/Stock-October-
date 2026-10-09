@@ -37,3 +37,6 @@ Modern systems do not rely solely on technicals; they filter technical setups us
     *   *Logic*: Even if a valid technical/macro signal is fired, execution layer must verify: `Current_Drawdown < Max_Allowed` and `Daily_Exposure < Account_Limit`. If false, drop the signal.
 
 8. **GitHub Live Sync:** All code changes, agent memory logs, and chart outputs MUST be pushed to GitHub at the end of every single execution cycle. No exceptions. This allows the human supervisor to monitor progress in real-time.
+
+## Credit Optimization & Runaway Prevention
+9. **Smart Sleep Protocol (Credit Conservation):** DeepSeek agents are strictly forbidden from rewriting code or running deep heuristic evaluations if the current backtest script achieves the target >80% win rate with structurally sound charts. If a cycle receives a `PASS` grade from the QA Analyst, the optimization engine MUST halt and enter standby mode. Do not waste API tokens over-optimizing a working system. The orchestrator is hard-limited to prevent infinite runaway loops.
