@@ -434,56 +434,48 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v8) — QA feedback integration:
-      * QA flagged v7 for: (a) still too few trades — the stacked vetoes
-        (opposite-bar, consecutive-opposite, opposite-swing, momentum,
-        flat-slope, EMA21-slope) were each individually reasonable but
-        jointly over-filtering, (b) the dominant loser class was entries
-        taken when the base-TF EMA9/EMA21 slope was flat AND the higher-TF
-        vote was split (no directional edge), (c) mean-rev branch still
-        under-firing on 1m/3m bars, (d) trend branch rejecting valid
-        pullback continuations because the momentum confirmation required
-        a fresh directional close on the exact entry bar.
-      * Fixes (v8):
-          - Consolidated the three "opposite move" vetoes into ONE
-            composite reversal veto: reject only when the last 2 bars
-            moved against the intended direction by a combined >= 2.0*ATR
-            AND the current bar fails to reclaim the prior bar's close.
-            This removes the double/triple-counting that was killing
-            valid pullback entries.
-          - Momentum confirmation for trend setups relaxed: accept if
-            close > prev_close OR close > ema9 OR the current bar's
-            close is in the upper half of its range (long) / lower half
-            (short). This recovers continuation entries where the entry
-            bar is an inside/consolidation bar.
-          - Flat-slope veto relaxed to 0.08*ATR (was 0.10) and EMA21
-            slope requirement relaxed to 0.03*ATR (was 0.05) — the
-            previous thresholds were rejecting valid slow-trend entries.
-          - Mean-rev stretch threshold relaxed to 0.60*ATR (was 0.75);
-            hard veto kept at 3.0*ATR. Reclaim/wick logic unchanged
-            (already relaxed in v7).
-          - Distance gate directional cap relaxed to 2.0*ATR (was 1.75)
-            — the 1.75-2.0 band was still rejecting valid trend
-            continuations on liquid names.
-          - Anti-chase gate: single hard veto at 3.5*ATR over 3 bars
-            (removed the redundant 3.0 soft + 4.0 hard pair).
-          - MTF gate: with >=4 TFs require strict majority; with 3 TFs
-            require >=2 agreeing AND base-TF slope confirms; with <3
-            TFs pass through (unchanged).
-          - Split-vote veto: only reject when winning side has 1 vote
-            AND base-TF slope is flat (unchanged).
+    Hardened cluster (v9) — QA feedback integration:
+      * QA flagged v8 for: (a) win rate still below target because the
+        dominant loser class was trend-following entries taken when the
+        higher-TF vote was split AND the base-TF slope was only barely
+        non-flat (weak edge, whipsaw), (b) mean-reversion branch still
+        under-firing on 1m/3m bars because the stretch threshold and the
+        reclaim/wick requirement were jointly too strict, (c) trend
+        branch still rejecting valid pullback continuations when the
+        entry bar closed slightly against the trend but held above EMA21,
+        (d) the composite reversal veto was still firing on healthy
+        pullbacks that briefly dipped below the prior close.
+      * Fixes (v9):
+          - Trend branch now requires a MINIMUM slope magnitude
+            (0.12*ATR) instead of merely "non-flat" (0.08*ATR). This
+            directly targets the dominant loser class: weak-edge trend
+            entries in chop. The flat-slope veto is kept as a hard gate.
+          - MTF gate hardened for trend setups: with >=4 TFs require a
+            strict majority AND the winning side must have at least 2
+            votes (kills 1-vote "majority" noise). With 3 TFs require
+            >=2 agreeing AND base-TF slope magnitude >= 0.12*ATR.
+          - Mean-rev stretch threshold relaxed to 0.45*ATR (was 0.60);
+            hard veto kept at 3.0*ATR. Reclaim/wick logic broadened:
+            accept a reclaim OR a wick OR a close in the outer 40% of
+            the bar range in the fade direction. This recovers the
+            under-firing 1m/3m mean-rev class.
+          - Trend pullback continuation: accept when close holds on the
+            trend side of EMA21 (close >= ema21 - 0.15*ATR for long)
+            even if the entry bar closed slightly against the trend,
+            provided the prior bar was a directional close. Recovers
+            valid pullback continuations.
+          - Composite reversal veto relaxed: require combined against
+            move >= 2.5*ATR (was 2.0) AND the current bar fails to
+            reclaim the prior bar's close by more than 0.10*ATR. Stops
+            firing on healthy pullbacks that briefly dipped.
+          - Momentum confirmation for trend setups: accept if close is
+            on the trend side of EMA21 (structural) OR close > prev_close
+            OR close in the trend half of the bar range. Removes the
+            EMA9 dependency that was rejecting slow-trend entries.
+          - Distance gate directional cap kept at 2.0*ATR; anti-chase
+            kept at 3.5*ATR over 3 bars.
           - Kept ATR regime, risk gates, structural SL/TP, macro gate,
             GEX routing, pullback-to-EMA21 structure.
-      * v8 changes (this revision):
-          - Composite reversal veto replaces the three separate
-            opposite-move vetoes (large-opposite-bar, consecutive-
-            opposite-bars, opposite-swing). Single gate, single
-            threshold, no double-counting.
-          - Momentum confirmation broadened (see above).
-          - Slope thresholds relaxed (see above).
-          - Mean-rev stretch relaxed to 0.60*ATR.
-          - Distance gate directional cap relaxed to 2.0*ATR.
-          - Anti-chase gate simplified to a single 3.5*ATR veto.
     """
     if i < 3 or i >= len(df):
         return None
@@ -503,6 +495,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     close = float(row["Close"])
     high = float(row["High"])
     low = float(row["Low"])
+    open_ = float(row["Open"]) if "Open" in df.columns and np.isfinite(row["Open"]) else close
     prev_close = float(prev["Close"])
     prev_high = float(prev["High"])
     prev_low = float(prev["Low"])
@@ -517,6 +510,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     bar_range = max(high - low, 1e-9)
     ema_slope = ema9 - ema21
     slope_flat = abs(ema_slope) < 0.08 * atr
+    # v9: minimum slope magnitude for trend entries — targets the
+    # dominant loser class (weak-edge trend entries in chop).
+    slope_strong = abs(ema_slope) >= 0.12 * atr
 
     # EMA21 slope over last 3 bars (trend confirmation)
     ema21_3ago = float(prev3["EMA21"]) if np.isfinite(prev3["EMA21"]) else ema21
@@ -563,14 +559,16 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 elif v < 0:
                     mtf_short_votes += 1
 
-    # Relaxed majority: with >=4 TFs require strict majority; with 3 TFs
-    # require >=2 agreeing AND base-TF slope confirms direction.
+    # v9: hardened MTF gate for trend setups. With >=4 TFs require a
+    # strict majority AND the winning side must have >=2 votes (kills
+    # 1-vote "majority" noise). With 3 TFs require >=2 agreeing AND
+    # base-TF slope magnitude >= 0.12*ATR.
     if mtf_available >= 4:
-        mtf_long_ok = mtf_long_votes > mtf_short_votes
-        mtf_short_ok = mtf_short_votes > mtf_long_votes
+        mtf_long_ok = (mtf_long_votes > mtf_short_votes) and (mtf_long_votes >= 2)
+        mtf_short_ok = (mtf_short_votes > mtf_long_votes) and (mtf_short_votes >= 2)
     elif mtf_available == 3:
-        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope > 0)
-        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope < 0)
+        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope >= 0.12 * atr)
+        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope <= -0.12 * atr)
     else:
         mtf_long_ok = True
         mtf_short_ok = True
@@ -606,8 +604,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     setup_type = None
 
     if regime == "trend":
-        # Require a non-flat slope so we don't take trend trades in chop.
-        if not slope_flat:
+        # v9: require a STRONG slope (>=0.12*ATR), not merely non-flat.
+        # This is the primary fix for the dominant loser class.
+        if slope_strong:
             if (ema9 > ema21 and long_bias and mtf_long_ok
                     and not macro_blocks_long and ema21_slope_ok_long):
                 direction = "long"
@@ -617,24 +616,24 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                 direction = "short"
                 setup_type = "trend_follow_short"
     else:
-        # Mean reversion: fade exhaustion. Accept EITHER a reclaim candle
-        # OR a rejection wick. Stretch threshold relaxed to 0.60*ATR;
-        # hard veto above 3.0*ATR (those are trend days, not mean-rev).
+        # Mean reversion: fade exhaustion. v9: stretch threshold relaxed
+        # to 0.45*ATR (was 0.60); hard veto kept at 3.0*ATR. Reclaim/wick
+        # logic broadened to include outer-40% close in fade direction.
         if ema50 is not None:
             stretch = (close - ema50) / atr
-            # Relaxed reclaim: just a directional close vs prev bar.
             reclaim_up = close > prev_close
             reclaim_dn = close < prev_close
-            # Relaxed wick: pierce prior 2-bar extreme (no outer-third
-            # close requirement — fires on tiny 1m/3m bars).
             wick_up = low < min(prev_low, float(prev2["Low"]))
             wick_dn = high > max(prev_high, float(prev2["High"]))
+            # v9: outer-40% close in fade direction.
+            close_upper = close >= low + 0.60 * bar_range
+            close_lower = close <= low + 0.40 * bar_range
 
             if abs(stretch) <= 3.0:
-                if stretch <= -0.60 and (reclaim_up or wick_up) and mtf_long_ok and not macro_blocks_long:
+                if stretch <= -0.45 and (reclaim_up or wick_up or close_upper) and mtf_long_ok and not macro_blocks_long:
                     direction = "long"
                     setup_type = "mean_revert_long"
-                elif stretch >= 0.60 and (reclaim_dn or wick_dn) and mtf_short_ok and not macro_blocks_short:
+                elif stretch >= 0.45 and (reclaim_dn or wick_dn or close_lower) and mtf_short_ok and not macro_blocks_short:
                     direction = "short"
                     setup_type = "mean_revert_short"
 
@@ -642,9 +641,6 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         return None
 
     # --- distance gate (don't chase) -------------------------------------
-    # Use EMA21 (structural) instead of EMA9 (noisy on 1m/3m bars).
-    # Directional cap relaxed to 2.0*ATR (was 1.75) — the 1.75-2.0 ATR
-    # band was still rejecting valid trend continuations on liquid names.
     if abs(close - ema21) > DISTANCE_GATE_ATR * atr:
         return None
     if (close - ema21) > 2.0 * atr and direction == "long":
@@ -653,47 +649,47 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         return None
 
     # --- anti-chase gate (losers were late entries) ----------------------
-    # Single hard veto at 3.5*ATR over 3 bars (removed the redundant
-    # 3.0 soft + 4.0 hard pair from v7).
     move_3 = close - float(prev3["Close"])
     if direction == "long" and move_3 > 3.5 * atr:
         return None
     if direction == "short" and -move_3 > 3.5 * atr:
         return None
 
-    # --- composite reversal veto -----------------------------------------
-    # Single gate replacing the three separate opposite-move vetoes from
-    # v7 (large-opposite-bar, consecutive-opposite-bars, opposite-swing).
-    # Reject only when the last 2 bars moved against the intended
-    # direction by a combined >= 2.0*ATR AND the current bar fails to
-    # reclaim the prior bar's close (i.e. the reversal is still in force).
+    # --- composite reversal veto (v9 relaxed) ----------------------------
+    # Require combined against move >= 2.5*ATR (was 2.0) AND the current
+    # bar fails to reclaim the prior bar's close by more than 0.10*ATR.
+    # Stops firing on healthy pullbacks that briefly dipped.
     prev_move = prev_close - float(prev2["Close"])
     prev2_move = float(prev["Close"]) - float(prev2["Close"])
     if direction == "long":
         combined_against = -(prev_move + prev2_move)
-        if combined_against >= 2.0 * atr and close < prev_close:
+        if combined_against >= 2.5 * atr and close < prev_close - 0.10 * atr:
             return None
     else:
         combined_against = prev_move + prev2_move
-        if combined_against >= 2.0 * atr and close > prev_close:
+        if combined_against >= 2.5 * atr and close > prev_close + 0.10 * atr:
             return None
 
     # --- structure confirmation ------------------------------------------
-    # "pullback to EMA21" as a third valid structure for trend setups —
-    # recovers the dominant valid-pullback-continuation class.
     breakout_up = close > recent_swing_high + BREAKOUT_BUFFER_ATR * atr
     breakout_dn = close < recent_swing_low - BREAKOUT_BUFFER_ATR * atr
     at_support = abs(close - recent_swing_low) <= SUPPORT_PROXIMITY_ATR * atr
     at_resistance = abs(close - recent_swing_high) <= SUPPORT_PROXIMITY_ATR * atr
+    # v9: pullback continuation accepts a close that holds on the trend
+    # side of EMA21 (close >= ema21 - 0.15*ATR for long) even if the
+    # entry bar closed slightly against the trend, provided the prior
+    # bar was a directional close.
     pullback_long = (
         regime == "trend"
         and abs(close - ema21) <= 0.5 * atr
-        and close >= ema21 - 0.25 * atr
+        and close >= ema21 - 0.15 * atr
+        and (close >= prev_close or prev_close >= prev_ema21)
     )
     pullback_short = (
         regime == "trend"
         and abs(close - ema21) <= 0.5 * atr
-        and close <= ema21 + 0.25 * atr
+        and close <= ema21 + 0.15 * atr
+        and (close <= prev_close or prev_close <= prev_ema21)
     )
 
     if direction == "long":
@@ -704,25 +700,21 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return None
 
     # --- momentum confirmation (trend only; mean-rev already encoded) ----
-    # Broadened: accept if close > prev_close OR close > ema9 OR the
-    # current bar's close is in the upper half of its range (long) /
-    # lower half (short). Recovers continuation entries where the entry
-    # bar is an inside/consolidation bar.
+    # v9: accept if close is on the trend side of EMA21 (structural) OR
+    # close > prev_close OR close in the trend half of the bar range.
+    # Removes the EMA9 dependency that was rejecting slow-trend entries.
     if regime == "trend":
-        tol = 0.05 * atr
         if direction == "long":
             momentum_ok = (
-                (close > prev_close)
-                or (close > ema9)
+                (close >= ema21)
+                or (close > prev_close)
                 or (close >= low + 0.5 * bar_range)
-                or (close > ema9 and prev_close <= prev_ema9 + tol)
             )
         else:
             momentum_ok = (
-                (close < prev_close)
-                or (close < ema9)
+                (close <= ema21)
+                or (close < prev_close)
                 or (close <= low + 0.5 * bar_range)
-                or (close < ema9 and prev_close >= prev_ema9 - tol)
             )
         if not momentum_ok:
             return None

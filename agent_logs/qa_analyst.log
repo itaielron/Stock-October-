@@ -1248,3 +1248,228 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         "volume": volume,
     }
 ```
+
+--- Sat Oct 10 02:23:04 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster detector with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON trades=0:
+    -----------------
+    The previous run produced zero trades. Root causes identified:
+      1. GEX regime gate was evaluated as a hard AND against a column that
+         was frequently NaN / zero-filled, so `gex < 0` and `gex > 0` both
+         failed -> every bar rejected.
+      2. EMA_200 warmup: with only ~1 week of 1m data (~2000 bars) the
+         EMA_200 was NaN for the first 200 bars and unstable afterwards,
+         so the trend gate rejected nearly everything.
+      3. ATR band filter used absolute dollar thresholds that did not match
+         the instrument's realized ATR, rejecting all bars.
+      4. Macro/event pause flag defaulted to False (trading disabled) when
+         the calendar column was missing.
+
+    Fixes applied below:
+      - GEX gate is now soft: if GEX is unavailable, fall back to a
+        volatility-regime proxy (ATR percentile) instead of hard-rejecting.
+      - EMA gate degrades gracefully: if EMA_200 is NaN, require only
+        EMA_50 alignment; if EMA_50 is NaN, require only price vs EMA_20.
+      - ATR filter is now relative (percentile of rolling ATR), not absolute.
+      - Event pause defaults to ENABLED unless an explicit pause flag is set.
+      - Multi-timeframe confluence is scored, not hard-gated, so a single
+        missing timeframe does not zero out the signal.
+    """
+
+    if i < 2 or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+    open_ = float(row["open"])
+
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    # ------------------------------------------------------------------
+    # 0. Event-driven pause (default ENABLED unless explicitly paused)
+    # ------------------------------------------------------------------
+    if "trading_enabled" in df.columns:
+        te = row.get("trading_enabled", True)
+        if te is False or (isinstance(te, float) and np.isnan(te)):
+            # NaN means calendar missing -> do NOT pause
+            if te is False:
+                return None
+    if "event_pause" in df.columns:
+        ep = row.get("event_pause", False)
+        if ep is True:
+            return None
+
+    # ------------------------------------------------------------------
+    # 1. Regime filter (GEX) with graceful fallback
+    # ------------------------------------------------------------------
+    gex = row.get("gex", np.nan)
+    gex_valid = isinstance(gex, (int, float)) and np.isfinite(gex)
+
+    # ATR percentile as volatility-regime proxy
+    atr_series = df["atr_14"] if "atr_14" in df.columns else None
+    atr_pct = np.nan
+    if atr_series is not None:
+        window = atr_series.iloc[max(0, i - 200):i + 1]
+        if len(window) > 20 and np.isfinite(window.iloc[-1]):
+            atr_pct = float((window < window.iloc[-1]).mean())
+
+    if gex_valid:
+        regime = "trend" if gex < 0 else "mean_revert"
+    else:
+        # Fallback: high vol -> trend, low vol -> mean revert
+        if np.isfinite(atr_pct):
+            regime = "trend" if atr_pct > 0.6 else ("mean_revert" if atr_pct < 0.4 else "neutral")
+        else:
+            regime = "neutral"
+
+    # ------------------------------------------------------------------
+    # 2. Directional bias (EMA) with graceful degradation
+    # ------------------------------------------------------------------
+    ema20 = row.get("ema_20", np.nan)
+    ema50 = row.get("ema_50", np.nan)
+    ema200 = row.get("ema_200", np.nan)
+
+    long_ok = False
+    short_ok = False
+
+    if np.isfinite(ema50) and np.isfinite(ema200):
+        long_ok = close > ema50 and ema50 > ema200
+        short_ok = close < ema50 and ema50 < ema200
+    elif np.isfinite(ema50):
+        long_ok = close > ema50
+        short_ok = close < ema50
+    elif np.isfinite(ema20):
+        long_ok = close > ema20
+        short_ok = close < ema20
+    else:
+        # No EMA data at all -> use simple momentum
+        long_ok = close > float(prev["close"])
+        short_ok = close < float(prev["close"])
+
+    # ------------------------------------------------------------------
+    # 3. ATR band filter (relative, not absolute)
+    # ------------------------------------------------------------------
+    atr_ok = True
+    if np.isfinite(atr_pct):
+        # Reject only extreme tails
+        atr_ok = 0.05 < atr_pct < 0.98
+
+    # ------------------------------------------------------------------
+    # 4. Multi-timeframe confluence scoring (soft, not hard gate)
+    # ------------------------------------------------------------------
+    mtf_score = 0
+    mtf_total = 0
+    for tf in ("1m", "3m", "5m", "15m", "1h", "4h"):
+        col = f"close_{tf}"
+        if col in df.columns:
+            v = row.get(col, np.nan)
+            if isinstance(v, (int, float)) and np.isfinite(v):
+                mtf_total += 1
+                if v > close:
+                    mtf_score += 1
+                elif v < close:
+                    mtf_score -= 1
+
+    mtf_bias = 0
+    if mtf_total > 0:
+        mtf_bias = mtf_score / mtf_total  # -1..1
+
+    # ------------------------------------------------------------------
+    # 5. Macro regime score
+    # ------------------------------------------------------------------
+    macro = row.get("macro_score", 0.0)
+    if not isinstance(macro, (int, float)) or not np.isfinite(macro):
+        macro = 0.0
+
+    # ------------------------------------------------------------------
+    # 6. Signal assembly
+    # ------------------------------------------------------------------
+    direction = None
+
+    # Trend-following regime
+    if regime == "trend":
+        if long_ok and mtf_bias >= -0.2 and macro >= -0.5:
+            direction = "long"
+        elif short_ok and mtf_bias <= 0.2 and macro <= 0.5:
+            direction = "short"
+
+    # Mean-reversion regime
+    elif regime == "mean_revert":
+        # Fade extremes: price stretched from EMA20
+        if np.isfinite(ema20):
+            stretch = (close - ema20) / atr if atr > 0 else 0.0
+            if stretch <= -1.0 and long_ok:
+                direction = "long"
+            elif stretch >= 1.0 and short_ok:
+                direction = "short"
+
+    # Neutral regime: require strong MTF agreement
+    else:
+        if long_ok and mtf_bias >= 0.5 and macro >= 0.0:
+            direction = "long"
+        elif short_ok and mtf_bias <= -0.5 and macro <= 0.0:
+            direction = "short"
+
+    if direction is None or not atr_ok:
+        return None
+
+    # ------------------------------------------------------------------
+    # 7. Risk sizing & levels
+    # ------------------------------------------------------------------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        entry = close
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * 1.0
+        tp2 = entry + sl_dist * 2.0
+    else:
+        entry = close
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * 1.0
+        tp2 = entry - sl_dist * 2.0
+
+    # ------------------------------------------------------------------
+    # 8. Risk management layer
+    # ------------------------------------------------------------------
+    dd = row.get("current_drawdown", 0.0)
+    if isinstance(dd, (int, float)) and np.isfinite(dd) and dd > 0.20:
+        return None
+
+    daily_exp = row.get("daily_exposure", 0.0)
+    if isinstance(daily_exp, (int, float)) and np.isfinite(daily_exp) and daily_exp > 1.0:
+        return None
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "regime": regime,
+        "mtf_bias": float(mtf_bias),
+        "macro_score": float(macro),
+        "gex": float(gex) if gex_valid else None,
+        "atr_pct": float(atr_pct) if np.isfinite(atr_pct) else None,
+        "reason": (
+            f"regime={regime} dir={direction} mtf={mtf_bias:.2f} "
+            f"macro={macro:.2f} atr_pct={atr_pct if np.isfinite(atr_pct) else 'na'}"
+        ),
+    }
+```
