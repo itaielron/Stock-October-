@@ -9217,3 +9217,52 @@ This is non-negotiable — we cannot optimize what we cannot attribute.
 This is a **FAIL**, so optimization may continue — but only the diagnostic instrumentation above. Do not rewrite entry logic until the rejection histogram tells us which gate is the culprit. One targeted fix per cycle.
 
 **Next action:** instrument rejection counters, re-run same window, report histogram.
+
+--- Sat Oct 10 02:51:29 2026 ---
+TASK:
+Backtest Output:
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:51:24Z -> 2026-10-09T23:51:24Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+----------------------------------------------------------------------
+SUMMARY trades=0 winners=0 losers=0 win_rate=0.0% total_R=+0.00 avg_R=+0.000 charts=charts/
+======================================================================
+
+Evaluat...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (Zero-Trade Deadlock)**
+
+### Why trades=0
+The engine produced **0 signals across 669 bars**. This is not a "no setup" market — it's a **gating deadlock**. Root causes, in order of likelihood:
+
+1. **GEX gate is hard-blocking.** Per Mandate #11, GEX is unavailable on the IEX feed. If the code still requires `GEX < 0` (trend) or `GEX > 0` (mean-revert) to fire, and the proxy returns `None`/`0`/`NaN`, the AND-chain collapses to `False` on every bar. **Fix:** default GEX to neutral and let EMA+ATR carry the decision, or derive proxy = `sign(EMA_50 - EMA_200) * normalized_volume`.
+
+2. **EMA stack never satisfied.** `Close > EMA_50 > EMA_200` requires ~200 bars of warmup. SPY has 297 bars, QQQ 372 — but if EMAs are computed *per-symbol from bar 0* without a pre-roll, the first ~200 bars are NaN and the remaining window may simply not have printed a clean stack. **Fix:** seed EMAs with prior history or extend lookback.
+
+3. **ATR "within limits" band too tight.** If `ATR_14` is filtered to a narrow band (e.g., 0.3–0.8% of price), a low-vol week (SPY 297 bars ≈ 5 sessions) can sit entirely outside it. **Fix:** log ATR min/max/median per symbol to confirm.
+
+4. **Macro/event pause stuck True.** If the calendar parser failed silently and left `Trading_Enabled=False`, every bar is dropped. **Fix:** assert and log this flag per bar.
+
+### Required Diagnostics (next cycle)
+Before any optimization, the Coder MUST emit per-bar counters:
+- `bars_passing_gex`, `bars_passing_ema`, `bars_passing_atr`, `bars_passing_macro`, `bars_passing_risk`
+- ATR distribution (min/median/max) per symbol
+- `Trading_Enabled` true-count
+
+Without these, we are guessing. **Zero-trade output is a bug, not a result.**
+
+### Structural Verdict
+- No winners/losers to analyze → **cannot** perform Mandate #6 genetic learning this cycle.
+- Charts are empty → **violates Mandate #4** (visual clarity requires entry/TP/SL markers).
+- Do **not** rotate timeframes yet (Mandate #10) — nothing proven to rotate from.
+
+### Action
+1. Patch GEX fallback (neutral default) — **highest priority**.
+2. Add gate-pass telemetry.
+3. Re-run same window. Target: `trades > 20` before any win-rate discussion.
+4. Push to GitHub (Mandate #8).
+
+**Do not enter standby** — standby is only valid after a PASS with >80% WR.
