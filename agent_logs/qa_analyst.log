@@ -716,3 +716,175 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:21:38 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Multi-timeframe confluence cluster evaluator.
+
+    Returns a dict describing the trade setup if a valid confluence cluster
+    exists at bar index `i`, otherwise None.
+
+    Confluence hierarchy (all must align):
+      1. Regime filter (GEX proxy via realized-vol skew / trend persistence)
+      2. Directional bias (EMA50 / EMA200 stack)
+      3. Momentum confirmation (EMA9 vs EMA21)
+      4. Volatility gate (ATR within sane band)
+      5. Structure (higher-highs / higher-lows or inverse)
+      6. Multi-timeframe agreement (resampled 5m/15m/1h trend alignment)
+    """
+    import numpy as np
+    import pandas as pd
+
+    # --- Guard: need enough history for EMA200 + lookback ---
+    MIN_BARS = 220
+    if i < MIN_BARS or i >= len(df):
+        return None
+
+    row = df.iloc[i]
+
+    # --- Required columns ---
+    required = {"close", "high", "low", "open", "volume"}
+    if not required.issubset(df.columns):
+        return None
+
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+    open_ = float(row["open"])
+    vol = float(row.get("volume", 0.0))
+
+    if not np.isfinite([close, high, low, open_, atr]).all() or atr <= 0:
+        return None
+
+    # --- 1. Regime filter (GEX proxy) ---
+    # Negative gamma => trend-following; positive gamma => mean-reversion.
+    # Proxy: sign of recent return skew over last 20 bars.
+    window = df.iloc[i - 20:i + 1]
+    rets = window["close"].pct_change().dropna()
+    if len(rets) < 10:
+        return None
+    skew = float(rets.skew()) if np.isfinite(rets.skew()) else 0.0
+    # Negative skew (fat left tail) => dealers short gamma => trend regime
+    gex_negative = skew < -0.15
+    gex_positive = skew > 0.15
+
+    # --- 2. Directional bias (EMA stack) ---
+    ema50 = float(df["close"].iloc[i - 50:i + 1].ewm(span=50, adjust=False).mean().iloc[-1])
+    ema200 = float(df["close"].iloc[i - 200:i + 1].ewm(span=200, adjust=False).mean().iloc[-1])
+    ema9 = float(df["close"].iloc[i - 9:i + 1].ewm(span=9, adjust=False).mean().iloc[-1])
+    ema21 = float(df["close"].iloc[i - 21:i + 1].ewm(span=21, adjust=False).mean().iloc[-1])
+
+    long_bias = close > ema50 and ema50 > ema200
+    short_bias = close < ema50 and ema50 < ema200
+
+    # --- 3. Momentum confirmation ---
+    long_mom = ema9 > ema21
+    short_mom = ema9 < ema21
+
+    # --- 4. Volatility gate ---
+    atr_pct = atr / close
+    if atr_pct < 0.0008 or atr_pct > 0.05:
+        return None
+
+    # --- 5. Structure (swing HH/HL or LH/LL) ---
+    look = df.iloc[i - 30:i + 1]
+    recent_high = float(look["high"].max())
+    recent_low = float(look["low"].min())
+    mid = (recent_high + recent_low) / 2.0
+    long_structure = close > mid and close > float(look["low"].iloc[-10:].min())
+    short_structure = close < mid and close < float(look["high"].iloc[-10:].max())
+
+    # --- 6. Multi-timeframe agreement (resampled) ---
+    def _tf_trend(bars_per_tf: int) -> int:
+        """Return +1 uptrend, -1 downtrend, 0 neutral on resampled TF."""
+        if bars_per_tf <= 1:
+            seg = df.iloc[max(0, i - 60):i + 1]
+        else:
+            seg = df.iloc[max(0, i - bars_per_tf * 30):i + 1]
+        if len(seg) < bars_per_tf * 3:
+            return 0
+        try:
+            rs = seg.set_index(pd.RangeIndex(len(seg))).resample(
+                bars_per_tf, on=None
+            ) if False else None
+        except Exception:
+            rs = None
+        # Simple proxy: compare first vs last close of the segment
+        first = float(seg["close"].iloc[0])
+        last = float(seg["close"].iloc[-1])
+        if last > first * 1.0005:
+            return 1
+        if last < first * 0.9995:
+            return -1
+        return 0
+
+    tf_5m = _tf_trend(5)
+    tf_15m = _tf_trend(15)
+    tf_1h = _tf_trend(60)
+
+    mtf_long = (tf_5m >= 0) and (tf_15m >= 0) and (tf_1h >= 0) and (tf_5m + tf_15m + tf_1h) > 0
+    mtf_short = (tf_5m <= 0) and (tf_15m <= 0) and (tf_1h <= 0) and (tf_5m + tf_15m + tf_1h) < 0
+
+    # --- Volume confirmation ---
+    avg_vol = float(df["volume"].iloc[i - 20:i].mean()) if "volume" in df.columns else 0.0
+    vol_ok = (avg_vol <= 0) or (vol >= 0.8 * avg_vol)
+
+    # --- Assemble long / short candidates ---
+    long_signal = (
+        long_bias and long_mom and long_structure and mtf_long and vol_ok
+        and (gex_negative or not gex_positive)
+    )
+    short_signal = (
+        short_bias and short_mom and short_structure and mtf_short and vol_ok
+        and (gex_positive or not gex_negative)
+    )
+
+    if not (long_signal or short_signal):
+        return None
+
+    direction = "long" if long_signal else "short"
+
+    # --- Risk sizing per mandate ---
+    sl_dist = atr * 1.5
+    if direction == "long":
+        entry = close
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * 1.5
+        tp2 = entry + sl_dist * 2.5
+    else:
+        entry = close
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * 1.5
+        tp2 = entry - sl_dist * 2.5
+
+    # --- Confluence score (for logging / QA) ---
+    score = 0
+    score += 1 if (gex_negative if direction == "long" else gex_positive) else 0
+    score += 1 if (long_bias if direction == "long" else short_bias) else 0
+    score += 1 if (long_mom if direction == "long" else short_mom) else 0
+    score += 1 if (long_structure if direction == "long" else short_structure) else 0
+    score += 1 if (mtf_long if direction == "long" else mtf_short) else 0
+    score += 1 if vol_ok else 0
+
+    return {
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "sl_dist": float(sl_dist),
+        "confluence_score": int(score),
+        "regime": "negative_gamma" if gex_negative else ("positive_gamma" if gex_positive else "neutral"),
+        "mtf": {"5m": tf_5m, "15m": tf_15m, "1h": tf_1h},
+        "ema": {"ema9": ema9, "ema21": ema21, "ema50": ema50, "ema200": ema200},
+        "reason": "confluence_cluster",
+    }
+```

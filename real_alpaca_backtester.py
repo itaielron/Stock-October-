@@ -434,35 +434,48 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     Evaluate the confluence cluster at bar `i`. Returns a dict of the
     structural levels if ALL conditions pass, else None.
 
-    Hardened cluster (v5) — QA feedback integration:
-      * QA flagged v4 for: (a) still too few trades — the strict-majority
-        MTF gate combined with the anti-chase + opposite-swing vetoes
-        produced near-zero signals on liquid names, (b) mean-reversion
-        branch still required a reclaim candle that rarely fires on the
-        exact bar of exhaustion, (c) the "opposite swing" veto was too
-        aggressive and rejected valid pullback continuations, (d) the
-        distance gate used EMA9 which is noisy on 1m/3m bars, (e) no
-        explicit "why losers lost" filter for the dominant loser class:
-        entries taken *into* a fresh opposite swing high/low that formed
-        within the last 2 bars (not 3), and entries where the higher-TF
-        vote was split 1-1-1 (no edge).
+    Hardened cluster (v6) — QA feedback integration:
+      * QA flagged v5 for: (a) still too few trades on liquid names —
+        the split-vote veto combined with the opposite-swing veto and
+        the strict structural confirmation (breakout OR proximity) was
+        still rejecting valid pullback continuations, (b) the mean-rev
+        branch required stretch >= 1.0*ATR which rarely fires on 1m/3m
+        bars where ATR is small relative to EMA50 distance, (c) the
+        momentum confirmation was redundant with the reclaim/wick logic
+        and double-filtered, (d) the dominant loser class was entries
+        taken when the *higher-TF* vote was split AND the base-TF EMA
+        slope was flat (no directional edge), (e) no explicit filter for
+        entries taken immediately after a large opposite-direction bar
+        (>= 1.2*ATR) which is the classic "caught in the reversal" loss.
       * Fixes:
-          - MTF gate: require strict majority only when >= 4 TFs present;
-            with 3 TFs require >= 2 agreeing (not strict >). This restores
-            trade count while still filtering 1-1-1 splits.
-          - Mean-reversion: accept either a reclaim candle OR a
-            rejection wick (close in upper/lower third of bar range) so
-            we fade exhaustion on the bar it prints, not one bar late.
-          - Opposite-swing veto narrowed to last 2 bars and only when the
-            fresh swing is *decisive* (>= 0.5*ATR displacement), so
-            shallow pullbacks no longer veto valid continuations.
-          - Distance gate now uses EMA21 (structural) instead of EMA9
-            (noisy), with a slightly wider cap.
-          - Anti-chase gate relaxed to 3.0*ATR over 3 bars (was 2.5) —
-            losers were not the 2.5-3.0 ATR movers, they were the
-            >3.0 ATR chasers.
-          - Added "split-vote veto": reject when mtf_available >= 3 and
-            the winning side has only 1 vote (1-1-1 or 1-0-2 splits).
+          - MTF gate: keep strict majority for >=4 TFs, but for 3 TFs
+            require >=2 agreeing AND the base-TF EMA9/EMA21 slope to
+            confirm direction (removes 1-1-1 splits without killing
+            trade count).
+          - Split-vote veto: only reject when the winning side has 1
+            vote AND the base-TF slope is flat (|ema9-ema21| < 0.15*ATR).
+            This preserves trades where base TF has a clear edge.
+          - Mean-rev stretch threshold relaxed to 0.75*ATR (was 1.0) so
+            exhaustion fades fire on 1m/3m bars; added a hard veto when
+            stretch > 3.0*ATR (those are trend days, not mean-rev).
+          - Removed the redundant momentum confirmation for mean-rev
+            setups (reclaim/wick already encodes it); kept it for trend.
+          - Opposite-swing veto: narrowed to last 2 bars AND only when
+            the fresh swing is decisive (>= 0.6*ATR displacement) AND
+            the current bar closes back through the swing (confirmation
+            of rejection), so shallow pullbacks no longer veto.
+          - Added "large opposite bar" veto: reject if the previous bar
+            moved >= 1.2*ATR against the intended direction (classic
+            reversal-catch loss).
+          - Added "flat slope" veto for trend setups: require
+            |ema9 - ema21| >= 0.10*ATR so we don't take trend trades in
+            chop.
+          - Distance gate: keep EMA21 structural cap but tighten the
+            directional cap to 1.5*ATR (was 2.0) — losers were the
+            1.5-2.0 ATR extended entries.
+          - Anti-chase gate: tightened to 2.5*ATR over 3 bars (was 3.0)
+            because the >2.5 ATR movers were the dominant loser class
+            in v5's trade log.
           - Kept ATR regime, risk gates, structural SL/TP, macro gate.
     """
     if i < 3 or i >= len(df):
@@ -484,6 +497,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     high = float(row["High"])
     low = float(row["Low"])
     prev_close = float(prev["Close"])
+    prev_high = float(prev["High"])
+    prev_low = float(prev["Low"])
     prev_ema9 = float(prev["EMA9"]) if np.isfinite(prev["EMA9"]) else ema9
 
     if not (np.isfinite(ema9) and np.isfinite(ema21) and np.isfinite(close)):
@@ -492,6 +507,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         return None
 
     bar_range = max(high - low, 1e-9)
+    ema_slope = ema9 - ema21
+    slope_flat = abs(ema_slope) < 0.10 * atr
 
     # --- regime context (EMA50 / EMA200) ---------------------------------
     ema50 = float(row["EMA50"]) if "EMA50" in df.columns and np.isfinite(row["EMA50"]) else None
@@ -533,20 +550,20 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
                     mtf_short_votes += 1
 
     # Relaxed majority: with >=4 TFs require strict majority; with 3 TFs
-    # require >=2 agreeing (filters 1-1-1 splits but restores trade count).
+    # require >=2 agreeing AND base-TF slope confirms direction.
     if mtf_available >= 4:
         mtf_long_ok = mtf_long_votes > mtf_short_votes
         mtf_short_ok = mtf_short_votes > mtf_long_votes
     elif mtf_available == 3:
-        mtf_long_ok = mtf_long_votes >= 2
-        mtf_short_ok = mtf_short_votes >= 2
+        mtf_long_ok = (mtf_long_votes >= 2) and (ema_slope > 0)
+        mtf_short_ok = (mtf_short_votes >= 2) and (ema_slope < 0)
     else:
         mtf_long_ok = True
         mtf_short_ok = True
 
-    # Split-vote veto: reject when the winning side has only 1 vote
-    # (1-1-1 or 1-0-2 splits carry no edge — dominant loser class).
-    if mtf_available >= 3:
+    # Split-vote veto: reject only when the winning side has 1 vote AND
+    # the base-TF slope is flat (no directional edge at all).
+    if mtf_available >= 3 and slope_flat:
         if mtf_long_votes == 1 and mtf_short_votes <= 1:
             mtf_long_ok = False
         if mtf_short_votes == 1 and mtf_long_votes <= 1:
@@ -575,70 +592,83 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     setup_type = None
 
     if regime == "trend":
-        if ema9 > ema21 and long_bias and mtf_long_ok and not macro_blocks_long:
-            direction = "long"
-            setup_type = "trend_follow_long"
-        elif ema9 < ema21 and short_bias and mtf_short_ok and not macro_blocks_short:
-            direction = "short"
-            setup_type = "trend_follow_short"
+        # Require a non-flat slope so we don't take trend trades in chop.
+        if not slope_flat:
+            if ema9 > ema21 and long_bias and mtf_long_ok and not macro_blocks_long:
+                direction = "long"
+                setup_type = "trend_follow_long"
+            elif ema9 < ema21 and short_bias and mtf_short_ok and not macro_blocks_short:
+                direction = "short"
+                setup_type = "trend_follow_short"
     else:
         # Mean reversion: fade exhaustion. Accept EITHER a reclaim candle
-        # OR a rejection wick (close in the outer third of the bar range)
-        # so we can fade on the exhaustion bar itself, not one bar late.
+        # OR a rejection wick (close in the outer third of the bar range).
+        # Stretch threshold relaxed to 0.75*ATR; hard veto above 3.0*ATR
+        # (those are trend days, not mean-rev).
         if ema50 is not None:
             stretch = (close - ema50) / atr
-            reclaim_up = close > prev_close and close > float(prev["Low"])
-            reclaim_dn = close < prev_close and close < float(prev["High"])
-            # Rejection wick: close in upper third (long) / lower third (short).
+            reclaim_up = close > prev_close and close > prev_low
+            reclaim_dn = close < prev_close and close < prev_high
             upper_third = low + (2.0 / 3.0) * bar_range
             lower_third = low + (1.0 / 3.0) * bar_range
-            wick_up = close >= upper_third and low < min(prev["Low"], prev2["Low"])
-            wick_dn = close <= lower_third and high > max(prev["High"], prev2["High"])
+            wick_up = close >= upper_third and low < min(prev_low, float(prev2["Low"]))
+            wick_dn = close <= lower_third and high > max(prev_high, float(prev2["High"]))
 
-            if stretch <= -1.0 and (reclaim_up or wick_up) and mtf_long_ok and not macro_blocks_long:
-                direction = "long"
-                setup_type = "mean_revert_long"
-            elif stretch >= 1.0 and (reclaim_dn or wick_dn) and mtf_short_ok and not macro_blocks_short:
-                direction = "short"
-                setup_type = "mean_revert_short"
+            if abs(stretch) <= 3.0:
+                if stretch <= -0.75 and (reclaim_up or wick_up) and mtf_long_ok and not macro_blocks_long:
+                    direction = "long"
+                    setup_type = "mean_revert_long"
+                elif stretch >= 0.75 and (reclaim_dn or wick_dn) and mtf_short_ok and not macro_blocks_short:
+                    direction = "short"
+                    setup_type = "mean_revert_short"
 
     if direction is None:
         return None
 
     # --- distance gate (don't chase) -------------------------------------
     # Use EMA21 (structural) instead of EMA9 (noisy on 1m/3m bars).
+    # Directional cap tightened to 1.5*ATR (losers were 1.5-2.0 ATR extended).
     if abs(close - ema21) > DISTANCE_GATE_ATR * atr:
         return None
-    if (close - ema21) > 2.0 * atr and direction == "long":
+    if (close - ema21) > 1.5 * atr and direction == "long":
         return None
-    if (ema21 - close) > 2.0 * atr and direction == "short":
+    if (ema21 - close) > 1.5 * atr and direction == "short":
         return None
 
     # --- anti-chase gate (losers were late entries) ----------------------
-    # Relaxed to 3.0*ATR over 3 bars — losers were the >3.0 ATR chasers,
-    # not the 2.5-3.0 ATR movers.
+    # Tightened to 2.5*ATR over 3 bars — the >2.5 ATR movers were the
+    # dominant loser class in v5's trade log.
     move_3 = close - float(prev3["Close"])
-    if direction == "long" and move_3 > 3.0 * atr:
+    if direction == "long" and move_3 > 2.5 * atr:
         return None
-    if direction == "short" and -move_3 > 3.0 * atr:
+    if direction == "short" and -move_3 > 2.5 * atr:
+        return None
+
+    # --- large opposite bar veto (classic reversal-catch loss) -----------
+    prev_move = prev_close - float(prev2["Close"])
+    if direction == "long" and prev_move <= -1.2 * atr:
+        return None
+    if direction == "short" and prev_move >= 1.2 * atr:
         return None
 
     # --- opposite-swing veto (losers entered into fresh reversal) --------
-    # Narrowed to last 2 bars and only when the fresh swing is decisive
-    # (>= 0.5*ATR displacement) so shallow pullbacks don't veto.
+    # Narrowed to last 2 bars, decisive displacement (>= 0.6*ATR), AND
+    # current bar closes back through the swing (confirmation of rejection).
     if direction == "long":
         fresh_lh = (
-            float(prev["High"]) < float(prev2["High"])
-            and float(row["High"]) < float(prev["High"])
-            and (float(prev2["High"]) - float(row["High"])) >= 0.5 * atr
+            prev_high < float(prev2["High"])
+            and high < prev_high
+            and (float(prev2["High"]) - high) >= 0.6 * atr
+            and close < prev_high
         )
         if fresh_lh:
             return None
     else:
         fresh_hl = (
-            float(prev["Low"]) > float(prev2["Low"])
-            and float(row["Low"]) > float(prev["Low"])
-            and (float(row["Low"]) - float(prev2["Low"])) >= 0.5 * atr
+            prev_low > float(prev2["Low"])
+            and low > prev_low
+            and (low - float(prev2["Low"])) >= 0.6 * atr
+            and close > prev_low
         )
         if fresh_hl:
             return None
@@ -656,18 +686,19 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not (breakout_dn or at_resistance):
             return None
 
-    # --- momentum confirmation (relaxed) ---------------------------------
-    tol = 0.05 * atr
-    if direction == "long":
-        momentum_ok = (close > prev_close) or (
-            close > ema9 and prev_close <= prev_ema9 + tol
-        )
-    else:
-        momentum_ok = (close < prev_close) or (
-            close < ema9 and prev_close >= prev_ema9 - tol
-        )
-    if not momentum_ok:
-        return None
+    # --- momentum confirmation (trend only; mean-rev already encoded) ----
+    if regime == "trend":
+        tol = 0.05 * atr
+        if direction == "long":
+            momentum_ok = (close > prev_close) or (
+                close > ema9 and prev_close <= prev_ema9 + tol
+            )
+        else:
+            momentum_ok = (close < prev_close) or (
+                close < ema9 and prev_close >= prev_ema9 - tol
+            )
+        if not momentum_ok:
+            return None
 
     # --- structural stop / targets ---------------------------------------
     if direction == "long":
