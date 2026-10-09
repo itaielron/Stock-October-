@@ -1,10 +1,12 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import json
 import os
 
 st.set_page_config(page_title="Stock-October- Kanban", layout="wide")
 st.title("🚀 Blissful Carson - Autonomous Agent Dashboard")
-st.info("💡 Tip: Press 'R' or refresh your browser to see the latest agent updates.")
+st_autorefresh(interval=2000, limit=None, key="dashboard_autorefresh")
+st.success("🟢 LIVE: Seamless real-time agent updates enabled.")
 
 KANBAN_FILE = "kanban.json"
 LOG_FILE = "agent_activity.log"
