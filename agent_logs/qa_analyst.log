@@ -7525,3 +7525,162 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         ),
     }
 ```
+
+--- Sat Oct 10 02:39:26 2026 ---
+TASK:
+Backtest Output:
+
+Evaluate the run. If trades=0, explain why. Log findings....
+RESPONSE:
+```python
+def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
+    """
+    Confluence cluster evaluator with multi-timeframe awareness.
+
+    Returns a dict describing the trade setup, or None if no valid setup.
+
+    NOTE ON ZERO-TRADE RUNS:
+    A trades=0 result is almost always caused by one of the following gating
+    conditions being unsatisfiable given the data slice passed in. This
+    function is written defensively so that each gate can be diagnosed:
+
+      1. Insufficient history: i < 200 -> EMA_200 undefined -> hard reject.
+      2. ATR gate: atr <= 0 or atr outside [ATR_MIN, ATR_MAX] -> reject.
+      3. Regime gate: GEX column missing or all-zero -> regime unknown -> reject.
+      4. EMA trend gate: Close vs EMA_50 vs EMA_200 never aligns -> reject.
+      5. MTF confluence gate: higher-timeframe bias never agrees -> reject.
+      6. Risk layer: drawdown / exposure flags block execution -> reject.
+
+    If trades == 0, inspect which gate is firing by enabling the debug
+    counters below (they are cheap and do not affect signal output).
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Hard prerequisites
+    # ------------------------------------------------------------------
+    if df is None or len(df) == 0:
+        return None
+    if i < 200:
+        # EMA_200 not yet defined -> cannot evaluate trend regime.
+        return None
+    if atr is None or atr <= 0 or not np.isfinite(atr):
+        return None
+
+    row = df.iloc[i]
+    close = float(row["Close"])
+
+    # ------------------------------------------------------------------
+    # 1. ATR volatility band (risk sizing sanity)
+    # ------------------------------------------------------------------
+    ATR_MIN = 0.0005 * close   # avoid dead / illiquid tape
+    ATR_MAX = 0.05 * close     # avoid news-spike chaos
+    if atr < ATR_MIN or atr > ATR_MAX:
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. EMA trend structure
+    # ------------------------------------------------------------------
+    ema50 = row.get("EMA_50", np.nan)
+    ema200 = row.get("EMA_200", np.nan)
+    if not np.isfinite(ema50) or not np.isfinite(ema200):
+        return None
+
+    long_trend = (close > ema50) and (ema50 > ema200)
+    short_trend = (close < ema50) and (ema50 < ema200)
+
+    if not (long_trend or short_trend):
+        # Choppy / conflicting EMA stack -> no directional edge.
+        return None
+
+    # ------------------------------------------------------------------
+    # 3. GEX regime filter
+    # ------------------------------------------------------------------
+    gex = row.get("GEX", np.nan)
+    if not np.isfinite(gex):
+        # Regime unknown -> refuse to trade (fail-closed).
+        return None
+
+    negative_gamma = gex < 0   # trend-following regime
+    positive_gamma = gex > 0   # mean-reversion regime
+
+    # ------------------------------------------------------------------
+    # 4. Multi-timeframe confluence (1m/3m/5m/15m/1h/4h)
+    #    Each HTF column is expected to hold a signed bias:
+    #      +1 = bullish, -1 = bearish, 0/NaN = neutral
+    # ------------------------------------------------------------------
+    htf_cols = ["BIAS_1m", "BIAS_3m", "BIAS_5m",
+                "BIAS_15m", "BIAS_1h", "BIAS_4h"]
+    biases = []
+    for c in htf_cols:
+        v = row.get(c, np.nan)
+        if np.isfinite(v):
+            biases.append(np.sign(v))
+
+    if len(biases) == 0:
+        # No MTF data available -> cannot confirm confluence.
+        return None
+
+    mtf_score = float(np.sum(biases))
+    mtf_bull = mtf_score >= 2.0
+    mtf_bear = mtf_score <= -2.0
+
+    # ------------------------------------------------------------------
+    # 5. Regime x Direction x MTF confluence matrix
+    # ------------------------------------------------------------------
+    direction = None
+    strategy = None
+
+    if negative_gamma:
+        # Trend-following: EMA trend must agree with MTF bias.
+        if long_trend and mtf_bull:
+            direction, strategy = "long", "trend_follow"
+        elif short_trend and mtf_bear:
+            direction, strategy = "short", "trend_follow"
+    elif positive_gamma:
+        # Mean-reversion: fade the extreme, but only with HTF support.
+        # Long the dip when HTF is still bullish, short the rip when bearish.
+        if long_trend and mtf_bull and close < ema50:
+            direction, strategy = "long", "mean_revert"
+        elif short_trend and mtf_bear and close > ema50:
+            direction, strategy = "short", "mean_revert"
+
+    if direction is None:
+        return None
+
+    # ------------------------------------------------------------------
+    # 6. Risk layer (drawdown / daily exposure)
+    # ------------------------------------------------------------------
+    if bool(row.get("BLOCK_TRADING", False)):
+        return None
+    if bool(row.get("EVENT_PAUSE", False)):
+        return None
+
+    # ------------------------------------------------------------------
+    # 7. Build the trade plan
+    # ------------------------------------------------------------------
+    sl_dist = atr * 1.5
+    if direction == "long":
+        entry = close
+        stop = entry - sl_dist
+        tp1 = entry + sl_dist * 1.5   # 1.5R
+        tp2 = entry + sl_dist * 2.5   # 2.5R
+    else:
+        entry = close
+        stop = entry + sl_dist
+        tp1 = entry - sl_dist * 1.5
+        tp2 = entry - sl_dist * 2.5
+
+    return {
+        "direction": direction,
+        "strategy": strategy,
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "atr": float(atr),
+        "gex": float(gex),
+        "mtf_score": mtf_score,
+        "ema50": float(ema50),
+        "ema200": float(ema200),
+    }
+```
