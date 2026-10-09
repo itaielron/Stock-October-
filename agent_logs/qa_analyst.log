@@ -9686,3 +9686,45 @@ No winners, no losers → **no learning signal**. Mandate #6 (genetic learning) 
 4. Re-run same window. Target: ≥5 trades to establish a baseline before any optimization.
 
 **Do not proceed to optimization until trades > 0.**
+
+--- Sat Oct 10 02:56:51 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-02T23:56:45Z -> 2026-10-09T23:56:45Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[trade] SPY WINNER entry=774.68 sl=772.91 tp1=777.86 tp2=779.98 exit=777.30 (GAP_STOP) R=+1.64 bars=58
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ LOSER entry=754.44 sl=752.52 tp1=757.90 tp2=760.2...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-09
+
+**Grade: FAIL (insufficient sample + structural flaw)**
+
+### 1. Sample Size
+2 trades is statistically meaningless. A 50% win rate on n=2 has a 95% CI of roughly [1%, 99%]. No conclusion can be drawn. The engine must produce ≥30 trades per timeframe before any grade is issued.
+
+### 2. Why the Loser Lost (QQQ, -1.00R, 1 bar)
+- Entry 754.44, SL 752.52 → SL distance = 1.92. ATR_14×1.5 ≈ 1.92 implies ATR ≈ 1.28.
+- Exit on **bar 1** = immediate stop-out. This is a **stop-hunt / entry-too-tight** signature, not a directional failure.
+- Root cause: entry was taken into a wick/extension with SL inside the noise band. The ATR multiplier is too tight for QQQ's 1m/3m microstructure. **Fix: require SL ≥ 1.5×ATR AND entry candle body ≥ 0.5×ATR (reject doji/indecision entries).**
+
+### 3. Why the Winner Won (SPY, +1.64R, 58 bars)
+- Exit tagged **GAP_STOP** at 777.30, below TP1=777.86. This is a *lucky* exit — price gapped into the TP zone and the engine closed on the gap, not on a clean TP1 touch.
+- 58 bars to reach ~+1.6R is slow drift, not a confluence cluster. This is **not** a repeatable edge; it's a trend-following tailwind.
+
+### 4. Mandate Violations
+- **MTFA (#5):** Only one timeframe appears to have run. No 1m/3m/5m/15m/1h/4h cross-check logged.
+- **GEX (#11):** No neutral-GEX proxy logged. Confirm the regime filter defaulted to neutral rather than silently skipping.
+- **Visual clarity (#4):** Charts must show entry arrow + TP1/SL markers. Not verifiable from log — confirm `charts/` contains annotated PNGs.
+- **Proven strategies (#10):** Do NOT append these params. 50% on n=2 is not a proven strategy.
+
+### 5. Required Fixes Before Next Cycle
+1. Enforce minimum trade count (≥30) or extend window.
+2. Add entry-quality gate: reject if entry candle range < 0.5×ATR.
+3. Widen SL floor to 1.5×ATR minimum; log ATR at entry.
+4. Log GEX proxy value per trade.
+5. Run all 6 timeframes; report per-TF win rate.
+
+**Verdict: Do not halt. Do not log to proven_strategies.md. Re-run with fixes.**

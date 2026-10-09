@@ -436,68 +436,63 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    Hierarchical confluence cluster — 1Hour timeframe (QA-hardened rewrite v4).
+    Hierarchical confluence cluster — 4Hour timeframe (QA-hardened rewrite v5).
 
-    QA feedback addressed in this revision (from 15Min FAIL report):
-      (1) MINIMUM HOLD / NOISE FILTER (QA gate #1): 1-bar GAP_STOP exits
-          with |R| < 0.5 are data artifacts, not trades. We cannot see the
-          exit here, so we HARDEN THE ENTRY so that a 1-bar gap-fill is
-          structurally impossible: require the entry bar to CLOSE beyond
-          the prior bar's extreme (confirmation), require a decisive body,
-          and require the bar to be a fresh breakout of the recent 3-bar
-          extreme. A bar that satisfies all three cannot be a micro-gap
-          fill — it is a real participation bar.
-      (2) ENTRY CONFIRMATION (QA gate #2): Long requires
-          `Close[t] > High[t-1]`; Short requires `Close[t] < Low[t-1]`.
-          This kills the −0.05 gap-entry loser directly.
-      (3) REGIME GATE (QA gate #3): GEX proxy =
-          `sign(EMA_50 − EMA_200) * volume_zscore`. When the proxy is
-          strongly bullish, mean-reversion SHORTS are blocked. When
-          strongly bearish, mean-reversion LONGS are blocked. Neutral
-          permits both (Mandate §11 — never halt on missing GEX).
-      (4) ATR FLOOR (QA gate #4): Reject `ATR_14 < 0.15% of price`.
-          The +0.02/+0.06 dead-vol trades are structurally excluded.
-      (5) MTFA (Mandate §5): 1Hour is the anchor. We require HTF
-          alignment via EMA_200 (or EMA_50 vs EMA_20 fallback) AND a
-          slope agreement over 5 bars. When higher-TF columns are
-          present (EMA_200_4H, EMA_50_4H, EMA_200_1D) we use them as a
-          hard directional anchor; otherwise we degrade gracefully to
-          the 1Hour EMA_200. This is the 1Hour leg of the MTFA stack.
+    QA feedback addressed in this revision (from 1Hour zero-trade FAIL report):
+      (1) GEX DEADLOCK (Mandate §11): GEX is NEVER a hard gate. The proxy is
+          computed for regime ROUTING only. If the proxy is unavailable or
+          degenerate, we fall through to EMA+ATR confluence. There is NO
+          `if gex is None: return None` path. `_GATE_TRACE["gex_ok"]` is
+          incremented unconditionally.
+      (2) EMA STACK TIMEFRAME-ADAPTIVE: 4Hour bars are ~4x denser than 1Hour
+          in wall-clock terms, so a 1-week window yields only ~30-35 bars.
+          EMA_50/EMA_200 is IMPOSSIBLE on this window. We therefore use the
+          FAST stack (EMA_9 vs EMA_21) as the primary trend filter, with
+          EMA_50 as a slow anchor when present. This is the QA-mandated
+          substitution for sub-15m/4H windows.
+      (3) ATR BAND WIDENED: 4Hour ATR/Close is naturally larger than 1Hour.
+          Band is [0.10%, 6.0%] — a floor to kill dead-vol bars, a ceiling
+          only to reject data glitches. No tight ceiling that zeroes signals.
+      (4) MACRO PAUSE: Default Trading_Enabled = True. No calendar feed ->
+          never block. If a column exists and is False, we skip the bar but
+          the counter is logged so a stuck-False bug is visible.
+      (5) PER-BAR INSTRUMENTATION (QA non-negotiable): bars_passed_gex,
+          bars_passed_ema, bars_passed_atr, bars_passed_macro are all
+          incremented so a zero-trade run self-diagnoses.
 
-    1Hour-specific structural tuning (win-rate oriented, not overfit):
-      - Warmup guard = 60 bars. 1Hour bars are ~60x denser than 1Min in
-        wall-clock terms; 60 bars ≈ 2.5 trading days — enough for
-        EMA_50/200 + ATR_14 + swing seeding on a 1-week window.
-      - Swing lookback = 24 bars (1Hour swings span ~1 trading day).
-      - Pullback tolerance = 0.75 ATR around EMA_50 (1Hour noise is
-        larger than 15Min; wider tolerance keeps entries near value).
-      - Momentum body >= 0.55 ATR (1Hour bars carry more signal; a
-        decisive body is a real participation edge).
-      - Close position in bar range: top/bottom 25% (1Hour bars are
-        less wick-dominated; 25% is a real edge).
-      - R:R >= 1.8 on TP1, 3.0 on TP2 (1Hour moves are larger; TP1 is
+    4Hour-specific structural tuning (win-rate oriented, not overfit):
+      - Warmup guard = 30 bars. 4Hour bars are ~4x denser than 1Hour in
+        wall-clock terms; 30 bars ≈ 5 trading days — enough for EMA_21 +
+        ATR_14 + swing seeding on a 1-week window.
+      - Swing lookback = 12 bars (4Hour swings span ~2 trading days).
+      - Pullback tolerance = 0.60 ATR around EMA_21 (4Hour noise is larger;
+        wider tolerance keeps entries near value without chasing).
+      - Momentum body >= 0.45 ATR (4Hour bars carry more signal; a decisive
+        body is a real participation edge).
+      - Close position in bar range: top/bottom 30% (4Hour bars are less
+        wick-dominated; 30% is a real edge).
+      - R:R >= 1.8 on TP1, 3.0 on TP2 (4Hour moves are larger; TP1 is
         reachable within a session).
-      - Mean-reversion stretch cap = 1.0 ATR from swing extreme.
-      - Trend continuation requires EMA_50 slope agreement over 5 bars
-        (1Hour slope over 5 bars ≈ 5 hours — the natural 1Hour trend
-        unit).
-      - Volume confirmation: require current bar volume >= 1.10x rolling
-        mean (1Hour bars are less noisy; 1.10x is a real participation
-        edge).
-      - 1Hour-specific: require a fresh breakout of the recent 3-bar
-        extreme in the trade direction (momentum ignition) — the single
-        strongest 1Hour win-rate filter.
-      - 1Hour-specific: require the prior bar to confirm direction (no
+      - Mean-reversion stretch cap = 1.2 ATR from swing extreme (4Hour
+        stretches are larger than 1Hour).
+      - Trend continuation requires EMA_21 slope agreement over 3 bars
+        (4Hour slope over 3 bars ≈ 12 hours — the natural 4Hour trend unit).
+      - Volume confirmation: require current bar volume >= 1.05x rolling
+        mean (4Hour bars are less noisy; 1.05x is a real participation edge).
+      - 4Hour-specific: require a fresh breakout of the recent 2-bar extreme
+        in the trade direction (momentum ignition) — the single strongest
+        4Hour win-rate filter.
+      - 4Hour-specific: require the prior bar to confirm direction (no
         counter-trend entries against the immediately preceding bar).
-      - 1Hour-specific: require the entry bar to close beyond the prior
+      - 4Hour-specific: require the entry bar to close beyond the prior
         bar's extreme (QA gate #2) — kills gap-fill artifacts.
 
     Confluence stack (all must agree):
         1) GEX regime  (proxy, neutral-permissive — NEVER hard-blocks)
-        2) EMA trend   (Close > EMA_50 + slope > 0 + >= 0.30 ATR for longs;
+        2) EMA trend   (Close > EMA_21 + slope > 0 + >= 0.25 ATR for longs;
                         symmetric for shorts)
-        3) ATR sanity  (RELATIVE band: 0.15% <= ATR/Close <= 3.0%)
-        4) HTF anchor  (EMA_200 or EMA_50 vs EMA_20 alignment)
+        3) ATR sanity  (RELATIVE band: 0.10% <= ATR/Close <= 6.0%)
+        4) HTF anchor  (EMA_50 or EMA_21 vs EMA_9 alignment)
         5) Structural pullback + momentum + volume + breakout + strong close
         6) Entry confirmation (Close[t] beyond High[t-1] / Low[t-1])
     """
@@ -522,12 +517,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         _REJECT_STATS[reason] = _REJECT_STATS.get(reason, 0) + 1
         return None
 
-    # ---- Warmup guard: 60 bars for 1Hour (≈2.5 trading days of context) ----
-    if i < 60:
+    # ---- Warmup guard: 30 bars for 4Hour (≈5 trading days of context) ----
+    if i < 30:
         return _rej("warmup")
 
     # ---- Required columns (fail-soft: skip bar, never raise) ----
-    required = ("Close", "High", "Low", "Open", "Volume", "EMA_50", "ATR_14")
+    required = ("Close", "High", "Low", "Open", "Volume", "ATR_14")
     for col in required:
         if col not in df.columns:
             return _rej("missing_col")
@@ -541,7 +536,6 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         low = float(row["Low"])
         open_ = float(row["Open"])
         vol = float(row["Volume"])
-        ema50 = float(row["EMA_50"])
         atr14 = float(row["ATR_14"])
         prev_high = float(prev["High"])
         prev_low = float(prev["Low"])
@@ -550,35 +544,44 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     except (TypeError, ValueError):
         return _rej("bad_values")
 
-    if atr14 <= 0 or close <= 0 or ema50 <= 0:
+    if atr14 <= 0 or close <= 0:
         return _rej("bad_values")
 
     _GATE_TRACE["bars"] += 1
 
-    # ---- EMA_200 / EMA_20 with graceful fallback (HTF anchor) ----
-    ema200 = None
-    if "EMA_200" in df.columns:
+    # ---- EMA stack with graceful fallback (QA gate #2: timeframe-adaptive) ----
+    # 4Hour window is too short for EMA_50/EMA_200. Use EMA_9/EMA_21 as the
+    # primary trend filter, EMA_50 as a slow anchor when present.
+    def _get_ema(col):
+        if col not in df.columns:
+            return None
         try:
-            v = float(row["EMA_200"])
+            v = float(row[col])
             if v == v and v > 0:
-                ema200 = v
+                return v
         except (TypeError, ValueError):
-            ema200 = None
+            return None
+        return None
 
-    ema20 = None
-    if "EMA_20" in df.columns:
-        try:
-            v = float(row["EMA_20"])
-            if v == v and v > 0:
-                ema20 = v
-        except (TypeError, ValueError):
-            ema20 = None
+    ema9 = _get_ema("EMA_9")
+    ema21 = _get_ema("EMA_21")
+    ema50 = _get_ema("EMA_50")
+    ema200 = _get_ema("EMA_200")
+
+    # Primary trend reference: EMA_21 if available, else EMA_50, else EMA_9.
+    ema_fast = ema9
+    ema_slow = ema21 if ema21 is not None else ema50
+    if ema_slow is None:
+        ema_slow = ema9
+    if ema_fast is None:
+        ema_fast = ema_slow
+
+    if ema_slow is None or ema_slow <= 0:
+        return _rej("missing_col")
 
     # ---- Optional higher-TF anchors (MTFA, Mandate §5) ----
-    # If the caller has merged 4H/1D EMAs, use them as a hard directional
-    # anchor. Otherwise degrade gracefully to the 1Hour EMA_200.
     htf_ema_4h = None
-    for col in ("EMA_200_4H", "EMA_50_4H"):
+    for col in ("EMA_200_4H", "EMA_50_4H", "EMA_200_1D"):
         if col in df.columns:
             try:
                 v = float(row[col])
@@ -606,12 +609,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     # ============================================================
     # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
-    #    QA gate #3: proxy = sign(EMA_50 − EMA_200) * volume_zscore.
+    #    QA gate #1: proxy is for ROUTING only. NEVER a hard gate.
     #    Strongly bullish proxy => block MR shorts.
     #    Strongly bearish proxy => block MR longs.
     #    Neutral => permit both (permissive).
     # ============================================================
-    lookback = 24  # 1Hour: 24 bars ≈ 1 trading day of context
+    lookback = 12  # 4Hour: 12 bars ≈ 2 trading days of context
     if i < lookback:
         return _rej("warmup")
     window = df.iloc[i - lookback:i]
@@ -634,9 +637,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         drift = (close - vwap) / vwap if vwap > 0 else 0.0
 
         rets = np.diff(w_close) / w_close[:-1]
-        if len(rets) >= 12:
-            recent_vol = float(np.std(rets[-6:])) + 1e-9
-            prior_vol = float(np.std(rets[:-6])) + 1e-9
+        if len(rets) >= 6:
+            recent_vol = float(np.std(rets[-3:])) + 1e-9
+            prior_vol = float(np.std(rets[:-3])) + 1e-9
             vol_slope = (recent_vol - prior_vol) / prior_vol
             vol_expansion = vol_slope > 0.10
         else:
@@ -646,13 +649,13 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         last_rng = float(high - low) + 1e-9
         range_ratio = last_rng / rng
 
-        # QA gate #3: directional proxy from EMA_50 vs EMA_200 (or EMA_20).
-        ema_ref = ema200 if ema200 is not None else ema20
+        # QA gate #1: directional proxy from EMA_21 vs EMA_50 (or EMA_9).
+        ema_ref = ema50 if ema50 is not None else ema9
         ema_dir_sign = 0.0
         if ema_ref is not None and ema_ref > 0:
-            if ema50 > ema_ref:
+            if ema_slow > ema_ref:
                 ema_dir_sign = 1.0
-            elif ema50 < ema_ref:
+            elif ema_slow < ema_ref:
                 ema_dir_sign = -1.0
 
         # Volume z-score over the lookback window.
@@ -677,31 +680,36 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     # ============================================================
     # 2) EMA TREND FILTER (state + slope, NO crossover event)
-    #    Longs: Close > EMA_50 AND EMA_50 slope > 0 over 5 bars AND
-    #           (Close - EMA_50) >= 0.30 * ATR.
+    #    QA gate #2: timeframe-adaptive. 4Hour uses EMA_9/EMA_21.
+    #    Longs: Close > EMA_21 AND EMA_21 slope > 0 over 3 bars AND
+    #           (Close - EMA_21) >= 0.25 * ATR.
     #    Shorts: symmetric.
     # ============================================================
-    ema50_slope_up = False
-    ema50_slope_dn = False
-    if i >= 5:
+    ema_slope_up = False
+    ema_slope_dn = False
+    if i >= 3:
         try:
-            ema50_prev5 = float(df["EMA_50"].iloc[i - 5])
-            if ema50_prev5 == ema50_prev5 and ema50_prev5 > 0:
-                ema50_slope_up = ema50 > ema50_prev5
-                ema50_slope_dn = ema50 < ema50_prev5
+            ema_slow_prev3 = float(df["EMA_21"].iloc[i - 3]) if "EMA_21" in df.columns else None
+            if ema_slow_prev3 is None or ema_slow_prev3 != ema_slow_prev3 or ema_slow_prev3 <= 0:
+                # Fallback to EMA_50 slope if EMA_21 unavailable.
+                if "EMA_50" in df.columns:
+                    ema_slow_prev3 = float(df["EMA_50"].iloc[i - 3])
+            if ema_slow_prev3 is not None and ema_slow_prev3 == ema_slow_prev3 and ema_slow_prev3 > 0:
+                ema_slope_up = ema_slow > ema_slow_prev3
+                ema_slope_dn = ema_slow < ema_slow_prev3
         except (TypeError, ValueError):
             pass
 
-    dist_from_ema = close - ema50
+    dist_from_ema = close - ema_slow
     long_trend = (
-        close > ema50
-        and ema50_slope_up
-        and dist_from_ema >= (atr14 * 0.30)
+        close > ema_slow
+        and ema_slope_up
+        and dist_from_ema >= (atr14 * 0.25)
     )
     short_trend = (
-        close < ema50
-        and ema50_slope_dn
-        and (-dist_from_ema) >= (atr14 * 0.30)
+        close < ema_slow
+        and ema_slope_dn
+        and (-dist_from_ema) >= (atr14 * 0.25)
     )
 
     if not (long_trend or short_trend):
@@ -709,17 +717,17 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     _GATE_TRACE["ema_ok"] += 1
 
     # ============================================================
-    # 3) ATR SANITY BAND — RELATIVE (QA gate #4: ATR floor 0.15%)
-    #    1Hour ATR/Close band is [0.15%, 3.0%]. No absolute band.
+    # 3) ATR SANITY BAND — RELATIVE (QA gate #3: widened for 4Hour)
+    #    4Hour ATR/Close band is [0.10%, 6.0%]. No tight ceiling.
     # ============================================================
     atr_pct = atr14 / close
-    if atr_pct < 0.0015 or atr_pct > 0.030:
+    if atr_pct < 0.0010 or atr_pct > 0.060:
         return _rej("atr")
     _GATE_TRACE["atr_ok"] += 1
 
     # ============================================================
     # 4) HTF ANCHOR (MTFA, Mandate §5)
-    #    Prefer 4H EMA if present; else 1Hour EMA_200; else EMA_20.
+    #    Prefer 4H EMA if present; else EMA_50 vs EMA_21; else EMA_21 vs EMA_9.
     #    This is a HARD directional anchor for trend entries.
     # ============================================================
     htf_long_confirm = False
@@ -727,12 +735,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     if htf_ema_4h is not None:
         htf_long_confirm = close > htf_ema_4h
         htf_short_confirm = close < htf_ema_4h
-    elif ema200 is not None:
-        htf_long_confirm = ema50 > ema200
-        htf_short_confirm = ema50 < ema200
-    elif ema20 is not None:
-        htf_long_confirm = ema50 > ema20
-        htf_short_confirm = ema50 < ema20
+    elif ema50 is not None and ema21 is not None:
+        htf_long_confirm = ema21 > ema50
+        htf_short_confirm = ema21 < ema50
+    elif ema21 is not None and ema9 is not None:
+        htf_long_confirm = ema21 > ema9
+        htf_short_confirm = ema21 < ema9
     else:
         # No HTF reference available — degrade gracefully (permissive).
         htf_long_confirm = True
@@ -750,54 +758,54 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     _GATE_TRACE["confirm_ok"] += 1
 
     # ============================================================
-    # 6) STRUCTURAL PULLBACK + MOMENTUM + VOLUME + BREAKOUT (1Hour tuned)
+    # 6) STRUCTURAL PULLBACK + MOMENTUM + VOLUME + BREAKOUT (4Hour tuned)
     # ============================================================
-    swing_low = float(df["Low"].iloc[max(0, i - 24):i].min())
-    swing_high = float(df["High"].iloc[max(0, i - 24):i].max())
+    swing_low = float(df["Low"].iloc[max(0, i - 12):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 12):i].max())
 
     body = close - open_
-    # 1Hour: require a decisive body (>= 0.55 ATR) to filter micro-chop.
-    min_body = atr14 * 0.55
+    # 4Hour: require a decisive body (>= 0.45 ATR) to filter micro-chop.
+    min_body = atr14 * 0.45
     bullish_bar = body > min_body and close > prev_close
     bearish_bar = body < -min_body and close < prev_close
 
-    # 1Hour-specific: close must sit in the top/bottom 25% of the bar
+    # 4Hour-specific: close must sit in the top/bottom 30% of the bar
     # range for trend entries (rejects wick-heavy indecision bars).
     bar_range = high - low
     if bar_range > 0:
         close_pos = (close - low) / bar_range
     else:
         close_pos = 0.5
-    strong_close_up = close_pos >= 0.75
-    strong_close_dn = close_pos <= 0.25
+    strong_close_up = close_pos >= 0.70
+    strong_close_dn = close_pos <= 0.30
 
-    # 1Hour-specific: prior bar must confirm direction.
+    # 4Hour-specific: prior bar must confirm direction.
     prev_body = prev_close - prev_open
     prev_bullish = prev_body > 0
     prev_bearish = prev_body < 0
 
-    # 1Hour-specific: fresh breakout of the recent 3-bar extreme.
-    recent3_high = float(df["High"].iloc[max(0, i - 3):i].max())
-    recent3_low = float(df["Low"].iloc[max(0, i - 3):i].min())
-    breakout_up = close > recent3_high
-    breakout_dn = close < recent3_low
+    # 4Hour-specific: fresh breakout of the recent 2-bar extreme.
+    recent2_high = float(df["High"].iloc[max(0, i - 2):i].max())
+    recent2_low = float(df["Low"].iloc[max(0, i - 2):i].min())
+    breakout_up = close > recent2_high
+    breakout_dn = close < recent2_low
 
-    # Volume confirmation: current bar volume >= 1.10x rolling mean (24 bars).
+    # Volume confirmation: current bar volume >= 1.05x rolling mean (12 bars).
     vol_ok = True
     try:
-        vol_mean = float(df["Volume"].iloc[max(0, i - 24):i].astype(float).mean())
+        vol_mean = float(df["Volume"].iloc[max(0, i - 12):i].astype(float).mean())
         if vol_mean > 0:
-            vol_ok = vol >= (vol_mean * 1.10)
+            vol_ok = vol >= (vol_mean * 1.05)
     except (TypeError, ValueError):
         vol_ok = True
 
     # ============================================================
-    # REGIME ROUTER (Mandate §1 + QA gate #3)
+    # REGIME ROUTER (Mandate §1 + QA gate #1)
     #   negative -> trend-following
     #   positive -> mean-reversion
     #   neutral  -> permissive: BOTH sub-routines enabled
     #
-    # QA gate #3: strongly bullish proxy blocks MR shorts;
+    # QA gate #1: strongly bullish proxy blocks MR shorts;
     #             strongly bearish proxy blocks MR longs.
     # ============================================================
     block_mr_short = gex_proxy > 0.15
@@ -814,12 +822,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("structure")
         if not confirm_long:
             return _rej("confirm")
-        recent_low = float(df["Low"].iloc[i - 8:i].min())
-        # 1Hour: allow pullback within 0.75 ATR of EMA_50.
-        pulled_back = recent_low <= ema50 + (atr14 * 0.75)
+        recent_low = float(df["Low"].iloc[i - 6:i].min())
+        # 4Hour: allow pullback within 0.60 ATR of EMA_21.
+        pulled_back = recent_low <= ema_slow + (atr14 * 0.60)
         if not pulled_back:
             return _rej("structure")
-        # 1Hour-specific: prior bar must not be a strong counter-trend bar.
+        # 4Hour-specific: prior bar must not be a strong counter-trend bar.
         if prev_bearish and abs(prev_body) > atr14 * 0.5:
             return _rej("structure")
         entry = close
@@ -846,8 +854,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("structure")
         if not confirm_short:
             return _rej("confirm")
-        recent_high = float(df["High"].iloc[i - 8:i].max())
-        pulled_back = recent_high >= ema50 - (atr14 * 0.75)
+        recent_high = float(df["High"].iloc[i - 6:i].max())
+        pulled_back = recent_high >= ema_slow - (atr14 * 0.60)
         if not pulled_back:
             return _rej("structure")
         if prev_bullish and abs(prev_body) > atr14 * 0.5:
@@ -866,21 +874,21 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         }
 
     def _mr_long():
-        # QA gate #3: block MR longs when proxy is strongly bearish.
+        # QA gate #1: block MR longs when proxy is strongly bearish.
         if block_mr_long:
             return _rej("gex")
         if not htf_long_confirm:
             return _rej("htf")
         if not vol_ok:
             return _rej("volume")
-        if close >= ema50:
+        if close >= ema_slow:
             return _rej("structure")
         if not bullish_bar:
             return _rej("structure")
         if not confirm_long:
             return _rej("confirm")
         dist_to_low = (close - swing_low) / atr14
-        if dist_to_low > 1.0:
+        if dist_to_low > 1.2:
             return _rej("structure")
         entry = close
         sl = swing_low - (atr14 * 1.5)
@@ -896,21 +904,21 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         }
 
     def _mr_short():
-        # QA gate #3: block MR shorts when proxy is strongly bullish.
+        # QA gate #1: block MR shorts when proxy is strongly bullish.
         if block_mr_short:
             return _rej("gex")
         if not htf_short_confirm:
             return _rej("htf")
         if not vol_ok:
             return _rej("volume")
-        if close <= ema50:
+        if close <= ema_slow:
             return _rej("structure")
         if not bearish_bar:
             return _rej("structure")
         if not confirm_short:
             return _rej("confirm")
         dist_to_high = (swing_high - close) / atr14
-        if dist_to_high > 1.0:
+        if dist_to_high > 1.2:
             return _rej("structure")
         entry = close
         sl = swing_high + (atr14 * 1.5)
