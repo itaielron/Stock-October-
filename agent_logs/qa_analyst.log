@@ -10222,3 +10222,41 @@ RESPONSE:
 Do **not** append to `proven_strategies.md`. Do **not** enter standby (Mandate #9 requires a genuine PASS). Rotate backtester to 15m and 1h with the fixes above. Push logs + charts to GitHub (Mandate #8).
 
 **Next action:** Coder patches gate telemetry + SL width; QA re-evaluates on ≥30 trades.
+
+--- Sat Oct 10 03:05:28 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:05:21Z -> 2026-10-10T00:05:21Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=751.25 sl=752.32 tp1=749.11 tp2=747.51 exit=751.31 (GAP_STOP) R=+0.06 bars=1
+--------------------------------------------------------------...
+RESPONSE:
+**QA VERDICT: FAIL — Insufficient Sample, Not a Valid PASS**
+
+**1. Sample Size Rejection**
+`trades=1` is statistically meaningless. A 100% win rate on n=1 is noise, not edge. Per Mandate #2 (>80% win rate *or high consistency*), consistency requires a distribution — one trade cannot demonstrate it. Do NOT append to `proven_strategies.md`.
+
+**2. Structural Red Flags in the Single Trade**
+- `entry=751.25 sl=752.32 tp1=749.11` → SL distance = 1.07, TP1 distance = 2.14. That's a **2:1 R:R setup**, yet `exit=751.31` with `R=+0.06`.
+- Exit reason `GAP_STOP` at a price *above* entry on a long? Entry 751.25 → exit 751.31 is a +0.06 move, but SL was 752.32 (above entry). This implies the trade was **SHORT** (SL above, TP below), and the "GAP_STOP" fired at 751.31 — *above* the SL of 752.32? That is logically impossible unless the gap filled favorably. **The exit logic is broken or mislabeled.** A short stopped out should exit ≥ SL, not below it.
+- `bars=1` — the trade lived one bar. This is not a confluence cluster; it's a single-bar gap artifact.
+
+**3. Why Only 1 Trade Across 669 Bars?**
+SPY 297 bars + QQQ 372 bars over 7 days ≈ 1m timeframe. Only 1 signal fired. Root causes to investigate:
+- **EMA_50 > EMA_200 gate** on 1m data over 7 days is nearly always satisfied in one direction — should produce *many* signals, not one. The gate is likely inverted or the warmup window consumed most bars.
+- **ATR filter** may be rejecting everything if thresholds are absolute rather than percentile-based.
+- **GEX proxy** (Mandate #11) — confirm it's returning neutral, not silently zeroing all signals.
+
+**4. Required Fixes Before Re-Run**
+1. **Fix exit labeling**: verify SL/TP orientation matches trade direction. Log `direction` explicitly.
+2. **Log rejection counters**: for each bar, count how many signals died at GEX gate vs EMA gate vs ATR gate. Without this, you cannot diagnose the 1-trade anomaly.
+3. **Widen sample**: run across 30+ days minimum, or rotate to 5m/15m per Mandate #10 to accumulate n≥50.
+4. **Do NOT halt** (Mandate #9 does not apply — no valid PASS).
+
+**5. MTFA Compliance (Mandate #5)**
+Output shows only one implicit timeframe. No 1m/3m/5m/15m/1h/4h confluence evaluation occurred. This run does not satisfy the multi-timeframe mandate.
+
+**Action:** Return to Coder. Fix exit logic + add rejection telemetry. Re-run. No GitHub sync of "proven" status — log as `FAILED_VALIDATION`.
