@@ -10185,3 +10185,40 @@ This is a **short that never worked**. Price gapped *against* the position, the 
 5. Produce ≥30 trades before any win-rate claim is valid.
 
 **No PASS. Continue optimization. Do not sleep.**
+
+--- Sat Oct 10 03:04:52 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:04:46Z -> 2026-10-10T00:04:46Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=756.27 sl=758.06 tp1=752.69 tp2=750.01 exit=756.29 (GAP_STOP) R=+0.01 bars=1
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.1...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically void)**
+
+### Why this is not a pass
+- **Sample size = 2.** A 100% win rate on n=2 is noise, not edge. Confidence interval spans ~16–100%. Cannot validate >80% mandate.
+- **Both "winners" are GAP_STOP exits at R=+0.01 and +0.07.** These are not wins — they are flat scratches. The engine exited on a gap artifact, not on TP1/TP2/SL logic. This means the entry→exit path never actually tested the thesis.
+- **SPY produced 0 trades.** 297 bars, no signals. Either the EMA/GEX/ATR gate is over-constrained, or the regime filter is silently rejecting everything. Must diagnose.
+
+### Structural failure analysis (Mandate #6)
+1. **GAP_STOP dominance** = the SL/TP geometry is being bypassed by bar-open gaps. Entry at 756.27, SL 758.06 (short), next bar opens 756.29 → instant exit. The ATR×1.5 stop is too tight relative to overnight/index gap distribution. **Fix:** widen SL to ATR×2.0 for index ETFs, or require entry on non-gap bars only.
+2. **Zero SPY signals** suggests the confluence stack (GEX proxy + EMA50/200 + ATR band) is mutually exclusive on SPY's regime. Log which gate rejects each bar — you cannot optimize a black box.
+3. **No TP1/TP2 hits recorded** → visual clarity mandate (#4) unmet. Charts cannot show "exact TP1/SL markers" if neither was reached.
+
+### Required fixes before next cycle
+- Add **per-bar gate rejection counters** (GEX / EMA / ATR / macro / drawdown) and print them in the summary.
+- Enforce **minimum trade count ≥ 30** before any win-rate claim is graded.
+- Reclassify GAP_STOP exits with |R| < 0.15 as **SCRATCH**, not WINNER. Win rate must exclude scratches.
+- Widen index SL to ATR×2.0; re-run 1m/3m/5m/15m/1h/4h per Mandate #5.
+- Confirm GEX proxy is neutral-derived (Mandate #11) — no crash observed, good, but verify it isn't zeroing all signals.
+
+### Verdict
+Do **not** append to `proven_strategies.md`. Do **not** enter standby (Mandate #9 requires a genuine PASS). Rotate backtester to 15m and 1h with the fixes above. Push logs + charts to GitHub (Mandate #8).
+
+**Next action:** Coder patches gate telemetry + SL width; QA re-evaluates on ≥30 trades.

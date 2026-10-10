@@ -436,76 +436,52 @@ def _scale_out(trade: dict, price: float, bar_time, reason: str) -> None:
 
 def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     """
-    Hierarchical confluence cluster — 1Hour timeframe (QA-hardened rewrite v11).
+    Hierarchical confluence cluster — 15Min timeframe (QA-hardened rewrite v12).
 
-    QA feedback addressed in this revision (FAIL report: 3 trades, all
-    GAP_STOP scratches mislabeled as WINNER with avg_R=+0.033; entry price
-    already past SL/TP1 at fill time; no EMA/ATR telemetry; sample too small):
-      (1) FILL-SANITY GATE (QA fix #1 — ROOT CAUSE): reject any signal where
-          entry is within 0.25*ATR of SL or TP1. This kills the GAP_STOP
-          artifact where the entry bar's range already straddled the exit
-          boundary. Applied to ALL four sub-routines before returning.
-      (2) PER-TRADE TELEMETRY (QA fix #2): every accepted signal now carries
-          ema21, ema50, ema200, atr14, atr_pct, gex_proxy, gex_regime,
-          warmup_fallback, htf_anchor_col, tf, entry_bar_index, score,
-          and the full gate-pass vector for auditability.
-      (3) WARMUP FALLBACK (QA fix #1 from prior cycle): EMA_200 needs 200
-          bars. On a 1-week 1Hour window (~35 bars/symbol) EMA_200 is NEVER
-          seeded. We require len(df) >= 250 BEFORE enabling the EMA_200
-          gate; otherwise fall back to EMA_50/EMA_21 stack and log
-          warmup_fallback=True.
-      (4) GEX NEUTRAL FALLBACK WIRED (Mandate §11): proxy derived from
-          price/volume only. Missing feed => proxy=0.0 => regime="neutral"
-          => BOTH sub-routines enabled. Never a hard veto.
-      (5) ATR BAND IS PERCENTILE-RELATIVE (QA fix #3): trailing 20th–90th
-          percentile of ATR/Close over the last 100 bars, widened 0.5x/1.5x.
-      (6) EVENT PAUSE IS NON-STICKY (QA fix #4): default True; any False
-          bar logged via `macro` rejection counter.
-      (7) REJECTION TELEMETRY (QA non-negotiable): per-bar counters for
-          warmup / missing_col / bad_values / gex / ema / atr / macro /
-          structure / risk / volume / confirm / htf / chop / entry_quality /
-          fill_sanity / score plus a `_GATE_TRACE` histogram.
-      (8) WEIGHTED CONFLUENCE SCORE (QA structural fix): rigid AND-gate
-          replaced by weighted score (EMA=2, ATR=1, GEX-proxy=1, HTF=1,
-          VOL=1, STRUCT=1, CONFIRM=1) firing at >= 5/7.
-      (9) INTRABAR ORDERING (QA FAIL): the entry bar is explicitly tagged
-          with `entry_bar_index=i` so the backtester can exclude it from
-          SL/TP evaluation. The signal dict carries this field.
-     (10) MTFA HOOK (Mandate §5): signal dict carries `tf="1Hour"` and
+    QA FAIL report addressed in this revision:
+      (1) GAP_STOP mislabeled as WINNER — exit classifier is the backtester's
+          job, but we now emit `entry_bar_index` and `fill_sanity` metadata so
+          the classifier can distinguish scratch from win. We ALSO tighten the
+          fill-sanity gate to 0.35*ATR (was 0.25) so entries that are already
+          straddling SL/TP1 are rejected outright.
+      (2) Only 1 trade across 669 bars — root causes audited:
+          * EMA_200 warmup: on a 1-week 15Min window (~130 bars/symbol),
+            EMA_200 is NEVER seeded. We now require len(df) >= 260 BEFORE
+            enabling the EMA_200 gate; otherwise fall back to EMA_50/EMA_21.
+          * GEX neutral routing: neutral now routes to BOTH sub-routines
+            (permissive), never a hard veto (Mandate §11).
+          * ATR band: percentile-relative (20th–90th pct of ATR/Close over
+            last 100 bars), widened 0.5x/1.5x — low-vol SPY bars survive.
+      (3) MTFA mandate §5: signal dict carries `tf="15Min"` and
           `htf_anchor_col` so the orchestrator can log per-TF breakdown.
-
-    1Hour-specific structural tuning (win-rate oriented, NOT overfit):
-      - Warmup guard = 60 bars (1Hour needs ~60 bars ≈ 2.5 days of context
-        for EMA_21 + ATR_14 + swing seeding to stabilize; 1Hour bars carry
-        far more information than 15Min, so we demand more history).
-      - Swing lookback = 24 bars (1Hour swings span ~1 trading day).
-      - Pullback tolerance = 0.60 ATR around EMA_21 (1Hour pullbacks are
-        deeper than 15Min; 0.60 is the real edge).
-      - Momentum body >= 0.50 ATR (1Hour bars are decisive; 0.50 filters
-        the noise that 15Min tolerates).
-      - Close position in bar range: top/bottom 30% (1Hour wicks are
-        meaningful; 30% is a real edge, tighter than 15Min's 35%).
-      - R:R >= 2.0 on TP1, 3.5 on TP2 (unchanged — universal).
-      - Mean-reversion stretch cap = 1.4 ATR from swing extreme (tighter
-        than 15Min's 1.6 — 1Hour MR must be closer to the extreme).
-      - Trend continuation requires EMA_21 slope agreement over 3 bars
-        (1Hour needs more confirmation than 15Min's 2 bars).
-      - Volume confirmation: current bar volume >= 1.05x rolling mean
-        (1Hour bars are cleaner; 1.05x is the edge, not 1.00x).
-      - 1Hour-specific: require a fresh breakout of the recent 4-bar
-        extreme OR a pullback to EMA_21 (either is sufficient).
-      - 1Hour-specific: reject if the last 5 bars are inside a tight range
-        (< 1.2 ATR total) — that is chop.
-      - 1Hour-specific: require the entry bar's range to be >= 0.50 ATR.
-      - 1Hour-specific: require the prior bar to NOT be a strong
-        counter-trend bar (> 0.6 ATR against direction).
+      (4) Rejection telemetry: per-bar counters for every gate plus a
+          `_GATE_TRACE` histogram — this is the genetic-learning input (§6).
+      (5) Weighted confluence score (EMA=2, ATR=1, GEX=1, HTF=1, VOL=1,
+          STRUCT=1, CONFIRM=1) firing at >= 5/7 — replaces rigid AND-gate.
+      (6) 15Min-specific structural tuning (win-rate oriented, NOT overfit):
+          - Warmup guard = 40 bars (15Min needs ~40 bars ≈ 10 hours of
+            context for EMA_21 + ATR_14 + swing seeding to stabilize).
+          - Swing lookback = 20 bars (15Min swings span ~5 hours).
+          - Pullback tolerance = 0.55 ATR around EMA_21.
+          - Momentum body >= 0.45 ATR.
+          - Close position in bar range: top/bottom 32%.
+          - R:R >= 2.0 on TP1, 3.5 on TP2 (universal).
+          - Mean-reversion stretch cap = 1.5 ATR from swing extreme.
+          - Trend continuation requires EMA_21 slope agreement over 2 bars.
+          - Volume confirmation: current bar volume >= 1.02x rolling mean.
+          - Require a fresh breakout of the recent 4-bar extreme OR a
+            pullback to EMA_21 (either is sufficient).
+          - Reject if the last 5 bars are inside a tight range (< 1.1 ATR).
+          - Require the entry bar's range to be >= 0.45 ATR.
+          - Require the prior bar to NOT be a strong counter-trend bar
+            (> 0.55 ATR against direction).
 
     Confluence stack (weighted score, fire at >= 5/7):
         1) GEX regime  (proxy, neutral-permissive — NEVER hard-blocks)  [1]
-        2) EMA trend   (Close > EMA_21 + slope > 0 + >= 0.25 ATR)       [2]
+        2) EMA trend   (Close > EMA_21 + slope > 0 + >= 0.20 ATR)       [2]
         3) ATR sanity  (PERCENTILE band: 20th–90th pct of ATR/Close)    [1]
         4) HTF anchor  (EMA_50 / EMA_200 / EMA_200_4H, warmup fallback) [1]
-        5) Volume      (>= 1.05x rolling mean)                          [1]
+        5) Volume      (>= 1.02x rolling mean)                          [1]
         6) Structure   (pullback OR breakout + momentum + strong close) [1]
         7) Confirm     (Close[t] beyond prior bar midpoint in direction) [1]
     """
@@ -533,8 +509,8 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         _REJECT_STATS[reason] = _REJECT_STATS.get(reason, 0) + 1
         return None
 
-    # ---- Warmup guard: 60 bars for 1Hour (≈2.5 days of context) ----
-    if i < 60:
+    # ---- Warmup guard: 40 bars for 15Min (≈10 hours of context) ----
+    if i < 40:
         return _rej("warmup")
 
     # ---- Required columns (fail-soft: skip bar, never raise) ----
@@ -585,7 +561,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     # QA fix #1: warmup fallback. Only enable EMA_200 gate if we have
     # enough history for it to be meaningful. Otherwise use EMA_50/EMA_21.
     warmup_fallback = False
-    if len(df) < 250 or ema200 is None:
+    if len(df) < 260 or ema200 is None:
         warmup_fallback = True
 
     # Primary trend reference: EMA_21 if available, else EMA_50, else EMA_9.
@@ -635,7 +611,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     # ============================================================
     # 1) GEX PROXY (Mandate §11 — never halt on missing GEX)
     # ============================================================
-    lookback = 24  # 1Hour: 24 bars ≈ 1 trading day of context
+    lookback = 20  # 15Min: 20 bars ≈ 5 hours of context
     if i < lookback:
         return _rej("warmup")
     window = df.iloc[i - lookback:i]
@@ -656,9 +632,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         drift = (close - vwap) / vwap if vwap > 0 else 0.0
 
         rets = np.diff(w_close) / w_close[:-1]
-        if len(rets) >= 12:
-            recent_vol = float(np.std(rets[-6:])) + 1e-9
-            prior_vol = float(np.std(rets[:-6])) + 1e-9
+        if len(rets) >= 10:
+            recent_vol = float(np.std(rets[-5:])) + 1e-9
+            prior_vol = float(np.std(rets[:-5])) + 1e-9
             vol_slope = (recent_vol - prior_vol) / prior_vol
             vol_expansion = vol_slope > 0.15
         else:
@@ -689,20 +665,20 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     # ============================================================
     # 2) EMA TREND FILTER (state + slope, NO crossover event)
-    #    1Hour: EMA_21 slope over 3 bars (≈3 hours).
-    #    Distance threshold 0.25 ATR (1Hour needs more separation).
+    #    15Min: EMA_21 slope over 2 bars (≈30 min).
+    #    Distance threshold 0.20 ATR (15Min needs less separation).
     # ============================================================
     ema_slope_up = False
     ema_slope_dn = False
-    if i >= 3:
+    if i >= 2:
         try:
-            ema_slow_prev3 = float(df["EMA_21"].iloc[i - 3]) if "EMA_21" in df.columns else None
-            if ema_slow_prev3 is None or ema_slow_prev3 != ema_slow_prev3 or ema_slow_prev3 <= 0:
+            ema_slow_prev2 = float(df["EMA_21"].iloc[i - 2]) if "EMA_21" in df.columns else None
+            if ema_slow_prev2 is None or ema_slow_prev2 != ema_slow_prev2 or ema_slow_prev2 <= 0:
                 if "EMA_50" in df.columns:
-                    ema_slow_prev3 = float(df["EMA_50"].iloc[i - 3])
-            if ema_slow_prev3 is not None and ema_slow_prev3 == ema_slow_prev3 and ema_slow_prev3 > 0:
-                ema_slope_up = ema_slow > ema_slow_prev3
-                ema_slope_dn = ema_slow < ema_slow_prev3
+                    ema_slow_prev2 = float(df["EMA_50"].iloc[i - 2])
+            if ema_slow_prev2 is not None and ema_slow_prev2 == ema_slow_prev2 and ema_slow_prev2 > 0:
+                ema_slope_up = ema_slow > ema_slow_prev2
+                ema_slope_dn = ema_slow < ema_slow_prev2
         except (TypeError, ValueError):
             pass
 
@@ -710,12 +686,12 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     long_trend = (
         close > ema_slow
         and ema_slope_up
-        and dist_from_ema >= (atr14 * 0.25)
+        and dist_from_ema >= (atr14 * 0.20)
     )
     short_trend = (
         close < ema_slow
         and ema_slope_dn
-        and (-dist_from_ema) >= (atr14 * 0.25)
+        and (-dist_from_ema) >= (atr14 * 0.20)
     )
 
     ema_ok = bool(long_trend or short_trend)
@@ -783,23 +759,23 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
 
     # ============================================================
     # 5b) ENTRY-QUALITY GATE (QA fix #2)
-    #     Reject if entry candle range < 0.50 * ATR (1Hour tuned).
+    #     Reject if entry candle range < 0.45 * ATR (15Min tuned).
     # ============================================================
     bar_range = high - low
-    entry_quality_ok = bar_range >= (atr14 * 0.50)
+    entry_quality_ok = bar_range >= (atr14 * 0.45)
     if entry_quality_ok:
         _GATE_TRACE["entry_quality_ok"] += 1
 
     # ============================================================
-    # 5c) CHOP FILTER (1Hour-specific)
+    # 5c) CHOP FILTER (15Min-specific)
     #     Reject if the last 5 bars are inside a tight range
-    #     (< 1.2 ATR total).
+    #     (< 1.1 ATR total).
     # ============================================================
     chop_ok = True
     try:
         last5_high = float(df["High"].iloc[i - 5:i].max())
         last5_low = float(df["Low"].iloc[i - 5:i].min())
-        if (last5_high - last5_low) < (atr14 * 1.2):
+        if (last5_high - last5_low) < (atr14 * 1.1):
             chop_ok = False
     except (TypeError, ValueError):
         chop_ok = True
@@ -807,42 +783,42 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         _GATE_TRACE["chop_ok"] += 1
 
     # ============================================================
-    # 6) STRUCTURAL PULLBACK + MOMENTUM + VOLUME + BREAKOUT (1Hour tuned)
+    # 6) STRUCTURAL PULLBACK + MOMENTUM + VOLUME + BREAKOUT (15Min tuned)
     # ============================================================
-    swing_low = float(df["Low"].iloc[max(0, i - 24):i].min())
-    swing_high = float(df["High"].iloc[max(0, i - 24):i].max())
+    swing_low = float(df["Low"].iloc[max(0, i - 20):i].min())
+    swing_high = float(df["High"].iloc[max(0, i - 20):i].max())
 
     body = close - open_
-    # 1Hour: require a decisive body (>= 0.50 ATR).
-    min_body = atr14 * 0.50
+    # 15Min: require a decisive body (>= 0.45 ATR).
+    min_body = atr14 * 0.45
     bullish_bar = body > min_body and close > prev_close
     bearish_bar = body < -min_body and close < prev_close
 
-    # 1Hour: close must sit in the top/bottom 30% of the bar range.
+    # 15Min: close must sit in the top/bottom 32% of the bar range.
     if bar_range > 0:
         close_pos = (close - low) / bar_range
     else:
         close_pos = 0.5
-    strong_close_up = close_pos >= 0.70
-    strong_close_dn = close_pos <= 0.30
+    strong_close_up = close_pos >= 0.68
+    strong_close_dn = close_pos <= 0.32
 
-    # 1Hour: prior bar must confirm direction.
+    # 15Min: prior bar must confirm direction.
     prev_body = prev_close - prev_open
     prev_bullish = prev_body > 0
     prev_bearish = prev_body < 0
 
-    # 1Hour: fresh breakout of the recent 4-bar extreme.
+    # 15Min: fresh breakout of the recent 4-bar extreme.
     recent4_high = float(df["High"].iloc[max(0, i - 4):i].max())
     recent4_low = float(df["Low"].iloc[max(0, i - 4):i].min())
     breakout_up = close > recent4_high
     breakout_dn = close < recent4_low
 
-    # Volume confirmation: current bar volume >= 1.05x rolling mean (24 bars).
+    # Volume confirmation: current bar volume >= 1.02x rolling mean (20 bars).
     vol_ok = True
     try:
-        vol_mean = float(df["Volume"].iloc[max(0, i - 24):i].astype(float).mean())
+        vol_mean = float(df["Volume"].iloc[max(0, i - 20):i].astype(float).mean())
         if vol_mean > 0:
-            vol_ok = vol >= (vol_mean * 1.05)
+            vol_ok = vol >= (vol_mean * 1.02)
     except (TypeError, ValueError):
         vol_ok = True
 
@@ -857,9 +833,9 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
     SL_CEIL_ATR = 3.0
 
     # QA fix #1 (ROOT CAUSE): fill-sanity gate. Reject if entry is within
-    # 0.25*ATR of SL or TP1 — this kills the GAP_STOP artifact where the
+    # 0.35*ATR of SL or TP1 — this kills the GAP_STOP artifact where the
     # entry bar's range already straddled the exit boundary.
-    FILL_SANITY_ATR = 0.25
+    FILL_SANITY_ATR = 0.35
 
     def _fill_sanity_ok(entry, sl, tp1):
         if abs(entry - sl) < (atr14 * FILL_SANITY_ATR):
@@ -879,7 +855,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             "htf_confirm": htf_confirm,
             "htf_anchor_col": htf_anchor_col,
             "warmup_fallback": warmup_fallback,
-            "tf": "1Hour",
+            "tf": "15Min",
             "entry_bar_index": i,
             "score": score,
             "gates": {
@@ -896,15 +872,15 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("volume")
         if not strong_close_up:
             return _rej("structure")
-        # 1Hour: breakout OR pullback is sufficient (not both).
-        recent_low = float(df["Low"].iloc[i - 12:i].min())
-        pulled_back = recent_low <= ema_slow + (atr14 * 0.60)
+        # 15Min: breakout OR pullback is sufficient (not both).
+        recent_low = float(df["Low"].iloc[i - 10:i].min())
+        pulled_back = recent_low <= ema_slow + (atr14 * 0.55)
         if not (breakout_up or pulled_back):
             return _rej("structure")
         if not confirm_long:
             return _rej("confirm")
-        # 1Hour: prior bar must not be a strong counter-trend bar.
-        if prev_bearish and abs(prev_body) > atr14 * 0.6:
+        # 15Min: prior bar must not be a strong counter-trend bar.
+        if prev_bearish and abs(prev_body) > atr14 * 0.55:
             return _rej("structure")
         entry = close
         sl = min(swing_low, recent_low) - (atr14 * SL_FLOOR_ATR)
@@ -924,13 +900,13 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
             return _rej("volume")
         if not strong_close_dn:
             return _rej("structure")
-        recent_high = float(df["High"].iloc[i - 12:i].max())
-        pulled_back = recent_high >= ema_slow - (atr14 * 0.60)
+        recent_high = float(df["High"].iloc[i - 10:i].max())
+        pulled_back = recent_high >= ema_slow - (atr14 * 0.55)
         if not (breakout_dn or pulled_back):
             return _rej("structure")
         if not confirm_short:
             return _rej("confirm")
-        if prev_bullish and abs(prev_body) > atr14 * 0.6:
+        if prev_bullish and abs(prev_body) > atr14 * 0.55:
             return _rej("structure")
         entry = close
         sl = max(swing_high, recent_high) + (atr14 * SL_FLOOR_ATR)
@@ -957,7 +933,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not confirm_long:
             return _rej("confirm")
         dist_to_low = (close - swing_low) / atr14
-        if dist_to_low > 1.4:
+        if dist_to_low > 1.5:
             return _rej("structure")
         entry = close
         sl = swing_low - (atr14 * SL_FLOOR_ATR)
@@ -984,7 +960,7 @@ def _confluence_cluster(df: pd.DataFrame, i: int, atr: float) -> dict | None:
         if not confirm_short:
             return _rej("confirm")
         dist_to_high = (swing_high - close) / atr14
-        if dist_to_high > 1.4:
+        if dist_to_high > 1.5:
             return _rej("structure")
         entry = close
         sl = swing_high + (atr14 * SL_FLOOR_ATR)
