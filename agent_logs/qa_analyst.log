@@ -9998,3 +9998,39 @@ RESPONSE:
 Do **not** halt to standby. This is not a PASS. Rotate to 15m and 1h, rerun with the classifier and gate instrumentation fixed, then re-submit.
 
 **Verdict: FAIL — fix classifier + intrabar logic + add gate telemetry, then rerun.**
+
+--- Sat Oct 10 03:01:39 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:01:33Z -> 2026-10-10T00:01:33Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=754.76 sl=756.63 tp1=751.01 tp2=748.20 exit=754.80 (GAP_STOP) R=+0.02 bars=1
+[trade] QQQ WINNER entry=756.27 sl=758.06 tp1=752.69 tp2=750.0...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically invalid)**
+
+### Why this is not a real 100% win rate
+All 3 "winners" exited via `GAP_STOP` after **1 bar** with R = +0.02, +0.01, +0.07. This is not a strategy edge — it is a **data artifact**:
+
+1. **GAP_STOP on bar 1** means the entry price was already past the SL/TP1 boundary at fill time. The engine is booking a "win" because the exit price landed marginally favorable, not because price moved in the trade's direction.
+2. **avg_R = +0.033** is below transaction cost. Net expectancy is negative after spread/slippage. A 100% win rate with +0.03R average is a **red flag for look-ahead or fill-logic bugs**, not a confluence cluster.
+3. **Only 3 trades across 2 symbols / 1 week** — sample size is far too small to claim >80% consistency. Minimum viable N ≈ 30 per regime.
+
+### Structural failure diagnosis (Mandate #6)
+- **Entry logic is firing on stale/gapped bars.** The SL is placed *inside* the entry bar's range, so the first tick triggers GAP_STOP. Fix: require `SL` and `TP1` to be outside `[bar_low, bar_high]` of the signal bar before accepting the trade.
+- **No EMA/ATR confluence visible.** Per Quant Report §1, longs require `Close > EMA_50 > EMA_200`; shorts require `Close < EMA_50`. The log shows no regime tag — likely the gate is being bypassed.
+- **GEX missing (Mandate #11):** confirm the code defaults to neutral, not silently skipping the regime filter.
+
+### Required fixes before next cycle
+1. Reject any signal where `entry` is within `0.25 * ATR` of SL or TP1.
+2. Log `ema50`, `ema200`, `atr14`, `gex_proxy` per trade for auditability.
+3. Enforce minimum 30 trades before reporting win rate; otherwise mark `INSUFFICIENT_SAMPLE`.
+4. Re-run across 1m/3m/5m/15m/1h/4h (Mandate #5) and report per-TF.
+
+### Verdict
+**Do NOT append to `proven_strategies.md`.** Do NOT enter standby (Mandate #9 applies only to *validated* >80% results). Rotate backtester to 15m with the fill-logic fix applied.
