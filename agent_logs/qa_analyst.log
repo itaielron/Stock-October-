@@ -10296,3 +10296,36 @@ All 3 "winners" exited via `GAP_STOP` after **1 bar** with R = +0.02, +0.01, +0.
 Per Mandate #9, this is a FAIL, so optimization continues — but the next cycle must be a **bug-fix cycle**, not a parameter sweep. Fixing the exit engine is higher ROI than tuning thresholds on broken fills.
 
 **Verdict: FAIL — fix exit engine + MTFA pull, then re-run.**
+
+--- Sat Oct 10 03:06:40 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:06:33Z -> 2026-10-10T00:06:33Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=754.76 sl=756.99 tp1=750.31 tp2=746.97 exit=754.80 (GAP_STOP) R=+0.02 bars=1
+[trade] QQQ WINNER entry=756.27 sl=758.36 tp1=752.08 tp2=748.9...
+RESPONSE:
+**QA VERDICT: FAIL — Do not halt. Do not log to proven_strategies.md.**
+
+**Why this is a false PASS:**
+100% win rate is a statistical artifact, not an edge. Three trades, all `GAP_STOP` exits at **1 bar**, all R ≤ +0.06. This is not a strategy; it's a rounding error masquerading as alpha.
+
+**Structural failure analysis (Mandate #6):**
+1. **No real exits occurred.** Every "winner" exited via `GAP_STOP` on bar 1 — meaning price gapped through the SL level and the engine booked a tiny positive R instead of the intended -1.5R loss. The TP1/TP2 targets were never touched. The engine is mislabeling gap-through-stop as a win. **This is a bug, not a signal.**
+2. **Directional logic is inverted or broken.** QQQ entries at 754.76 with SL=756.99 (above entry) and TP1=750.31 (below entry) = SHORT. Exit at 754.80 is *above* entry — a short that closed higher should be a LOSS, not +0.02R. The PnL sign is wrong.
+3. **Sample size = 3.** Zero statistical validity. Mandate #2 (>80% consistency) requires n≥30 minimum per regime.
+4. **SPY produced 0 trades** across 297 bars. EMA_50/EMA_200 + regime filter is over-gating. Either the EMA stack never aligned, or the GEX proxy (Mandate #11) is defaulting to a state that blocks all signals.
+
+**Required fixes before next cycle:**
+- **Fix gap-stop accounting:** If `open` gaps beyond SL, exit at `open`, book full -1.5R. Never book positive R on a stop.
+- **Audit short PnL sign:** `R = (entry - exit) / risk` for shorts. Current math is inverted.
+- **Log rejection reasons:** Instrument the engine to count how many bars failed each gate (GEX, EMA, ATR, macro). SPY=0 trades is a red flag, not a clean result.
+- **Enforce min-n:** Suppress SUMMARY win_rate unless `trades >= 30`. Report `INSUFFICIENT_SAMPLE` otherwise.
+- **MTFA (Mandate #5):** Only 1m/5m appear to be running. Confirm 3m/15m/1h/4h are actually being pulled — no evidence in output.
+
+**Action:** Return to Coder. Fix accounting + sign bugs, add gate-rejection telemetry, re-run. **Do not push to GitHub as a success** (Mandate #8) — push as `FAILED_CYCLE_<ts>` with this QA note attached.
+
+**Credit note (Mandate #9):** Standby is NOT authorized. This is a broken engine, not a working system.
