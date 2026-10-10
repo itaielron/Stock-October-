@@ -9926,3 +9926,39 @@ RESPONSE:
 
 ### Verdict
 **Do NOT halt optimization.** Mandate #9 standby only applies to a *structurally sound* >80% result. This is a 2-trade artifact with a mislabeled exit. Re-run with the accounting fix and rejection logging before any PASS can be issued.
+
+--- Sat Oct 10 03:00:23 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:00:17Z -> 2026-10-10T00:00:17Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=756.27 sl=758.06 tp1=752.69 tp2=750.01 exit=756.29 (GAP_STOP) R=+0.01 bars=1
+[trade] QQQ WINNER entry=750.59 sl=751.36 tp1=749.04 tp2=747.8...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically void, not a real pass)**
+
+### Why this is not a legitimate 100% win rate
+- **Sample size = 2.** Zero statistical power. A 100% WR on n=2 is noise, not edge. Do not append to `proven_strategies.md`.
+- **Both "winners" exited via `GAP_STOP` at R=+0.01 and +0.03.** These are not wins — they are scratch trades that gapped through the stop and filled marginally positive. The engine is mislabeling gap-fills as winners. **Fix the P&L attribution logic:** a stop-gap fill should be classified by realized R, not by sign of exit-vs-entry.
+- **bars=1 on both.** Entry and exit on the same bar means the SL/TP logic is being evaluated intrabar without proper sequencing. This is a look-ahead / fill-order bug. You cannot know whether SL or TP was hit first on a single bar without tick data — default to conservative (SL first).
+
+### Structural diagnosis (Mandate #6)
+- **Why "winners" won:** They didn't. They were gap artifacts. No confluence cluster was actually validated.
+- **Why trades=0 on SPY:** 297 bars over 7 days ≈ 1m data only. SPY produced zero signals — likely because EMA_50/EMA_200 warmup consumed the window, or GEX proxy gated everything out. **Log rejection reasons per bar** (regime fail / EMA fail / ATR fail) so we can see which gate is starving the system.
+
+### Required fixes before next cycle
+1. **Intrabar fill ordering:** assume SL-first on ambiguous bars.
+2. **Gap-stop classification:** realized R < 0.5R = scratch, not winner.
+3. **Rejection telemetry:** count bars rejected by each gate (GEX/EMA/ATR/macro).
+4. **MTFA (Mandate #5):** you only ran 1m. Pull 3m/5m/15m/1h/4h and report per-TF trade counts.
+5. **GEX proxy (Mandate #11):** confirm neutral/proxy is active — no crashes observed, good, but log which mode was used.
+
+### Verdict
+**Do NOT halt (Mandate #9 does not apply — no valid PASS).** Rotate to 5m and 15m, fix the fill-classification bug, and re-run. Target: ≥30 trades per TF before any WR claim is credible.
+
+**GitHub sync required** (Mandate #8): push this eval + rejection-telemetry patch.
