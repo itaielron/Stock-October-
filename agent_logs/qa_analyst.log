@@ -10106,3 +10106,45 @@ The gating stack is over-constrained. Per the Quant Report, a signal requires GE
 
 ### Verdict
 Do **not** append to `proven_strategies.md`. Do **not** enter standby (Mandate #9 applies only to genuine PASS). Rotate to a longer window (≥30 days) and re-run with rejection telemetry enabled. Push logs to GitHub per Mandate #8.
+
+--- Sat Oct 10 03:03:38 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:03:30Z -> 2026-10-10T00:03:30Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.12 exit=751.31 (GAP_STOP) R=+0.07 bars=1
+--------------------------------------------------------------...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically void)**
+
+### Why this is not a pass
+`trades=1` is not a backtest — it's a single sample. A 100% win rate on n=1 has a 95% CI of roughly [2.5%, 100%]. This cannot be logged as a proven strategy, and per Mandate #9 the Smart Sleep Protocol does **not** trigger (it requires >80% *with structurally sound charts*; one trade is neither).
+
+### Why only 1 trade fired (root cause)
+The gating stack is over-constrained. With 297 SPY / 372 QQQ bars (~5–6 sessions of 1m), the confluence chain requires:
+1. GEX regime match — but per Mandate #11 GEX is unavailable, so it's neutral/mock. If the mock proxy defaults to a single regime, half your directional logic is dead on arrival.
+2. `Close > EMA_50 AND EMA_50 > EMA_200` — on 1m data, EMA_200 needs ~200 bars to stabilize. SPY has 297 bars total, so EMA_200 is only valid for the last ~97 bars, and it's still warming up. QQQ barely qualifies. **This alone kills most of the window.**
+3. ATR band + macro score + event pause + drawdown gate — each multiplies the rejection rate.
+
+Net effect: the intersection of 5–6 filters over a 5-day 1m window yields ~1 signal. That's expected, not a bug.
+
+### The one trade is also suspect
+`entry=751.25 sl=752.14 tp1=749.46 exit=751.31 (GAP_STOP) R=+0.07 bars=1`
+
+- A **short** with SL *above* entry (752.14 > 751.25) ✓ correct side.
+- Exit at 751.31 is **above entry** yet labeled WINNER with +0.07R. For a short, exit < entry = profit. 751.31 > 751.25 means this should be a **small loss**, not a win. **Sign/logic bug in PnL attribution or in the GAP_STOP handler.**
+- `bars=1` + `GAP_STOP` on 1m data is contradictory — gaps don't exist intraday on 1m bars. The stop handler is misfiring.
+
+### Required fixes before next cycle
+1. **Fix short PnL sign** — verify `R = (entry - exit)/risk` for shorts. This is a Mandate #3 violation (repeated-mistake class).
+2. **Fix GAP_STOP trigger** — it should only fire when `open` gaps through `sl`, not on a 1-bar 1m move.
+3. **Relax the gate for short windows**: require `EMA_50 > EMA_200` only when `bars > 250`; otherwise fall back to `Close vs EMA_50` alone. Log which filter rejected each bar (rejection histogram) so we can see the bottleneck.
+4. **Do not append to `proven_strategies.md`** — n=1 is not a proven cluster.
+5. **Push to GitHub** (Mandate #8) with the rejection histogram attached.
+
+**Verdict:** Do not sleep. Fix the PnL sign bug first — it invalidates every prior "winner" count. Then re-run with filter-rejection telemetry before touching parameters.
