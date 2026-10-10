@@ -10072,3 +10072,37 @@ The engine ran 669 bars across SPY/QQQ but emitted only **one** signal. Root cau
 
 ### Verdict
 Do **not** halt for standby (Mandate #9) — this is not a passing system. Rotate to a 30-day window, fix the R-sign bug, and re-run. No GitHub push of "proven" params this cycle.
+
+--- Sat Oct 10 03:02:57 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:02:50Z -> 2026-10-10T00:02:50Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.12 exit=751.31 (GAP_STOP) R=+0.07 bars=1
+--------------------------------------------------------------...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically void)**
+
+### Why this is not a PASS
+- **Sample size = 1.** A 100% win rate on a single trade is noise, not edge. Mandate #2 requires >80% *consistency*; n=1 cannot establish consistency.
+- **R = +0.07.** The "winner" exited via `GAP_STOP` at 751.31 vs entry 751.25 — a 6-cent favorable gap, not a structural TP1 hit. TP1 (749.46) was never reached. This is a scratch, mislabeled as a winner.
+- **Directional contradiction.** Entry 751.25, SL 752.14 (above), TP1 749.46 (below) → this is a **short**. But exit at 751.31 is *above* entry, meaning price moved against the short and the gap-stop filled favorably by luck. The label "WINNER" is misleading; the trade thesis failed.
+- **297/372 bars over 7 days** ≈ 42 bars/day for SPY — consistent with 5m, but QQQ at 372 suggests mixed granularity. MTFA mandate #5 (1m/3m/5m/15m/1h/4h) is **not evidenced** in the output.
+
+### Why only 1 trade fired
+The gating stack is over-constrained. Per the Quant Report, a signal requires GEX regime + EMA50/200 alignment + ATR band + macro score + event pause + drawdown/exposure checks. With GEX unavailable (Mandate #11), the proxy is likely defaulting to a neutral/blocking state, and the EMA50>EMA200 + macro-score conjunction is filtering out nearly everything. Result: 1 signal in 669 bars.
+
+### Required fixes before next cycle
+1. **Log rejection reasons.** Emit counters: `rejected_gex`, `rejected_ema`, `rejected_atr`, `rejected_macro`, `rejected_event`. Without this we cannot diagnose the 668 non-trades.
+2. **Relax GEX proxy.** Derive from realized vol / volume skew; do not let a missing feed silently veto.
+3. **Fix winner/loser classification.** A `GAP_STOP` exit with R<0.3 must be tagged `SCRATCH`, not `WINNER`.
+4. **Enforce MTFA.** Confirm all six timeframes are pulled and logged per symbol.
+5. **Minimum sample gate.** Do not report win_rate until n≥30; otherwise print `INSUFFICIENT_SAMPLE`.
+
+### Verdict
+Do **not** append to `proven_strategies.md`. Do **not** enter standby (Mandate #9 applies only to genuine PASS). Rotate to a longer window (≥30 days) and re-run with rejection telemetry enabled. Push logs to GitHub per Mandate #8.
