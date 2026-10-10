@@ -33,7 +33,7 @@ if os.path.exists(chart_dir):
     charts = sorted([c for c in os.listdir(chart_dir) if c.endswith(".png")], key=lambda x: os.path.getmtime(os.path.join(chart_dir, x)), reverse=True)
     if charts:
         chart_cols = st.columns(3)
-        for i, chart in enumerate(charts[:9]): 
+        for i, chart in enumerate(charts[:12]): 
             with chart_cols[i % 3]:
                 with open(os.path.join(chart_dir, chart), "rb") as img_file:
                     img_bytes = img_file.read()
