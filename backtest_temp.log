@@ -1,11 +1,9 @@
 findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
 ======================================================================
-Confluence-cluster backtest 2026-10-03T00:06:33Z -> 2026-10-10T00:06:33Z symbols=['SPY', 'QQQ']
+Confluence-cluster backtest 2026-10-03T00:07:09Z -> 2026-10-10T00:07:09Z symbols=['SPY', 'QQQ']
 [info] SPY: 297 bars, backtesting...
 [info] QQQ: 372 bars, backtesting...
-[trade] QQQ WINNER entry=754.76 sl=756.99 tp1=750.31 tp2=746.97 exit=754.80 (GAP_STOP) R=+0.02 bars=1
-[trade] QQQ WINNER entry=756.27 sl=758.36 tp1=752.08 tp2=748.94 exit=756.29 (GAP_STOP) R=+0.01 bars=1
-[trade] QQQ WINNER entry=751.25 sl=752.32 tp1=749.11 tp2=747.51 exit=751.31 (GAP_STOP) R=+0.06 bars=1
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.12 exit=751.31 (GAP_STOP) R=+0.07 bars=1
 ----------------------------------------------------------------------
-SUMMARY trades=3 winners=3 losers=0 win_rate=100.0% total_R=+0.08 avg_R=+0.028 charts=charts/
+SUMMARY trades=1 winners=1 losers=0 win_rate=100.0% total_R=+0.07 avg_R=+0.067 charts=charts/
 ======================================================================

@@ -120,3 +120,85 @@ To https://github.com/itaielron/Stock-October-.git
  create mode 100644 fix_rm.py
 To https://github.com/itaielron/Stock-October-.git
    82260da..0b332b2  main -> main
+[main cb7150c] Auto-Sync: Agent optimization cycle
+ 84 files changed, 721 insertions(+), 2 deletions(-)
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_234556.png
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235413.png
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235414.png
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235415.png
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235437.png
+ delete mode 100644 charts/LOSER_QQQ_GAP_STOP_20261009_235541.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235411.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235412.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235413.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235414.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235415.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235541.png
+ delete mode 100644 charts/LOSER_QQQ_STOP_20261009_235646.png
+ delete mode 100644 charts/LOSER_SPY_GAP_STOP_20261009_235407.png
+ delete mode 100644 charts/LOSER_SPY_GAP_STOP_20261009_235409.png
+ delete mode 100644 charts/LOSER_SPY_STOP_20261009_235407.png
+ delete mode 100644 charts/LOSER_SPY_STOP_20261009_235408.png
+ delete mode 100644 charts/LOSER_SPY_STOP_20261009_235409.png
+ delete mode 100644 charts/LOSER_SPY_STOP_20261009_235410.png
+ delete mode 100644 charts/LOSER_SPY_STOP_20261009_235436.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230027.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230130.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230220.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230303.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230347.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230431.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230514.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230558.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_230642.png
+ delete mode 100644 charts/LOSER_SPY_TIME_STOP_20261009_234555.png
+ delete mode 100644 charts/WINNER_QQQ_EOD_FLAT_20261009_234556.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235415.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235437.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235541.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235542.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235904.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235940.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261009_235941.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000018.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000057.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000134.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000135.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000212.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000251.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000331.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000411.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000447.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000448.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000522.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_STOP_20261010_000558.png
+ rename charts/{WINNER_QQQ_GAP_STOP_20261010_000559.png => WINNER_QQQ_GAP_STOP_20261010_000635.png} (100%)
+ delete mode 100644 charts/WINNER_QQQ_GAP_TP2_20261009_235414.png
+ delete mode 100644 charts/WINNER_QQQ_GAP_TP2_20261009_235415.png
+ delete mode 100644 charts/WINNER_QQQ_STOP_20261009_234556.png
+ delete mode 100644 charts/WINNER_QQQ_STOP_20261009_235412.png
+ delete mode 100644 charts/WINNER_QQQ_STOP_20261009_235413.png
+ delete mode 100644 charts/WINNER_QQQ_STOP_20261009_235414.png
+ delete mode 100644 charts/WINNER_QQQ_STOP_20261009_235415.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235411.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235412.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235413.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235414.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235415.png
+ delete mode 100644 charts/WINNER_QQQ_TP2_20261009_235541.png
+ delete mode 100644 charts/WINNER_SPY_EOD_FLAT_20261009_234555.png
+ delete mode 100644 charts/WINNER_SPY_EOD_FLAT_20261009_235410.png
+ delete mode 100644 charts/WINNER_SPY_GAP_STOP_20261009_235408.png
+ delete mode 100644 charts/WINNER_SPY_GAP_STOP_20261009_235409.png
+ delete mode 100644 charts/WINNER_SPY_GAP_STOP_20261009_235540.png
+ delete mode 100644 charts/WINNER_SPY_GAP_STOP_20261009_235645.png
+ delete mode 100644 charts/WINNER_SPY_GAP_TP2_20261009_235409.png
+ delete mode 100644 charts/WINNER_SPY_STOP_20261009_235407.png
+ delete mode 100644 charts/WINNER_SPY_STOP_20261009_235408.png
+ delete mode 100644 charts/WINNER_SPY_STOP_20261009_235409.png
+ delete mode 100644 charts/WINNER_SPY_STOP_20261009_235410.png
+ delete mode 100644 charts/WINNER_SPY_TIME_STOP_20261009_235408.png
+ delete mode 100644 charts/WINNER_SPY_TP2_20261009_235408.png
+ delete mode 100644 charts/WINNER_SPY_TP2_20261009_235410.png
+To https://github.com/itaielron/Stock-October-.git
+   0b332b2..cb7150c  main -> main
