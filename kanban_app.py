@@ -30,7 +30,7 @@ st.divider()
 st.subheader("📈 Verified Alpaca Backtest Charts")
 chart_dir = "charts"
 if os.path.exists(chart_dir):
-    charts = sorted([c for c in os.listdir(chart_dir) if c.endswith(".png")], reverse=True)
+    charts = sorted([c for c in os.listdir(chart_dir) if c.endswith(".png")], key=lambda x: os.path.getmtime(os.path.join(chart_dir, x)), reverse=True)
     if charts:
         chart_cols = st.columns(3)
         for i, chart in enumerate(charts[:9]): 

@@ -10148,3 +10148,40 @@ Net effect: the intersection of 5–6 filters over a 5-day 1m window yields ~1 s
 5. **Push to GitHub** (Mandate #8) with the rejection histogram attached.
 
 **Verdict:** Do not sleep. Fix the PnL sign bug first — it invalidates every prior "winner" count. Then re-run with filter-rejection telemetry before touching parameters.
+
+--- Sat Oct 10 03:04:16 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:04:10Z -> 2026-10-10T00:04:10Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.12 exit=751.31 (GAP_STOP) R=+0.07 bars=1
+--------------------------------------------------------------...
+RESPONSE:
+**QA VERDICT: FAIL — statistically meaningless, do not enter standby.**
+
+**1. Sample size is disqualifying.** 1 trade / 100% win rate is noise, not a proven strategy. Mandate #2 requires >80% *consistency*; a single trade cannot establish consistency. The Smart Sleep Protocol (#9) explicitly requires "structurally sound charts" — one trade is not that. **Do NOT halt optimization.**
+
+**2. The "winner" is structurally a loser.** Look at the mechanics:
+- Entry 751.25, SL 752.14 (risk = 0.89), TP1 749.46 (reward = 1.79). That's a ~2:1 setup.
+- Exit = 751.31 via `GAP_STOP`, R=+0.07, held 1 bar.
+
+This is a **short that never worked**. Price gapped *against* the position, the stop was triggered, and it filled 0.83 *better* than the stop level (751.31 vs 752.14) — pure slippage luck on a gap. Labeling this a "WINNER" is a logging bug: a gap-stop exit should be classified as a **loss or scratch**, never a win. Fix the exit classifier before any further runs.
+
+**3. Why only 1 trade across 669 bars?** This is the real failure. SPY (297 bars) produced **zero** trades. Root causes to audit:
+- **EMA gate too strict:** `Close > EMA_50 > EMA_200` on a 1-week window means EMA_200 is barely warmed up — likely NaN or flat, killing all longs. On 297 5-min bars, EMA_200 needs ~200 bars just to stabilize.
+- **GEX neutral assumption (#11):** If you defaulted GEX to neutral and your regime filter requires a *matching* regime, neutral may match neither trend nor mean-reversion → all signals dropped. Confirm the neutral branch actually routes to a strategy.
+- **ATR limits:** If `ATR within limits` has a hard band, low-volatility SPY bars may be filtered out entirely.
+
+**4. MTFA mandate (#5) not evidenced.** No output shows 1m/3m/5m/15m/1h/4h confluence evaluation. The engine appears to run a single timeframe. This is a compliance gap.
+
+**Required actions before next cycle:**
+1. Fix gap-stop exit classification (scratch/loss, not win).
+2. Log *rejection reasons* per bar (which gate killed the signal) — this is the genetic-learning input (#6).
+3. Verify EMA_200 warmup; use EMA_50/EMA_20 or require min-bar guard.
+4. Confirm neutral-GEX routing produces trades.
+5. Produce ≥30 trades before any win-rate claim is valid.
+
+**No PASS. Continue optimization. Do not sleep.**
