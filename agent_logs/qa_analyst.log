@@ -10034,3 +10034,41 @@ All 3 "winners" exited via `GAP_STOP` after **1 bar** with R = +0.02, +0.01, +0.
 
 ### Verdict
 **Do NOT append to `proven_strategies.md`.** Do NOT enter standby (Mandate #9 applies only to *validated* >80% results). Rotate backtester to 15m with the fill-logic fix applied.
+
+--- Sat Oct 10 03:02:18 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:02:11Z -> 2026-10-10T00:02:11Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=751.25 sl=752.14 tp1=749.46 tp2=748.12 exit=751.31 (GAP_STOP) R=+0.07 bars=1
+--------------------------------------------------------------...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (Insufficient Sample)**
+
+### Why trades=1
+The engine ran 669 bars across SPY/QQQ but emitted only **one** signal. Root cause is almost certainly the **EMA_50 > EMA_200 gate combined with the 1-week window**. With ~297 5-min bars (~5 trading days), EMA_200 is barely seeded — it's still in warm-up and effectively random. The directional filter is therefore rejecting nearly everything, not because confluence is absent but because the indicator is statistically meaningless at this lookback.
+
+### Why the "winner" is not a winner
+- `entry=751.25 sl=752.14 tp1=749.46` → this is a **SHORT** (SL above, TP below). Correct.
+- `exit=751.31` is **above entry** — the trade lost on price.
+- Labeled `WINNER` with `R=+0.07` via `GAP_STOP`. **This is a bug.** A gap-stop on a short that exits above entry cannot be positive R. Either the R calculation sign is inverted, or the exit price is being compared to the wrong reference. Fix before any further cycles — a mislabeled loser poisons the genetic learning loop (Mandate #6).
+
+### Structural failures vs. mandate
+1. **Mandate #5 (MTFA) not satisfied.** Only one timeframe ran. No 1m/3m/15m/1h/4h evaluation present in output.
+2. **Mandate #11 (GEX proxy) not evidenced.** No log line showing neutral/proxy GEX regime. Silent — acceptable, but should be explicit.
+3. **Mandate #4 (visual clarity).** `charts=charts/` with a single 1-bar trade is not a meaningful confluence visualization.
+4. **Win rate 100% on n=1 is statistically void.** Do not append to `proven_strategies.md`.
+
+### Required fixes before next cycle
+- **Extend window** to ≥30 days so EMA_200 is valid, OR drop EMA_200 and use EMA_50/EMA_20 for the 5-min regime.
+- **Audit R-sign logic** in the gap-stop branch. Add assertion: `sign(exit-entry) == sign(R)` for shorts.
+- **Emit per-timeframe trade counts** so we can see which TF is starving.
+- **Log GEX proxy value** each bar (e.g., rolling volume-weighted skew) to prove Mandate #11 compliance.
+
+### Verdict
+Do **not** halt for standby (Mandate #9) — this is not a passing system. Rotate to a 30-day window, fix the R-sign bug, and re-run. No GitHub push of "proven" params this cycle.
