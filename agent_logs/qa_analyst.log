@@ -9962,3 +9962,39 @@ RESPONSE:
 **Do NOT halt (Mandate #9 does not apply — no valid PASS).** Rotate to 5m and 15m, fix the fill-classification bug, and re-run. Target: ≥30 trades per TF before any WR claim is credible.
 
 **GitHub sync required** (Mandate #8): push this eval + rejection-telemetry patch.
+
+--- Sat Oct 10 03:01:02 2026 ---
+TASK:
+Backtest Output:
+findfont: Failed to find font weight semibold for DejaVu Sans, now using 700.
+======================================================================
+Confluence-cluster backtest 2026-10-03T00:00:55Z -> 2026-10-10T00:00:55Z symbols=['SPY', 'QQQ']
+[info] SPY: 297 bars, backtesting...
+[info] QQQ: 372 bars, backtesting...
+[trade] QQQ WINNER entry=756.27 sl=758.06 tp1=752.69 tp2=750.01 exit=756.29 (GAP_STOP) R=+0.01 bars=1
+[trade] QQQ WINNER entry=750.59 sl=751.36 tp1=749.04 tp2=747.8...
+RESPONSE:
+## QA Evaluation — Cycle 2026-10-10
+
+**Grade: FAIL (statistically invalid, not a real PASS)**
+
+### Why this is not a legitimate 100% win rate
+- **Sample size = 2.** Two trades cannot validate an >80% mandate. Confidence interval on 2/2 is roughly 16%–100%. This is noise, not edge.
+- **Both "winners" are GAP_STOP exits with R=+0.01 and +0.03.** These are not wins — they are flat scratches where the gap filled at/above entry. The engine is mislabeling breakeven gap-fills as WINNER. **Fix the classifier:** require `R >= +0.5` (or TP1 hit) to tag WINNER; tag `|R| < 0.1` as SCRATCH.
+- **Both trades lasted 1 bar.** Entry and exit on the same candle means the SL/TP logic is being evaluated intrabar against the gap, not against subsequent price action. This is a look-ahead/ordering bug in the bar loop.
+
+### Structural diagnosis (per Mandate #6)
+- **Why "winners" won:** They didn't. Price gapped through the stop level and the fill landed marginally favorable. No confluence was exercised.
+- **Why only 2 trades fired:** SPY produced 297 bars, QQQ 372, yet only QQQ triggered. SPY fired zero signals across the entire week — the EMA_50/EMA_200 + regime gate is almost certainly over-constrained (likely EMA_200 undefined on 1m/3m windows, silently returning False). **Add a diagnostic counter** for each gate (GEX proxy, EMA stack, ATR band) so we can see which filter is killing 99% of bars.
+
+### Required fixes before next cycle
+1. Reclassify WINNER/LOSER/SCRATCH with an R-threshold; report scratch count separately.
+2. Fix intrabar ordering: entry bar must not be eligible for SL/TP exit.
+3. Instrument gate pass-rates per symbol/timeframe; log to `agent_logs/`.
+4. Enforce minimum sample gate: **do not emit a win_rate unless trades >= 30.** Below that, output `INSUFFICIENT_SAMPLE`.
+5. Confirm MTFA (1m/3m/5m/15m/1h/4h) is actually being pulled — output shows only aggregate bars, no per-TF breakdown.
+
+### Credit protocol
+Do **not** halt to standby. This is not a PASS. Rotate to 15m and 1h, rerun with the classifier and gate instrumentation fixed, then re-submit.
+
+**Verdict: FAIL — fix classifier + intrabar logic + add gate telemetry, then rerun.**
